@@ -5,7 +5,7 @@ The new session records which session launched it (see session_lineage.py). Usua
 on its task at once (--prompt); in staged mode (--spec) the task waits on the bus until a human
 types in the new pane.
 
-    handoff_session.py --name task-b --display "task-b: retry logic" --prompt-file /tmp/p.md
+    handoff_session.py --name task-b --prompt-file /tmp/p.md
     handoff_session.py --name images --spec "generate today's images ..."
     handoff_session.py --name task-a --spec-file /tmp/spec.md --cwd /path/to/project
 
@@ -22,7 +22,7 @@ TWO MODES (pick one; they are mutually exclusive by design):
 What it does, in order:
   1. refuse if a live tmux session already owns that name
   2. resolve the `claude` binary
-  3. `tmux new-session -d [-e parent vars] -s <name> -c <cwd> -- <claude> -n <display> ...`
+  3. `tmux new-session -d [-e parent vars] -s <name> -c <cwd> -- <claude> -n <name> ...`
      (the -e vars name THIS session as the new one's parent; see session_lineage.py)
      (permission mode is whatever your Claude Code settings default to; NO
      --dangerously-skip-permissions unless --bypass is passed)
@@ -108,10 +108,13 @@ def tmux_has_session(name):
 DEFAULT_HANDOFF_MODEL = None
 
 
-def build_spawn_cmd(name, cwd, claude, display=None, bypass=False, prompt=None,
+def build_spawn_cmd(name, cwd, claude, bypass=False, prompt=None,
                     model=DEFAULT_HANDOFF_MODEL, parent_args=None):
     """The full `tmux new-session` argv. LIST form, never a shell string: a spec
     containing an apostrophe would otherwise break the spawn.
+
+    `claude -n` is ALWAYS <name>: that is what SendMessage/ListAgents address, so it
+    stays the single, short tmux session name with no separate display alias.
 
     TWO `--` separators, both load-bearing:
       * before the inner command, so tmux stops parsing its own options;
@@ -128,7 +131,7 @@ def build_spawn_cmd(name, cwd, claude, display=None, bypass=False, prompt=None,
     everything after the first `--` is the spawned claude's argv, never tmux's.
     None or [] leaves the argv unchanged.
     """
-    inner = [claude, "-n", display or name]
+    inner = [claude, "-n", name]
     # --model rides BEFORE the end-of-options separator, for the same reason --bypass
     # does: everything after `--` is a positional and would become part of the prompt.
     # model=None means INHERIT (emit no flag at all), which is why this keys on `is not None`
@@ -167,11 +170,12 @@ def selftest():
     # 1. LIST argv, never a shell string: an apostrophe in the prompt must survive verbatim.
     #    (Old shape joined the claude command into one shell string, which dropped it entirely.)
     tricky = "read /tmp/x.md; it's the spec for task-alpha (all of it), execute it."
-    cmd = build_spawn_cmd("alpha", "/tmp", "/usr/bin/claude", display="alpha: t", prompt=tricky)
+    cmd = build_spawn_cmd("alpha", "/tmp", "/usr/bin/claude", prompt=tricky)
     check("argv is a list of str", all(isinstance(c, str) for c in cmd))
     check("prompt survives verbatim as one argv element", cmd[-1] == tricky,
           "got %r" % cmd[-1])
-    check("display rides claude -n", cmd[cmd.index("-n") + 1] == "alpha: t")
+    check("-n is always --name", cmd[cmd.index("-n") + 1] == "alpha",
+          "got %r" % cmd[cmd.index("-n") + 1])
 
     # 2. A prompt whose first line is a markdown bullet must reach claude as a POSITIONAL.
     #    Verified: without the `--`, `claude` exits "unknown option" and the
@@ -181,9 +185,9 @@ def selftest():
     check("leading-dash prompt is preceded by an end-of-options --",
           c_dash[-2] == "--" and c_dash[-1] == dashed, " ".join("%r" % x for x in c_dash))
 
-    # 3. display defaults to name; bypass flag lands BEFORE the end-of-options separator.
+    # 3. -n is always --name; bypass flag lands BEFORE the end-of-options separator.
     c2 = build_spawn_cmd("beta", "/tmp", "c", bypass=True, prompt="go.")
-    check("display defaults to --name", c2[c2.index("-n") + 1] == "beta")
+    check("-n is --name", c2[c2.index("-n") + 1] == "beta")
     check("bypass flag is its own argv element (not shell-joined)",
           "--dangerously-skip-permissions" in c2)
     check("bypass flag precedes the -- separator",
@@ -295,9 +299,6 @@ def main(argv=None):
                                 "recording its parent. --prompt starts it working; --spec parks the "
                                 "task until you type in the new pane.")
     p.add_argument("--name", help="tmux session name for the new worker (required unless --selftest)")
-    p.add_argument("--display",
-                   help="human-readable session name (claude -n); shows in session_peers/bcast "
-                        "immediately, no /rename needed. Default: --name")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--spec", help="STAGED mode: spec text to park on the bus for the new session")
     g.add_argument("--spec-file", help="STAGED mode: read the spec from this file")
@@ -419,7 +420,7 @@ def main(argv=None):
     # Lineage: tell the child who launched it. spawn_env_args() never raises and is []
     # outside tmux, so a launch never fails over the record of its own parentage.
     parent_args = session_lineage.spawn_env_args()
-    tmux_cmd = build_spawn_cmd(name, cwd, claude, display=a.display, bypass=a.bypass,
+    tmux_cmd = build_spawn_cmd(name, cwd, claude, bypass=a.bypass,
                                prompt=prompt, model=model, parent_args=parent_args)
 
     if a.dry_run:
@@ -437,8 +438,8 @@ def main(argv=None):
         return 6
     # NAME THE MODEL in the confirmation. The failure this flag fixes was invisible spend:
     # large-model handoffs nobody noticed until the usage numbers moved.
-    print("spawned session %r as %r (claude, model: %s%s) in %s"
-          % (name, a.display or name,
+    print("spawned session %r (claude, model: %s%s) in %s"
+          % (name,
              "inherited (session default)" if model is None else model,
              " --bypass" if a.bypass else "", cwd))
 
