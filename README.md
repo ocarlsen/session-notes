@@ -2,7 +2,10 @@
 
 **Many Claude Code sessions, one keyboard, one memory.**
 
-<!-- Demo film goes here once recorded: video plus a GIF fallback. -->
+[![A worker session turns down a yes relayed by another session, then commits on the one the user types with bcast](docs/media/session-notes.gif)](docs/media/session-notes.mp4)
+
+The whole film, about five minutes of real Claude Code sessions in tmux:
+[docs/media/session-notes.mp4](docs/media/session-notes.mp4).
 
 Claude Code sessions can already message each other, and each project gets
 auto memory. If you run several sessions side by side, two jobs are still
