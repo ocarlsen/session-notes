@@ -53,7 +53,7 @@ PUBLIC = [
 EMAIL_OK = re.compile(r"@(?:example\.(?:com|org|net)|users\.noreply\.github\.com|anthropic\.com)$")
 
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv"}
-BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".woff", ".woff2"}
+BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".woff", ".woff2", ".mp4", ".mov", ".webm"}
 
 
 def terms_path():
