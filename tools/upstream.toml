@@ -1,0 +1,85 @@
+# Which files in this repo came from an upstream Claude Code config (a ~/.claude kept in git),
+# and where each one lives there. tools/upstream_drift.py reads this to report upstream
+# changes that have not been ported yet. Paths only, relative to each repo's root.
+#
+# Every .py and SKILL.md under bin/, hooks/ and skills/ must appear exactly once, either as a
+# [[pair]] or in repo_only; the drift check fails on an unmapped file so a new file is a
+# decision, not an omission.
+
+repo_only = ["bin/notes_config.py", "bin/session_peers.py"]
+
+[[pair]]
+repo = "bin/append_memory_index.py"
+upstream = "bin/append_memory_index.py"
+
+[[pair]]
+repo = "bin/bcast.py"
+upstream = "bin/bcast.py"
+
+[[pair]]
+repo = "bin/boot_budget.py"
+upstream = "bin/boot_budget.py"
+
+[[pair]]
+repo = "bin/bus_nudge.py"
+upstream = "bin/bus_nudge.py"
+
+[[pair]]
+repo = "bin/handoff_session.py"
+upstream = "bin/handoff_session.py"
+
+[[pair]]
+repo = "bin/memory_hygiene_canary.py"
+upstream = "bin/memory_hygiene_canary.py"
+
+[[pair]]
+repo = "bin/memory_index_lint.py"
+upstream = "bin/memory_index_lint.py"
+
+[[pair]]
+repo = "bin/reflect_lock.py"
+upstream = "bin/reflect_lock.py"
+
+[[pair]]
+repo = "bin/session_lineage.py"
+upstream = "bin/session_lineage.py"
+
+[[pair]]
+repo = "bin/session_bus.py"
+upstream = "bin/session_bus.py"
+
+[[pair]]
+repo = "hooks/em_dash_guard.py"
+upstream = "hooks/em_dash_guard.py"
+
+[[pair]]
+repo = "hooks/session_bus_hook.py"
+upstream = "hooks/session_bus.py"
+
+[[pair]]
+repo = "hooks/session_pane_registry.py"
+upstream = "hooks/session_pane_registry.py"
+
+[[pair]]
+repo = "hooks/time_sense.py"
+upstream = "hooks/time_sense.py"
+
+[[pair]]
+repo = "skills/find-session/SKILL.md"
+upstream = "skills/find-session/SKILL.md"
+
+[[pair]]
+repo = "skills/find-session/find_session.py"
+upstream = "skills/find-session/find_session.py"
+
+[[pair]]
+repo = "skills/reflect/SKILL.md"
+upstream = "skills/reflect/SKILL.md"
+
+[[pair]]
+repo = "skills/refresh/SKILL.md"
+upstream = "skills/refresh/SKILL.md"
+
+[[pair]]
+repo = "skills/rnr/SKILL.md"
+upstream = "skills/rnr/SKILL.md"

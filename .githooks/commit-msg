@@ -1,0 +1,3 @@
+#!/bin/sh
+ROOT=$(git rev-parse --show-toplevel)
+python3 "$ROOT/tests/leak_scan.py" --commit-msg "$1"

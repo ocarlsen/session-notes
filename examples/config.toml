@@ -1,0 +1,20 @@
+# Example config for the quickstart. Relative paths resolve against this
+# file's directory, so it works from any checkout location.
+[paths]
+# A sandboxed Claude home so the quickstart never reads your real one.
+claude_home = "home/.claude"
+state_dir = "state"
+global_store = "store/global"
+
+# A project folder and its own memory store. Folder, scope name and store
+# share one name so they are easy to match up.
+#
+# In a real setup, leave `store` out: the store then defaults to the folder
+# Claude Code already keeps for that project, named after its full path, e.g.
+#   ~/.claude/projects/-Users-you-Projects-recipes-app/memory/MEMORY.md
+# which is unique because the whole path is in the name. This example sets
+# `store` only because it must work from wherever the repo is cloned.
+[[scopes]]
+name = "recipes-app"
+root = "recipes-app"
+store = "store/recipes-app"

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Refuse the commit if anything staged looks personal or private, or if the
+# test suite fails. Bypassing this with --no-verify defeats the point.
+ROOT=$(git rev-parse --show-toplevel)
+python3 "$ROOT/tests/leak_scan.py" --staged || exit 1
+python3 "$ROOT/tests/leak_scan.py" || exit 1
+make -s -C "$ROOT" test >/dev/null 2>&1 || { echo "pre-commit: make test failed; run it to see why"; exit 1; }

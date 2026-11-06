@@ -1,0 +1,51 @@
+# session-notes config. Copy to ~/.config/session-notes/config.toml
+# (or point $SESSION_NOTES_CONFIG at it). Every key is optional; the values
+# shown are the defaults. Relative paths resolve against this file's folder.
+# Unknown keys are an error, so a typo fails loudly instead of being ignored.
+
+[paths]
+# Claude Code's own directory (transcripts live under projects/).
+claude_home = "~/.claude"
+# Runtime state: bus mailbox, locks, audit logs, pane registry.
+# Never memory content.
+state_dir = "~/.claude/session-notes/state"
+# The global memory store. Empty = ~/.claude/projects/<your encoded home>/memory,
+# the folder Claude Code already uses for sessions started in your home dir.
+global_store = ""
+
+[time]
+# IANA zone for the clock anchor, e.g. "Europe/Berlin". Empty = system local.
+timezone = ""
+# After this many idle minutes, time_sense tells the model its context may be stale.
+stale_after_minutes = 120
+
+[bcast]
+# Marker typed in front of broadcast prose so receivers know it was a broadcast.
+prefix = "[user via bcast]"
+
+[bus]
+# tmux session name suggested in the "bus_nudge is down" restart hint.
+nudge_session = "bus-nudge"
+
+[budgets]
+# Boot-prefix budgets, checked by boot_budget.py. Measured in characters,
+# which is what the boot prefix counts.
+global_index_bytes = 45000
+scope_index_bytes = 30000
+resume_bytes = 12000
+claude_md_bytes = 20000
+# Ceiling for a CLAUDE.md found outside every configured scope.
+unlisted_claude_md_bytes = 40000
+# Folders walked (depth 3) for CLAUDE.md files outside any scope.
+sweep_roots = ["~/Projects"]
+
+# One block per project folder that keeps its own memory store.
+# `store` is optional, and best left out: empty = the folder Claude Code
+# already keeps for that project, named after its full path, e.g.
+#   ~/.claude/projects/-Users-you-code-recipes-app/memory
+# (unique, because the whole path is in the name).
+#
+# [[scopes]]
+# name = "recipes-app"
+# root = "~/code/recipes-app"
+# store = ""

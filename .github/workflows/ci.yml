@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Official Python images, so the oldest supported version (3.9, what
+    # macOS ships) stays testable after runner images drop it.
+    container: python:${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-tests and hook smoke tests (HOME is a temp dir)
+        run: make test
+      - name: Leak scan (public patterns; private terms live on the author's machine)
+        run: LEAK_SCAN_PUBLIC_ONLY=1 python3 tests/leak_scan.py
