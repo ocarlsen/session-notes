@@ -35,9 +35,8 @@ TURN STATE
   idle_prompt is not a reliable Stop substitute: it only fires about 60
   seconds after a Stop that nothing then touches, and an interrupt
   mid-generation produces neither a Stop nor an idle_prompt, so a pane is
-  left reading "working" until its next prompt; a reader of this state
-  should ignore a "working" record that is more than a couple of hours old
-  for exactly this reason. A turn parked at a permission prompt also stays
+  left reading "working" until its next prompt, and a reader may want to
+  treat a "working" record that is hours old as stale. A turn parked at a permission prompt also stays
   "working" on purpose: the permission-prompt notification is not the end
   of a turn.
 
@@ -335,7 +334,7 @@ def selftest():
                                  ".pane_state.inflight")
         with open(inflight, "w") as f:
             f.write("{}")
-        _live_pane_ids = lambda: {"%live", "%cur"}
+        _live_pane_ids = lambda: {"%live"}  # %cur left out: only the current-pane guard keeps it
         os.environ.update(TMUX_PANE="%cur", CLAUDE_CODE_SESSION_ID="sess-delta", CLAUDE_PID="333")
         sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart"}))
         main()

@@ -132,7 +132,7 @@ in `/rnr`, which is where it is actually acted on.
 
 ## Notes
 
-- Read-only and idempotent: `/refresh` never writes (the one exception is the Step 2b-ii bus
+- Read-only and idempotent: `/refresh` never writes (the one exception is the Step 2b-ii native
   message on a detected collision).
 - `/refresh` never invokes `/reflect` and never recommends it. The sibling peek in Step 2b feeds
   collision-avoidance here and (when chained) `/rnr`'s gate; it is not a reflect recommendation.
