@@ -10,6 +10,11 @@ to end in one of them:
   ported      the change (or its equivalent) is in this repo
   local-only  the change is specific to that one setup and does not belong here
 
+An upstream commit whose message says it is itself a port OF a session-notes PR (the change
+originated here, then got carried back upstream) is auto-closed: it does not count as pending
+and does not need a `mark`. It is still listed, because a port commit can carry an extra
+upstream-only change alongside the port, and that extra change needs the usual decision.
+
 The per-file watermark (the last upstream commit decided) is private state, kept outside the
 repo: ~/.config/session-notes/upstream-state.json, or $SESSION_NOTES_UPSTREAM_STATE.
 Upstream commit ids and messages are never written into this repo.
@@ -29,6 +34,7 @@ on a setup error (no state, missing upstream). It never runs in CI, which has no
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +45,13 @@ import notes_config  # noqa: E402
 
 TRACKED_DIRS = ("bin", "hooks", "skills")
 DECISIONS = ("ported", "local-only")
+
+# "support of session-notes #3" contains the literal substring "port of" (supPORT OF) -- the
+# leading \b keeps that from matching, since there is no word boundary before "port" there.
+# The owner prefix (as in "someuser/session-notes") is a generic token, not this repo's own
+# name, so a fork can run this unmodified and so this file's own leak scan stays clean.
+AUTOCLOSE_RE = re.compile(
+    r"\bport of\s+(?:[\w.-]+/)?session-notes(?:-dev)?\s*(?:pr)?\s*#(\d+)", re.IGNORECASE)
 
 
 class SetupError(Exception):
@@ -113,14 +126,17 @@ def save_state(state, path=None):
 
 
 def pending(state, pairs, problems=None):
-    """{repo_file: [(sha, date, subject), ...]} of upstream commits after each watermark.
-    Map problems that need a person (a pair never decided, an upstream path that no longer
-    exists, a watermark gone from upstream history) are appended to `problems` when given,
-    else raised."""
+    """Three maps of upstream commits after each watermark, keyed by repo_file: commits still
+    needing a decision as {file: [(sha, date, subject), ...]}; commits auto-closed because the
+    message itself says it is a port of a session-notes PR, as {file: [(sha, date, subject,
+    ref), ...]} (ref like "#15"); and {file: sha} of the newest commit in either list (upstream
+    `git log` order is newest first). Map problems that need a person (a pair never decided, an
+    upstream path that no longer exists, a watermark gone from upstream history) are appended
+    to `problems` when given, else raised."""
     up = os.path.expanduser(state["upstream"])
     if not os.path.isdir(up):
         raise SetupError("upstream %s does not exist" % up)
-    out = {}
+    todo, closed, newest = {}, {}, {}
 
     def problem(msg):
         if problems is None:
@@ -139,12 +155,31 @@ def pending(state, pairs, problems=None):
             problem("%s: watermark %s is not in upstream history (rebased or force-pushed?): "
                     "review, then `mark %s ... --reset`" % (h, mark["through"][:9], h))
             continue
-        log = git(up, "log", "--format=%H%x09%ad%x09%s", "--date=short",
+        # %B (the full message, subject and body) carries the auto-close phrasing whether it
+        # falls on the subject line or below it. \x1f/\x1e separate fields/records since a body
+        # can hold anything, including tabs and blank lines. Each record STARTS with \x1e and
+        # a full sha, and the split requires both, so a stray \x1e inside a body stays part of
+        # that body instead of breaking the parse.
+        log = git(up, "log", "--format=%x1e%H%x1f%ad%x1f%s%x1f%B", "--date=short",
                   "%s..HEAD" % mark["through"], "--", u)
-        rows = [tuple(l.split("\t", 2)) for l in log.splitlines() if l.strip()]
-        if rows:
-            out[h] = rows
-    return out
+        todo_rows, closed_rows = [], []
+        for rec in re.split(r"\x1e(?=[0-9a-f]{40}\x1f)", log):
+            if not rec.strip():
+                continue
+            sha, date, subject, body = rec.split("\x1f", 3)
+            sha = sha.strip()
+            if h not in newest:
+                newest[h] = sha  # first record seen is the newest (git log is newest-first)
+            m = AUTOCLOSE_RE.search(body)
+            if m:
+                closed_rows.append((sha, date, subject, "#" + m.group(1)))
+            else:
+                todo_rows.append((sha, date, subject))
+        if todo_rows:
+            todo[h] = todo_rows
+        if closed_rows:
+            closed[h] = closed_rows
+    return todo, closed, newest
 
 
 def unmapped(pairs, repo_only, root=None):
@@ -171,12 +206,14 @@ def cmd_check(args):
     pairs, only = load_map()
     state = load_state()
     problems = []
-    todo = pending(state, pairs, problems)
+    todo, closed, newest = pending(state, pairs, problems)
     loose = unmapped(pairs, only)
     count = sum(len(v) for v in todo.values())
     if args.json:
         print(json.dumps({"pending": count, "files": {h: [{"sha": s, "date": d, "subject": m}
                           for s, d, m in rows] for h, rows in todo.items()},
+                          "auto_closed": {h: [{"sha": s, "date": d, "subject": m, "ref": r}
+                          for s, d, m, r in rows] for h, rows in closed.items()},
                           "unmapped": loose, "problems": problems}, indent=2))
     else:
         if not todo and not loose and not problems:
@@ -187,11 +224,20 @@ def cmd_check(args):
             print("%s  (%d upstream change%s)" % (h, len(rows), "" if len(rows) == 1 else "s"))
             for s, d, m in rows:
                 print("    %s %s %s" % (s[:9], d, m))
+        for h, rows in closed.items():
+            print("%s  (%d auto-closed: ports of session-notes PRs)" % (h, len(rows)))
+            for s, d, m, r in rows:
+                print("    %s %s %s  [port of %s]" % (s[:9], d, m, r))
         for f in loose:
             print("%s  UNMAPPED: add it to tools/upstream.toml as a pair or repo_only" % f)
-        if todo:
-            print("\nFor each file: port the change, or decide it is local-only, then\n"
-                  "  upstream_drift.py mark FILE ported|local-only [--through SHA]")
+        if closed:
+            print("\nAuto-closed commits came from this repo; check none carries an extra "
+                  "upstream-only change, then mark the file.")
+        todo_or_closed = sorted(set(todo) | set(closed))
+        if todo_or_closed:
+            print("\nthen record the decision (after the port merges, or to decide local-only):")
+            for h in todo_or_closed:
+                print("  upstream_drift.py mark %s ported|local-only --through %s" % (h, newest[h][:9]))
     return 1 if (todo or loose or problems) else 0
 
 
@@ -260,17 +306,19 @@ def selftest():
 
         head = git(up, "rev-parse", "HEAD").strip()
         state = {"upstream": up, "files": {h: {"through": head, "how": "seed"} for h in pairs}}
-        check("clean after seed at HEAD", pending(state, pairs) == {})
+        check("clean after seed at HEAD", pending(state, pairs)[0] == {})
 
         fix = commit("bin/a.py", "a2\n", "a: fix the thing")
-        todo = pending(state, pairs)
+        todo, closed, newest = pending(state, pairs)
         check("upstream change to a shared file is pending",
               list(todo) == ["bin/a.py"] and todo["bin/a.py"][0][0] == fix)
+        check("no auto-closed commits here", closed == {})
+        check("newest tracks the pending commit too", newest["bin/a.py"] == fix)
         commit("bin/unrelated.txt", "z\n", "unrelated")
-        check("unrelated upstream change is not pending", list(pending(state, pairs)) == ["bin/a.py"])
+        check("unrelated upstream change is not pending", list(pending(state, pairs)[0]) == ["bin/a.py"])
 
         state["files"]["bin/a.py"] = {"through": git(up, "rev-parse", "HEAD").strip(), "how": "ported"}
-        check("marking clears it", pending(state, pairs) == {})
+        check("marking clears it", pending(state, pairs)[0] == {})
 
         with open(os.path.join(repo, "bin", "new.py"), "w") as fh:
             fh.write("y\n")
@@ -289,7 +337,7 @@ def selftest():
         try:
             state["files"]["bin/b.py"] = {"through": base, "how": "seed"}
             try:
-                got = "bin/b.py" in pending(state, pairs)
+                got = "bin/b.py" in pending(state, pairs)[0]
             except SetupError:
                 got = False
             check("git calls ignore an inherited GIT_DIR", got)
@@ -352,6 +400,149 @@ def selftest():
         check("state saved private (0600)", oct(os.stat(sp).st_mode & 0o777) == "0o600")
         check("state round-trips", load_state(sp) == state)
         shutil.rmtree(up)
+
+        # Auto-close: an upstream commit saying it is itself a port OF a session-notes PR.
+        up2, repo2 = os.path.join(d, "up2"), os.path.join(d, "repo2")
+        os.makedirs(os.path.join(up2, "bin"))
+        os.makedirs(os.path.join(repo2, "bin"))
+        os.makedirs(os.path.join(repo2, "tools"))
+        git(up2, "init", "-q")
+        git(up2, "config", "user.email", "test@example.com")
+        git(up2, "config", "user.name", "Selftest")
+
+        def commit2(text, msg, body=None):
+            with open(os.path.join(up2, "bin", "a.py"), "w") as fh:
+                fh.write(text)
+            git(up2, "add", "bin/a.py")
+            cargs = ["commit", "-q", "-m", msg]
+            if body:
+                cargs += ["-m", body]
+            git(up2, *cargs)
+            return git(up2, "rev-parse", "HEAD").strip()
+
+        ac_base = commit2("a0\n", "a: first")
+        with open(os.path.join(repo2, "bin", "a.py"), "w") as fh:
+            fh.write("x\n")
+        with open(os.path.join(repo2, "tools", "upstream.toml"), "w") as fh:
+            fh.write('[[pair]]\nrepo = "bin/a.py"\nupstream = "bin/a.py"\n')
+        pairs2, only2 = load_map(repo2)
+
+        # Positive: real upstream phrasings (subject or body) that this repo originated.
+        # (The owner is a placeholder, not this repo's own GitHub name: the regex's owner
+        # prefix is generic, see AUTOCLOSE_RE, so this exercises that generic match.)
+        pos_pr = commit2("a1\n", "Port of someuser/session-notes PR #15.")
+        pos_hash = commit2("a2\n", "Port of session-notes #14.")
+        pos_compact = commit2("a3\n", "bus: retire a finished turn's mail on Stop "
+                                      "(port of session-notes#8)")
+        pos_body = commit2("a4\n", "a: refactor the helper", body="Port of someuser/session-notes PR #22.")
+        # Anti-population: real near-miss phrasings that must stay pending.
+        neg_unrelated_hash = commit2("a5\n", "personal_brief: one line for session-notes "
+                                              "upstream drift (#31)")
+        neg_sent_to = commit2("a6\n", "Port sent to session-notes.")
+        neg_ported_to = commit2("a7\n", "ported to session-notes later")
+        neg_bare_mention = commit2("a8\n", "session-notes#8 is related")
+        odd_body = commit2("a8b\n", "a: odd body", body="stray \x1e and \x1f separators")
+        neg_support_of = commit2("a9\n", "support of session-notes #3")
+        newest_sha = neg_support_of  # the true HEAD: last commit made
+
+        state2 = {"upstream": up2, "files": {"bin/a.py": {"through": ac_base, "how": "seed"}}}
+        todo2, closed2, newest2 = pending(state2, pairs2)
+        todo_shas = {r[0] for r in todo2.get("bin/a.py", [])}
+        refs = {c[0]: c[3] for c in closed2.get("bin/a.py", [])}
+
+        check("'Port of owner/session-notes PR #N.' auto-closes", refs.get(pos_pr) == "#15")
+        check("'Port of session-notes #N.' auto-closes", refs.get(pos_hash) == "#14")
+        check("compact parenthetical 'port of session-notes#N' auto-closes", refs.get(pos_compact) == "#8")
+        check("a match in the BODY (not the subject) auto-closes", refs.get(pos_body) == "#22")
+        check("auto-closed commits are excluded from pending",
+              todo_shas.isdisjoint({pos_pr, pos_hash, pos_compact, pos_body}))
+        check("a body holding the separator characters parses and stays pending", odd_body in todo_shas)
+        check("an unrelated trailing '(#N)' with no 'port of' stays pending", neg_unrelated_hash in todo_shas)
+        check("'Port sent to' (no 'of') stays pending", neg_sent_to in todo_shas)
+        check("'ported to' (not 'port of') stays pending", neg_ported_to in todo_shas)
+        check("a bare 'session-notes#N' mention with no 'port of' stays pending", neg_bare_mention in todo_shas)
+        check("'support of' does not false-match the 'port of' substring it contains",
+              neg_support_of in todo_shas)
+        check("newest tracks the true HEAD across pending and auto-closed", newest2["bin/a.py"] == newest_sha)
+
+        # Only-auto-closed history: nothing pending, but a decision is still owed.
+        up3 = os.path.join(d, "up3")
+        os.makedirs(os.path.join(up3, "bin"))
+        git(up3, "init", "-q")
+        git(up3, "config", "user.email", "test@example.com")
+        git(up3, "config", "user.name", "Selftest")
+
+        def commit3(text, msg, body=None):
+            with open(os.path.join(up3, "bin", "a.py"), "w") as fh:
+                fh.write(text)
+            git(up3, "add", "bin/a.py")
+            cargs = ["commit", "-q", "-m", msg]
+            if body:
+                cargs += ["-m", body]
+            git(up3, *cargs)
+            return git(up3, "rev-parse", "HEAD").strip()
+
+        base3 = commit3("a0\n", "a: first")
+        only_close = commit3("a1\n", "Port of session-notes #7.")
+        state3 = {"upstream": up3, "files": {"bin/a.py": {"through": base3, "how": "seed"}}}
+        todo3, closed3, newest3 = pending(state3, pairs2)
+        check("an only-auto-closed history has empty pending", todo3 == {})
+        check("an only-auto-closed history still reports the auto-close",
+              closed3.get("bin/a.py", [(None,)])[0][0] == only_close)
+
+        # CLI: JSON shape, exit code, and the copy-paste mark-command footer.
+        saved_root2, saved_env2 = ROOT, os.environ.get("SESSION_NOTES_UPSTREAM_STATE")
+        ROOT = repo2
+        os.environ["SESSION_NOTES_UPSTREAM_STATE"] = os.path.join(d, "cli2", "state.json")
+        try:
+            import contextlib
+            import io
+
+            def run2(*a):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    rc = main(list(a))
+                return rc, buf.getvalue()
+
+            check("seed on the mixed history exits 0", run2("seed", "--upstream", up2, "--at", ac_base)[0] == 0)
+            rc, out = run2("check", "--json")
+            payload = json.loads(out)
+            check("JSON pending excludes auto-closed shas", {r["sha"] for r in payload["files"]["bin/a.py"]}
+                  == todo_shas)
+            check("JSON pending count matches", payload["pending"] == len(todo_shas))
+            check("JSON auto_closed lists ports with their ref", {
+                (r["sha"], r["ref"]) for r in payload["auto_closed"]["bin/a.py"]} ==
+                {(pos_pr, "#15"), (pos_hash, "#14"), (pos_compact, "#8"), (pos_body, "#22")})
+
+            rc, out = run2("check")
+            check("exit code is 1 while real upstream changes are pending", rc == 1)
+            check("footer prints a mark command with the newest sha for that file",
+                  ("upstream_drift.py mark bin/a.py ported|local-only --through %s" % newest_sha[:9]) in out)
+            check("the mark command keeps 'ported|local-only' explicit, not auto-chosen", "ported|local-only" in out)
+            check("auto-closed commits print their own section",
+                  "(4 auto-closed: ports of session-notes PRs)" in out)
+            check("the auto-closed check-before-marking footer line prints",
+                  "check none carries an extra upstream-only change, then mark the file." in out)
+
+            rc, out = run2("mark", "bin/a.py", "ported", "--through", newest_sha[:9])
+            check("mark accepts a 9-character abbreviated sha", rc == 0)
+
+            check("re-seed on the only-auto-closed history exits 0",
+                  run2("seed", "--upstream", up3, "--at", base3, "--force")[0] == 0)
+            rc, out = run2("check")
+            check("exit code is 0 when only auto-closed commits remain and nothing is unmapped", rc == 0)
+            check("'nothing pending' still prints when only auto-closed commits remain",
+                  "upstream_drift: nothing pending" in out)
+            check("the auto-closed section still prints after 'nothing pending'",
+                  "(1 auto-closed: ports of session-notes PRs)" in out)
+        finally:
+            ROOT = saved_root2
+            if saved_env2 is None:
+                os.environ.pop("SESSION_NOTES_UPSTREAM_STATE", None)
+            else:
+                os.environ["SESSION_NOTES_UPSTREAM_STATE"] = saved_env2
+        shutil.rmtree(up2)
+        shutil.rmtree(up3)
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
