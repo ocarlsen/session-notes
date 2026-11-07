@@ -6,7 +6,7 @@
 # [[pair]] or in repo_only; the drift check fails on an unmapped file so a new file is a
 # decision, not an omission.
 
-repo_only = ["bin/notes_config.py", "bin/session_peers.py"]
+repo_only = ["bin/notes_config.py", "bin/session_peers.py", "bin/setup_claude.py"]
 
 [[pair]]
 repo = "bin/append_memory_index.py"
