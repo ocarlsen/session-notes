@@ -551,6 +551,8 @@ def report_mode():
             else:
                 flag = "ok"
             doubled = "  [DOUBLE-LOADS via native auto memory]" if e["doubled"] else ""
+            if e.get("native"):
+                doubled = "  [loaded natively, not @imported]"
             budget_s = f"{budget:,}" if budget is not None else "-"
             print(f"  {_display(e['path']):<70} {e['chars']:>7,} / {budget_s:>7}  {flag}{doubled}")
         # WARN_AT < TOTAL_LIMIT always (enforced by the selftest regression guard), so

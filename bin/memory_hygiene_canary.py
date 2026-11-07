@@ -453,17 +453,18 @@ def _non_empty_stores(cfg):
             yield store_dir, md_files, content_files
 
 
-def _scope_root_for_store(cfg, store_dir):
-    """The scope root ("~" for the global store) whose configured store IS `store_dir`
-    by realpath, or None when `store_dir` is not any configured scope's store (e.g. an
-    unconfigured stray store)."""
+def _scope_roots_for_store(cfg, store_dir):
+    """Every scope root ("~" for the global store) whose configured store IS `store_dir`
+    by realpath; empty when `store_dir` is not any configured scope's store (e.g. an
+    unconfigured stray store). Two scopes may share one store."""
     store_rp = os.path.realpath(str(store_dir))
+    roots = []
     if os.path.realpath(str(cfg["paths"]["global_store"])) == store_rp:
-        return "~"
+        roots.append("~")
     for s in cfg.get("scopes", []):
         if os.path.realpath(str(s["store"])) == store_rp:
-            return s["root"]
-    return None
+            roots.append(s["root"])
+    return roots
 
 
 def orphan_store_findings(cfg, reached=None):
@@ -487,12 +488,12 @@ def orphan_store_findings(cfg, reached=None):
         check_files = [memory_md] if memory_md.is_file() else md_files
         if any(os.path.realpath(str(p)) in reached for p in check_files):
             continue
-        root = _scope_root_for_store(cfg, store_dir)
-        if root is not None and memory_md.is_file():
+        if memory_md.is_file():
             import boot_budget
-            native = os.path.realpath(boot_budget.native_memory_path(root))
-            if (os.path.realpath(str(memory_md)) == native
-                    and boot_budget.is_auto_memory_enabled(root)):
+            memory_rp = os.path.realpath(str(memory_md))
+            if any(memory_rp == os.path.realpath(boot_budget.native_memory_path(root))
+                   and boot_budget.is_auto_memory_enabled(root)
+                   for root in _scope_roots_for_store(cfg, store_dir)):
                 continue  # natively loaded; not an orphan
         if content_files:
             holds = "%d memory files" % len(content_files)
@@ -892,6 +893,7 @@ def selftest():
         # store on its own, so it must not be flagged.
         import boot_budget
         orig_override = boot_budget.CONFIG_DIR_OVERRIDE
+        orig_disable = os.environ.pop("CLAUDE_CODE_DISABLE_AUTO_MEMORY", None)
         boot_budget.CONFIG_DIR_OVERRIDE = cfg["paths"]["claude_home"]
         settings_path = Path(cfg["paths"]["claude_home"]) / "settings.json"
         try:
@@ -913,8 +915,18 @@ def selftest():
             check(hit_on == [],
                   "check 10: with auto memory on for the scope, an un-imported store loads "
                   "natively and is NOT flagged as an orphan")
+
+            # Two scopes share the store; only the second one's native path is it.
+            cfg["scopes"].insert(0, {"name": "decoy", "root": os.path.join(d, "decoy-scope"),
+                                     "store": str(auto_native.parent)})
+            hit_shared = [f for f in orphan_store_findings(cfg) if str(auto_native.parent) in f]
+            cfg["scopes"].pop(0)
+            check(hit_shared == [],
+                  "check 10: a shared store loads natively for its second scope, NOT flagged")
         finally:
             boot_budget.CONFIG_DIR_OVERRIDE = orig_override
+            if orig_disable is not None:
+                os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = orig_disable
             cfg["scopes"].pop()
             if settings_path.exists():
                 settings_path.unlink()
