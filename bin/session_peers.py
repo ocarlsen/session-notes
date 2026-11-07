@@ -137,6 +137,52 @@ def write_pane_state(pane_id, state, claude_pid, cfg=None):
             os.unlink(tmp)
 
 
+def sweep_pane_state(live, current_pane, cfg=None):
+    """Delete pane_state/<stem>.json files for panes tmux no longer knows
+    about. Called from the pane-registry hook's SessionStart path, reusing
+    the same live-pane-ids call that already prunes the registry.
+
+    live=None ("no information") deletes nothing, same meaning the registry's
+    own prune gives it: a failed tmux call must never be read as "nothing is
+    live". The current pane's own file is never deleted. A fresh in-flight
+    tempfile (write_pane_state's ".pane_state." mkstemp prefix) is left alone
+    unless it is over an hour old, since a fresh one may be mid os.replace().
+    Fail-open: any error here is swallowed, same contract as the rest of the
+    hook that calls it."""
+    if live is None:
+        return
+    import notes_config
+    try:
+        state_dir = notes_config.state_path(PANE_STATE_DIR, cfg=cfg)
+        current_stem = "".join(c for c in (current_pane or "") if c.isalnum()) or "nopane"
+        live_stems = {"".join(c for c in p if c.isalnum()) or "nopane" for p in live}
+        now = time.time()
+        for name in os.listdir(state_dir):
+            path = os.path.join(state_dir, name)
+            if name.startswith(".pane_state."):
+                try:
+                    if now - os.path.getmtime(path) < 3600:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            if not name.endswith(".json"):
+                continue
+            stem = name[:-len(".json")]
+            if stem == current_stem or stem in live_stems:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def read_pane_state(pane_id, cfg=None):
     """The pane's hook record as a dict, or None when missing or corrupt."""
     try:

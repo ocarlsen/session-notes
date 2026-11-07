@@ -660,11 +660,13 @@ def render_injection(me, msgs, primer=False):
         reply_to = next((m for m in msgs if m.get("from_created") is not None), None)
         if reply_to is not None:
             lines.append(
-                "(New capability: sibling tmux Claude sessions can now message each "
-                f"other. Reply with `python3 {SELF} send --to "
-                f"{reply_to.get('from')} \"text\"`; `session_bus.py peers` lists who is "
-                "reachable. Delivery is asynchronous, landing on that pane's next "
-                "prompt, so it is handoff, not chat.)"
+                "(For a live back-and-forth with this sibling, use Claude Code's "
+                "native cross-session messaging (SendMessage; `/list-agents` finds "
+                "the target) instead of this bus. This bus stays for staged specs "
+                f"and job mail: to reply within one of those, `python3 {SELF} send "
+                f"--to {reply_to.get('from')} \"text\"`; `session_bus.py peers` "
+                "lists who is reachable. Delivery here is asynchronous, landing on "
+                "that pane's next prompt, so it is handoff, not chat.)"
             )
         else:
             lines.append(
