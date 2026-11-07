@@ -26,8 +26,9 @@ looks for the cruft and drift that accumulate as /reflect writes to a store:
      imported              entry point. It must never be: the whole point of the cold
                            tier is that it does not pay boot-prefix rent.
  10. Orphan STORE        -- a whole store (`<claude_home>/projects/<slug>/memory/`) that
-                           holds real memory files but whose MEMORY.md no CLAUDE.md entry
-                           point @imports. Everything it holds loads NOWHERE: the
+                           is non-empty per _non_empty_stores() (real memory files, or a
+                           real RESUME.md narrative) but whose MEMORY.md no CLAUDE.md
+                           entry point @imports. Everything it holds loads NOWHERE: the
                            store-level version of check 1's per-file orphan. Spans every
                            store found on disk, not just the configured ones, since an
                            unconfigured store is exactly the kind nobody is watching.
@@ -415,9 +416,16 @@ def reference_imported_findings(cfg, reached=None):
 # --- Check 10: orphan STORE, a whole store nothing @imports -----------------------
 def _non_empty_stores(cfg):
     """Yield (store_dir, md_files, content_files) for every
-    `<claude_home>/projects/*/memory` dir on disk, plus every configured store, that
-    holds at least one real (non-STRUCTURAL) .md file. Empty stores (a bare stub, or a
-    content-free scratch dir) are the anti-population and must never be flagged."""
+    `<claude_home>/projects/*/memory` dir on disk, plus every configured store, that is
+    NOT the anti-population (a bare MEMORY.md stub, or a content-free scratch dir).
+
+    A store counts as non-empty (is yielded) when ANY of:
+      - it holds at least one real (non-STRUCTURAL) .md file (content_files non-empty), or
+      - it has a RESUME.md whose content is non-empty after `.strip()` (whitespace-only
+        counts as empty; an unreadable RESUME.md -- OSError/UnicodeDecodeError -- counts
+        as non-empty, failing toward checking rather than a silent skip).
+    content_files may be empty for a yielded store (e.g. a store whose only content is a
+    real RESUME.md narrative with no indexed memory files)."""
     candidates = []
     projects_dir = Path(cfg["paths"]["claude_home"]) / "projects"
     if projects_dir.is_dir():
@@ -433,6 +441,29 @@ def _non_empty_stores(cfg):
         content_files = [p for p in md_files if p.name not in STRUCTURAL]
         if content_files:
             yield store_dir, md_files, content_files
+            continue
+        resume_counts = False
+        resume_path = store_dir / "RESUME.md"
+        if resume_path.is_file():
+            try:
+                resume_counts = bool(resume_path.read_text(encoding="utf-8").strip())
+            except (OSError, UnicodeDecodeError):
+                resume_counts = True  # fail toward checking, never toward silent skip
+        if resume_counts:
+            yield store_dir, md_files, content_files
+
+
+def _scope_root_for_store(cfg, store_dir):
+    """The scope root ("~" for the global store) whose configured store IS `store_dir`
+    by realpath, or None when `store_dir` is not any configured scope's store (e.g. an
+    unconfigured stray store)."""
+    store_rp = os.path.realpath(str(store_dir))
+    if os.path.realpath(str(cfg["paths"]["global_store"])) == store_rp:
+        return "~"
+    for s in cfg.get("scopes", []):
+        if os.path.realpath(str(s["store"])) == store_rp:
+            return s["root"]
+    return None
 
 
 def orphan_store_findings(cfg, reached=None):
@@ -440,7 +471,14 @@ def orphan_store_findings(cfg, reached=None):
     whole store loads nowhere. When a store has a MEMORY.md, ONLY that file is checked:
     a store can be wired in via RESUME.md alone while MEMORY.md itself is orphaned, and
     that is still a real finding. The any-.md fallback applies only when the store has
-    no MEMORY.md at all. [] when clean."""
+    no MEMORY.md at all.
+
+    A store whose scope has Claude Code's native auto memory on (boot_budget's
+    is_auto_memory_enabled()) is not an orphan even with no @import, PROVIDED its
+    MEMORY.md sits at that scope's native auto memory path (<claude_home>/projects/
+    <slug>/memory/MEMORY.md): that file loads on its own, natively, every time a
+    session starts in that scope. A custom store path native auto memory does not
+    know about gets no such pass. [] when clean."""
     reached = reached_files(cfg) if reached is None else reached
     known = {os.path.realpath(str(s)) for _, s, _ in configured_stores(cfg)}
     findings = []
@@ -449,9 +487,23 @@ def orphan_store_findings(cfg, reached=None):
         check_files = [memory_md] if memory_md.is_file() else md_files
         if any(os.path.realpath(str(p)) in reached for p in check_files):
             continue
+        root = _scope_root_for_store(cfg, store_dir)
+        if root is not None and memory_md.is_file():
+            import boot_budget
+            native = os.path.realpath(boot_budget.native_memory_path(root))
+            if (os.path.realpath(str(memory_md)) == native
+                    and boot_budget.is_auto_memory_enabled(root)):
+                continue  # natively loaded; not an orphan
+        if content_files:
+            holds = "%d memory files" % len(content_files)
+        else:
+            # No real content files -- the store was yielded only because it has a
+            # real RESUME.md narrative; name what it actually holds rather than
+            # misleadingly saying "0 memory files".
+            holds = ("%s only" % ", ".join(p.name for p in md_files)) if md_files else "no .md files"
         msg = (
-            "STORE %s: %d memory files, no CLAUDE.md entry point @imports it "
-            "(nothing it holds ever loads)" % (store_dir, len(content_files))
+            "STORE %s: %s, no CLAUDE.md entry point @imports it "
+            "(nothing it holds ever loads)" % (store_dir, holds)
         )
         if os.path.realpath(str(store_dir)) not in known:
             msg += " (not in the config: add a [[scopes]] entry and an @import in its CLAUDE.md)"
@@ -767,11 +819,12 @@ def selftest():
         _write(global_claude, "# global\n@%s\n" % g_mem)
         _write(scope_claude, "# alpha\n@%s\n" % s_mem)
 
-        # Anti-population: an empty store dir and a structural-only store.
+        # Anti-population: an empty store dir, a bare MEMORY.md stub, and a store with
+        # only a whitespace-only RESUME.md alongside it (whitespace never counts).
         projects = Path(cfg["paths"]["claude_home"]) / "projects"
         (projects / "-empty" / "memory").mkdir(parents=True)
         _write(projects / "-structural" / "memory" / "MEMORY.md", "# Memory Index\n\n")
-        _write(projects / "-structural" / "memory" / "RESUME.md", "# RESUME\n")
+        _write(projects / "-structural" / "memory" / "RESUME.md", "   \n\t\n")
 
         cap = _Capture()
         rc = report_mode(cfg, cap)
@@ -793,9 +846,30 @@ def selftest():
               "report_mode(): exits %d with the REFERENCE.md section" % EXIT_FINDINGS)
         _write(global_claude, "# global\n@%s\n" % g_mem)
 
-        # Check 10: anti-population stays silent.
+        # Check 10: anti-population stays silent (bare MEMORY.md stub, whitespace-only RESUME.md).
         clean = orphan_store_findings(cfg)
         check(clean == [], "check 10: wired stores, empty and structural-only stores are silent")
+
+        # Check 10: a store with MEMORY.md + a real RESUME.md narrative (no indexed
+        # memory files) IS flagged -- inverted from the old reading above, which treated
+        # any MEMORY.md + RESUME.md store as structural-only regardless of content.
+        resume_narrative = projects / "-resume-narrative" / "memory"
+        _write(resume_narrative / "MEMORY.md", "# Memory Index\n\n")
+        _write(resume_narrative / "RESUME.md", "- [ ] ship the thing\n")
+        hit = [f for f in orphan_store_findings(cfg) if str(resume_narrative) in f]
+        check(len(hit) == 1, "check 10: a store with only a real RESUME.md narrative is flagged")
+        check(bool(hit) and "0 memory files" not in hit[0],
+              "check 10: the RESUME-narrative store's message does not misreport '0 memory files'")
+        check(bool(hit) and "RESUME.md" in hit[0] and "MEMORY.md" in hit[0],
+              "check 10: the RESUME-narrative store's message names what it actually holds")
+
+        # Check 10: an unreadable (non-UTF-8) RESUME.md beside a bare MEMORY.md fails
+        # toward checking -- flagged, never a silent skip.
+        undecodable = projects / "-undecodable-resume" / "memory"
+        _write(undecodable / "MEMORY.md", "# Memory Index\n\n")
+        (undecodable / "RESUME.md").write_bytes(b"\xff\xfe")
+        check(any(str(undecodable) in f for f in orphan_store_findings(cfg)),
+              "check 10: a store whose RESUME.md is unreadable IS flagged (fails toward checking)")
 
         # Check 10: an unconfigured content store nothing imports.
         stray = projects / "-stray" / "memory"
@@ -811,6 +885,39 @@ def selftest():
         hit = [f for f in orphan_store_findings(cfg) if scope_store in f]
         check(len(hit) == 1 and "not in the config" not in hit[0],
               "check 10: RESUME.md reached but MEMORY.md not, configured store still flagged")
+
+        # Check 10 (native auto memory trial): a scope whose store sits at ITS OWN
+        # native auto memory path and is never @imported anywhere. With auto memory off
+        # for it, that's an ordinary orphan; with it on, native loading reaches the
+        # store on its own, so it must not be flagged.
+        import boot_budget
+        orig_override = boot_budget.CONFIG_DIR_OVERRIDE
+        boot_budget.CONFIG_DIR_OVERRIDE = cfg["paths"]["claude_home"]
+        settings_path = Path(cfg["paths"]["claude_home"]) / "settings.json"
+        try:
+            auto_root = os.path.join(d, "auto-scope")
+            os.makedirs(auto_root, exist_ok=True)
+            _write(os.path.join(auto_root, "CLAUDE.md"), "# auto-scope: no memory import\n")
+            auto_native = Path(boot_budget.native_memory_path(auto_root))
+            _write(auto_native, "# Memory Index\n\n- [Z](reference_autoz.md) -- hook\n")
+            _write(auto_native.parent / "reference_autoz.md", _mem_file("autoz"))
+            cfg["scopes"].append({"name": "auto", "root": auto_root, "store": str(auto_native.parent)})
+
+            _write(settings_path, '{"autoMemoryEnabled": false}')
+            hit_off = [f for f in orphan_store_findings(cfg) if str(auto_native.parent) in f]
+            check(len(hit_off) == 1,
+                  "check 10: auto memory off, an un-imported native-path store IS flagged (ordinary orphan)")
+
+            _write(settings_path, '{"autoMemoryEnabled": true}')
+            hit_on = [f for f in orphan_store_findings(cfg) if str(auto_native.parent) in f]
+            check(hit_on == [],
+                  "check 10: with auto memory on for the scope, an un-imported store loads "
+                  "natively and is NOT flagged as an orphan")
+        finally:
+            boot_budget.CONFIG_DIR_OVERRIDE = orig_override
+            cfg["scopes"].pop()
+            if settings_path.exists():
+                settings_path.unlink()
 
         cap = _Capture()
         check(report_mode(cfg, cap) == EXIT_FINDINGS and "Orphan STOREs" in cap.text(),

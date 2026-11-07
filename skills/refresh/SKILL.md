@@ -65,7 +65,9 @@ invisible to it.
 **How to read a peek:** text on the input line at the bottom of the pane is **NOT evidence of
 intent or a pending action**. It is either the user's typed-but-UNSENT input OR, just as often,
 **GHOST AUTO-SUGGESTION**: the TUI's greyed autocomplete of a likely command that nobody typed and
-nobody has pressed enter on. You cannot tell which from the peek, so **never attribute prompt-line
+nobody has pressed enter on. `--peek` labels a dim (SGR 2) prompt tail as ghost; a raw
+`tmux capture-pane` without `-e` strips that styling and cannot tell, so peek via the helper. Even
+an unlabelled line may still be ghost (wrapped or non-dim), so **never attribute prompt-line
 text to the user or treat it as "about to run"**: a `finish the reflect` or a queued `/rnr` at the
 prompt has NOT executed and may be pure autosuggestion. A sibling is only actually mid-`/reflect`
 if its *scrollback* shows reflect activity IN PROGRESS (skill launch, memory/RESUME edits); that is
@@ -79,13 +81,12 @@ from scrollback plus the idle/working glyph only.
 The peek is a **read** by default and stays that way. But files a session appends to reach other
 sessions at **boot**, not while they run: a running sibling gets no notice that a file changed.
 So when the peek finds a **concrete live collision**, that sibling has *no other channel*, and one
-addressed message is the right instrument:
+addressed message is the right instrument. **Use Claude Code's native cross-session messaging for
+this** (`ListAgents` to find the sibling's row by cwd/display name, then `SendMessage` with the
+one-line text), not the bus: this is exactly the live-overlap, conversation case native handles,
+and it is attributed and wakes the sibling without needing a separate notification loop.
 
-```
-python3 $SESSION_NOTES/bin/session_bus.py send --to <N> "<one line: the overlap + what you're about to do>"
-```
-
-**`--to`, never `--all`. One message. Silent in every other case.** With many sessions, a routine
+**One message to that one sibling. Silent in every other case.** With many sessions, a routine
 "here's what I did" emit would put an injection on every pane's next prompt, exactly the kind of
 never-silent recurring injection that trains everyone to ignore it.
 
@@ -97,9 +98,9 @@ sibling about to redo work you just finished.
 collision inferred from the sibling's bottom input line, which Step 2b already establishes is often
 ghost autosuggestion.
 
-**Honest limit, state it rather than oversell it:** the bus cannot preempt work in flight. A WORKING
-sibling receives this on its **next prompt**, possibly after the colliding step already happened,
-so the message informs its next move rather than stopping the current one. An IDLE sibling isn't
+**Honest limit, state it rather than oversell it:** native messaging cannot preempt a tool call in
+flight; a WORKING sibling reads it between tool calls, possibly after the colliding step already
+happened, so it informs its next move rather than stopping the current one. An IDLE sibling isn't
 colliding with anything by definition, so it is not the target.
 
 **Phrase it as information, not instruction.** It arrives on the recipient's side as a peer's
@@ -107,7 +108,7 @@ information that explicitly cannot authorize action, so an imperative would both
 channel and get discounted.
 
 **Do NOT add an emit to `/reflect`.** A reflecting session is usually wrapping up, so it would open
-a conversation it can't finish; and the bus self-expires and carries no authority, making it a
+a conversation it can't finish; and a native message carries no authority and no log, making it a
 strictly worse carrier than the durable stores reflect already writes.
 
 ## Step 3: if a subject argument was given, pick it up

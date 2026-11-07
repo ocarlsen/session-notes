@@ -28,11 +28,18 @@ TURN STATE
   Code's terminal title, and on 2.1.281 that glyph is the idle star even
   mid-turn. So the session reports its own state, the same pattern as above:
   "working" on UserPromptSubmit, "idle" on Stop and SessionStart, and "idle"
-  on the idle_prompt notification, because Stop does not fire when you
-  interrupt a turn. One small file per pane, tagged with CLAUDE_PID, which the
-  reader checks against the process in the pane (session_peers owns the file
-  format). A turn started without a prompt (a peer's message, if Claude Code
-  sends no UserPromptSubmit for it) is not seen; the title is the fallback.
+  on the idle_prompt notification. One small file per pane, tagged with
+  CLAUDE_PID, which the reader checks against the process in the pane
+  (session_peers owns the file format).
+
+  idle_prompt is not a reliable Stop substitute: it only fires about 60
+  seconds after a Stop that nothing then touches, and an interrupt
+  mid-generation produces neither a Stop nor an idle_prompt, so a pane is
+  left reading "working" until its next prompt; a reader of this state
+  should ignore a "working" record that is more than a couple of hours old
+  for exactly this reason. A turn parked at a permission prompt also stays
+  "working" on purpose: the permission-prompt notification is not the end
+  of a turn.
 
 The registry lives at <state_dir>/session_panes.json (state_dir from
 notes_config). It is user-level, not project-scoped: sessions exist
@@ -151,6 +158,14 @@ def main():
     if event in TURN_EVENTS:
         return 0  # a turn event updates the state file only, never the registry
 
+    live = _live_pane_ids()
+    if event == "SessionStart":
+        try:
+            import session_peers
+            session_peers.sweep_pane_state(live, pane)
+        except Exception:
+            pass
+
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     if not session_id:
         # The hook payload carries it too; prefer env, fall back to stdin.
@@ -199,7 +214,7 @@ def main():
                     with open(REGISTRY, "r") as fh:
                         reg = _load(fh)
                 reg[pane] = entry
-                reg = _prune(reg, _live_pane_ids())
+                reg = _prune(reg, live)
                 d = os.path.dirname(REGISTRY)
                 fd, tmp = tempfile.mkstemp(dir=d, prefix=".session_panes.")
                 try:
@@ -301,7 +316,7 @@ def selftest():
         check("turn event leaves the registry alone", os.path.getmtime(reg_file) == before)
         check("permission notification: state unchanged",
               turn("Notification", notification_type="permission_prompt") == "working")
-        check("idle_prompt notification: idle (Stop never fires on interrupt)",
+        check("idle_prompt notification: idle (fires ~60s after an untouched Stop)",
               turn("Notification", notification_type="idle_prompt") == "idle")
         check("UserPromptSubmit again: working", turn("UserPromptSubmit") == "working")
         check("Stop: idle", turn("Stop") == "idle")
@@ -309,6 +324,36 @@ def selftest():
         os.environ.pop("CLAUDE_PID")
         check("no pid: nothing written", turn("UserPromptSubmit", pane="%8") is None)
         os.environ["CLAUDE_PID"] = "4242"
+
+        # SessionStart also sweeps pane_state/ itself, not just the registry.
+        # "%dead" is gone from tmux, "%live" isn't, "%cur" is this invocation's
+        # own pane.
+        session_peers.write_pane_state("%dead", "idle", "111")
+        session_peers.write_pane_state("%live", "idle", "222")
+        session_peers.write_pane_state("%cur", "idle", "333")
+        inflight = os.path.join(os.path.dirname(session_peers.pane_state_path("%cur")),
+                                 ".pane_state.inflight")
+        with open(inflight, "w") as f:
+            f.write("{}")
+        _live_pane_ids = lambda: {"%live", "%cur"}
+        os.environ.update(TMUX_PANE="%cur", CLAUDE_CODE_SESSION_ID="sess-delta", CLAUDE_PID="333")
+        sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart"}))
+        main()
+        check("SessionStart sweep removes a dead pane's state file",
+              session_peers.read_pane_state("%dead") is None)
+        check("SessionStart sweep keeps a live pane's state file",
+              session_peers.read_pane_state("%live") is not None)
+        check("SessionStart sweep keeps the current pane's own file",
+              session_peers.read_pane_state("%cur") is not None)
+        check("SessionStart sweep leaves a fresh in-flight tempfile alone",
+              os.path.exists(inflight))
+
+        session_peers.write_pane_state("%dead2", "idle", "444")
+        _live_pane_ids = lambda: None
+        sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart"}))
+        main()
+        check("SessionStart sweep deletes nothing when liveness is unknown (None)",
+              session_peers.read_pane_state("%dead2") is not None)
 
         _live_pane_ids = lambda: None
         check("unknown liveness prunes nothing but age",

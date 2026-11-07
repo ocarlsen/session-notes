@@ -102,6 +102,19 @@ WARN_AT = 145_000
 # never contributes more than this, even when its real @import'd size is larger.
 # 24.4 KiB = 24,986 bytes.
 NATIVE_AUTO_MEMORY_CAP = 24_986
+NATIVE_AUTO_MEMORY_LINES = 200  # native auto memory also stops at the first 200 lines
+
+
+def native_load_chars(path):
+    """Chars of `path` that native auto memory actually loads: the first 200 lines, at most
+    NATIVE_AUTO_MEMORY_CAP chars (docs: "first 200 lines ... or the first 25KB, whichever comes
+    first")."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = "".join(line for _, line in zip(range(NATIVE_AUTO_MEMORY_LINES), fh))
+    except OSError:
+        return 0
+    return min(len(head), NATIVE_AUTO_MEMORY_CAP)
 
 # A line whose first non-whitespace char is "@" is a Claude Code import.
 _IMPORT_RE = re.compile(r"^[ \t]*@(\S.*)$")
@@ -330,11 +343,34 @@ def _settings_value(key):
     return value
 
 
-def is_auto_memory_enabled():
+def _project_settings_value(root, key):
+    """`key` from a scope root's own .claude/settings.json then settings.local.json (the local
+    file wins), or None. Claude Code ranks project settings above user settings, so a
+    project's autoMemoryEnabled overrides the user-level one for sessions started there."""
+    value = None
+    for name in ("settings.json", "settings.local.json"):
+        p = os.path.join(_tilde(root), ".claude", name)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if key in data:
+            value = data[key]
+    return value
+
+
+def is_auto_memory_enabled(root=None):
+    """Native auto memory on for sessions started at `root` (or user-wide when root is None)."""
     env_val = os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
     if env_val is not None and env_val.strip().lower() in _DISABLE_ENV_TRUE:
         return False
-    return _settings_value("autoMemoryEnabled") is not False
+    value = _settings_value("autoMemoryEnabled")
+    if root is not None:
+        proj = _project_settings_value(root, "autoMemoryEnabled")
+        if proj is not None:
+            value = proj
+    return value is not False
 
 
 def budget_for(path):
@@ -360,7 +396,7 @@ def scope_report(root):
     files = boot_files_for_scope(root)
     native = native_memory_path(root)
     native_rp = os.path.realpath(native) if os.path.isfile(native) else None
-    auto_on = is_auto_memory_enabled()
+    auto_on = is_auto_memory_enabled(root)
 
     entries = []
     total = 0
@@ -374,8 +410,16 @@ def scope_report(root):
         entries.append({"path": f, "chars": chars, "budget": budget, "doubled": doubled})
         total += chars
         if doubled:
-            total += min(chars, NATIVE_AUTO_MEMORY_CAP)
+            total += native_load_chars(f)
             double_load.append(f)
+
+    # A scope that lets native auto memory load its MEMORY.md instead of @importing it: count
+    # that load (capped) so the boot total is true and the store reads as reached.
+    if auto_on and native_rp and not any(os.path.realpath(e["path"]) == native_rp for e in entries):
+        chars = native_load_chars(native)
+        entries.append({"path": native, "chars": chars, "budget": budget_for(native), "doubled": False,
+                        "native": True})
+        total += chars
 
     return {
         "root": root,
@@ -817,6 +861,36 @@ def selftest():
             )
             os.remove(tmp_home / ".claude" / "settings.local.json")
             _write(tmp_home / ".claude" / "settings.json", "{}")
+
+            # --- a scope's own .claude settings override the user-level autoMemoryEnabled ---
+            nat_root = "~/Projects/NativeScope"
+            nat_dir = tmp_home / "Projects" / "NativeScope"
+            _write(nat_dir / "CLAUDE.md", "# no memory import: native auto memory loads it\n")
+            nat_mem = Path(native_memory_path(nat_root))
+            _write(nat_mem, "- [x](x.md) one memory\n")
+            _write(tmp_home / ".claude" / "settings.json", '{"autoMemoryEnabled": false}')
+            check(is_auto_memory_enabled(nat_root) is False, "no project setting: the user-level false applies")
+            rep_off = scope_report(nat_root)
+            check(not any(os.path.realpath(e["path"]) == os.path.realpath(nat_mem) for e in rep_off["entries"]),
+                  "auto memory off: an un-imported store is not counted as loading")
+            _write(nat_dir / ".claude" / "settings.json", '{"autoMemoryEnabled": true}')
+            check(is_auto_memory_enabled(nat_root) is True, "a project's autoMemoryEnabled: true overrides the user's false")
+            check(is_auto_memory_enabled() is False, "...for that project only: user-wide stays off")
+            rep_on = scope_report(nat_root)
+            native_entries = [e for e in rep_on["entries"] if e.get("native")]
+            check(len(native_entries) == 1 and os.path.realpath(native_entries[0]["path"]) == os.path.realpath(nat_mem),
+                  "auto memory on and not @imported: the natively loaded MEMORY.md is in the boot set")
+            check(rep_on["total"] == rep_off["total"] + char_count(nat_mem), "...and counted in the scope total")
+            check(not rep_on["double_load"], "...and not reported as a double load")
+            _write(nat_dir / ".claude" / "settings.local.json", '{"autoMemoryEnabled": false}')
+            check(is_auto_memory_enabled(nat_root) is False, "a project's settings.local.json overrides its settings.json")
+            _write(tmp_home / ".claude" / "settings.json", "{}")
+
+            # --- native load stops at 200 lines even when the file is far under the char cap ---
+            long_idx = tmp_home / "long_index.md"
+            _write(long_idx, "".join("- line %d\n" % i for i in range(300)))
+            first200 = "".join("- line %d\n" % i for i in range(200))
+            check(native_load_chars(long_idx) == len(first200), "native load counts the first 200 lines only")
 
             # --- double-load: native store IS the @import'd scope memory file ---
             native_widget = Path(native_memory_path(str(widget_root)))
