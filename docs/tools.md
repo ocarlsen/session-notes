@@ -99,10 +99,12 @@ examples, and a ready commit trailer. `propose` never writes to SKILL.md: the pr
 the model to draft and the user to approve.
 
 `bin/skill_feedback.py canary` prints `skill feedback: N skills used, M rows logged`: N is the
-count of distinct skills the transcript's own Skill tool calls name (excluding `reflect`/`rnr`,
-the step running the capture), M is this session's row count summed across every ledger under
+count of distinct skills the session invoked, by Skill tool call or by a user-typed `/<skill>`
+(a typed name counts when it names an installed skill or a plugin `ns:skill`, so built-ins like
+`/clear` do not), excluding `reflect`/`rnr`, the step running the capture. M is this session's row count summed across every ledger under
 `skill-feedback/`. `/reflect` Step 2b runs it and pastes the line verbatim, so the count is never
-eyeballed.
+eyeballed. If a session id matches transcripts in more than one project folder, it uses the
+newest and names it on stderr. `add` refuses `reflect`/`rnr` for the same reason N excludes them.
 
 **Before shipping a proposed edit, run a blind A/B.** Generate the same few paragraphs twice, once
 under the current SKILL.md (`git show HEAD:<path>/SKILL.md`) and once under the proposed version,

@@ -206,6 +206,10 @@ def _oneline(text):
 
 # ------------------------------------------------------------------------- add
 def cmd_add(args):
+    if args.skill in SELF_SKILLS:
+        raise SkillFeedbackError(
+            "%s runs the capture step itself; it is not a skill reviewed by it, so it "
+            "gets no feedback rows" % args.skill)
     verify_skill_exists(args.skill, args.skill_dir)
     path = ledger_path_for(args.skill, args.ledger)
 
@@ -388,10 +392,25 @@ def cmd_applied(args):
 
 
 # ---------------------------------------------------------------------- canary
-def _skill_names_from_transcript(path):
-    """Distinct values of a Skill tool_use block's `skill` input, across the whole
-    transcript. A subagent/reviewer turn (isSidechain) is excluded: this counts the
-    skills THIS session itself invoked, not a forked helper's."""
+COMMAND_NAME_RE = re.compile(r"<command-name>/?([^<\s]+)</command-name>")
+
+
+def _is_typed_skill(name, skills_dir):
+    """A user-typed `/<name>` is a skill (not a built-in like /clear or /model) when it
+    names an installed skill folder, or carries a plugin namespace (`ns:skill`)."""
+    if ":" in name:
+        return True
+    return bool(skills_dir) and SKILL_NAME_RE.match(name) is not None and \
+        os.path.isfile(os.path.join(skills_dir, name, "SKILL.md"))
+
+
+def _skill_names_from_transcript(path, skills_dir=None):
+    """Distinct skill names this session invoked: a Skill tool_use block's `skill`
+    input, plus a user-typed `/<skill>`, which reaches the transcript only as a
+    `<command-name>` marker in a user entry with no Skill tool_use at all. A set, so a
+    name invoked both ways counts once. A subagent/reviewer turn (isSidechain) is
+    excluded: this counts the skills THIS session itself invoked, not a forked
+    helper's."""
     names = set()
     for _, line in find_session.iter_lines(path):
         try:
@@ -401,6 +420,14 @@ def _skill_names_from_transcript(path):
         if entry.get("isSidechain"):
             continue
         content = (entry.get("message") or {}).get("content")
+        if entry.get("type") == "user":
+            texts = [content] if isinstance(content, str) else [
+                b.get("text") for b in (content or []) if isinstance(b, dict)
+                and b.get("type") == "text" and isinstance(b.get("text"), str)]
+            for text in texts:
+                for typed in COMMAND_NAME_RE.findall(text):
+                    if _is_typed_skill(typed, skills_dir):
+                        names.add(typed)
         if not isinstance(content, list):
             continue
         for block in content:
@@ -431,9 +458,15 @@ def cmd_canary(args):
             raise SkillFeedbackError(
                 "no transcript found for session %s under %s: pass --transcript"
                 % (session, transcripts_dir))
-        transcript = matches[0]
+        # Deterministic: a session id can match in more than one project dir (a
+        # resumed session re-rooted elsewhere); take the newest and say which.
+        transcript = max(matches, key=lambda p: (os.path.getmtime(p), p))
+        if len(matches) > 1:
+            print("canary: %d transcripts match session %s; using the newest, %s"
+                  % (len(matches), session, transcript), file=sys.stderr)
 
-    names = _skill_names_from_transcript(transcript) - SELF_SKILLS
+    skills_dir = os.path.join(cfg["paths"]["claude_home"], "skills")
+    names = _skill_names_from_transcript(transcript, skills_dir) - SELF_SKILLS
     n = len(names)
 
     ledger_dir = ledger_dir_for(cfg)
@@ -875,6 +908,16 @@ def selftest():
                 e["isSidechain"] = True
             return json.dumps(e)
 
+        def typed(name):
+            return json.dumps({"type": "user", "message": {"role": "user", "content":
+                "<command-message>%s</command-message>\n<command-name>/%s</command-name>"
+                % (name, name)}})
+
+        delta_dir = os.path.join(tmp, ".claude", "skills", "delta-skill")
+        os.makedirs(delta_dir)
+        with open(os.path.join(delta_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: delta-skill\n---\n")
+
         with open(transcript_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join([
                 skill_call("alpha-skill"),
@@ -882,6 +925,9 @@ def selftest():
                 skill_call("beta-skill"),
                 skill_call("reflect"),            # excluded: the step running this capture
                 skill_call("gamma-skill", sidechain=True),  # excluded: a subagent's call
+                typed("delta-skill"),             # typed /delta-skill: counted
+                typed("beta-skill"),              # typed AND called: still 1 name
+                typed("clear"),                   # built-in command, not a skill
             ]) + "\n")
 
         alpha_dir = os.path.join(tmp, "alpha-skill")
@@ -905,12 +951,29 @@ def selftest():
              "--habit", "h3", "--before", "bb", "--after", "aa", "--session", "other-session"])
 
         rc, out, _ = run(["canary", "--transcript", transcript_path, "--session", canary_session])
-        check("canary prints the exact derived line (N=2 skills, M=3 rows)",
-              rc == 0 and out.strip() == "skill feedback: 2 skills used, 3 rows logged")
+        check("canary prints the exact derived line (N=3 skills incl. a typed one, M=3 rows)",
+              rc == 0 and out.strip() == "skill feedback: 3 skills used, 3 rows logged")
 
         rc, out, _ = run(["canary", "--session", canary_session])
         check("canary locates the transcript by session id without --transcript",
-              rc == 0 and out.strip() == "skill feedback: 2 skills used, 3 rows logged")
+              rc == 0 and out.strip() == "skill feedback: 3 skills used, 3 rows logged")
+
+        # Same session id in a second project dir, older: still picks the newer one.
+        older_dir = os.path.join(tmp, ".claude", "projects", "-tmp-older")
+        os.makedirs(older_dir)
+        older = os.path.join(older_dir, canary_session + ".jsonl")
+        with open(older, "w", encoding="utf-8") as fh:
+            fh.write(skill_call("alpha-skill") + "\n")
+        os.utime(older, (1, 1))
+        rc, out, err = run(["canary", "--session", canary_session])
+        check("canary picks the newest of several matching transcripts and names it",
+              rc == 0 and out.strip() == "skill feedback: 3 skills used, 3 rows logged"
+              and "using the newest" in err and transcript_path in err)
+
+        rc, _, err = run(["add", "reflect", "--skill-dir", alpha_dir, "--verdict", "edit",
+                          "--habit", "h1", "--before", "b", "--after", "a",
+                          "--session", canary_session])
+        check("add refuses a self skill (reflect)", rc == 2 and "capture step" in err)
 
         rc, _, err = run(["canary", "--session", "no-such-session"])
         check("canary refuses loudly when no transcript is found",

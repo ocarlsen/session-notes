@@ -192,7 +192,7 @@ user reacted to it). So capture it HERE, mechanically, every time:
 python3 $SESSION_NOTES/bin/skill_feedback.py canary
 ```
 and paste its printed line, verbatim, into Step 6: `skill feedback: N skills used, M rows logged`
-(N = distinct skills the transcript's own Skill tool calls name, excluding `reflect`/`rnr`; M =
+(N = distinct skills invoked by Skill tool call or user-typed `/<skill>`, excluding `reflect`/`rnr`; M =
 this session's row count summed across every ledger under `skill-feedback/`). It defaults to
 `$CLAUDE_CODE_SESSION_ID` and locates its own transcript; pass `--transcript PATH` only if it
 can't find one. This includes the `0 skills used, 0 rows logged` case, so a skipped capture is
