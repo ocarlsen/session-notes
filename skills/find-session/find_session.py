@@ -156,35 +156,45 @@ def texts_of(entry, roles):
     return out
 
 
-def search_file(path, rx, roles, prefilter, window):
-    hits = []
+def iter_lines(path):
+    """Yield (1-based line number, raw line) pairs from a transcript JSONL file,
+    tolerant of undecodable bytes (errors='replace') and a missing file (yields
+    nothing, never raises). The one place a transcript file is opened: every reader
+    of one (this module's own search_file, and skill_feedback.py's canary command)
+    goes through this instead of re-opening the file itself."""
     try:
         fh = open(path, errors="replace")
     except OSError:
-        return hits
+        return
     with fh:
         for lineno, line in enumerate(fh, 1):
-            if prefilter and prefilter not in line.lower():
+            yield lineno, line
+
+
+def search_file(path, rx, roles, prefilter, window):
+    hits = []
+    for lineno, line in iter_lines(path):
+        if prefilter and prefilter not in line.lower():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue          # torn last line of a live append target
+        for text in texts_of(entry, roles):
+            m = rx.search(text)
+            if not m:
                 continue
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue          # torn last line of a live append target
-            for text in texts_of(entry, roles):
-                m = rx.search(text)
-                if not m:
-                    continue
-                start = max(0, m.start() - window)
-                snippet = text[start:m.end() + window].replace("\n", " ⏎ ")
-                if start:
-                    snippet = "…" + snippet
-                hits.append({
-                    "ts": (entry.get("timestamp") or "")[:16].replace("T", " "),
-                    "line": lineno,
-                    "role": entry.get("type"),
-                    "text": snippet,
-                })
-                break             # one hit per entry is enough to find it
+            start = max(0, m.start() - window)
+            snippet = text[start:m.end() + window].replace("\n", " ⏎ ")
+            if start:
+                snippet = "…" + snippet
+            hits.append({
+                "ts": (entry.get("timestamp") or "")[:16].replace("T", " "),
+                "line": lineno,
+                "role": entry.get("type"),
+                "text": snippet,
+            })
+            break             # one hit per entry is enough to find it
     return hits
 
 

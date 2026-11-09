@@ -70,6 +70,7 @@ fixed line (never the message) into its empty input box.
 | --- | --- | --- |
 | Config | `bin/notes_config.py`, `config.example.toml` | One TOML file for paths, scopes, boot budgets and time zone. No hardcoded directories. |
 | Scoped memory | `skills/reflect`, `skills/rnr`, `skills/refresh`, `skills/find-session`; `bin/reflect_lock.py`, `append_memory_index.py`, `memory_index_lint.py`, `boot_budget.py`, `memory_hygiene_canary.py` | Write, reload and check memory stores. A lock serializes concurrent reflects; the index writer refuses over-long lines; the budget and canary report drift. |
+| Skill feedback | `bin/skill_feedback.py`; a ledger `<claude_home>/skill-feedback/<skill>.jsonl` per skill | Logs how the user corrects a skill's own output (edit / reject / approve, quoted verbatim), captured by `/reflect` (Step 2b). `propose` groups unresolved rows by habit and reports which have enough evidence (default: 3+ rows from 2+ sessions) to act on; it never edits a SKILL.md itself. `canary` prints the derived "N skills used, M rows logged" line. |
 | Session coordination | `bin/session_peers.py`, `session_lineage.py`, `handoff_session.py`, `bcast.py`; `hooks/session_pane_registry.py` | List and peek at sibling sessions, launch a worker session and record who launched it, show the lineage tree, broadcast a line you type to every session. |
 | Bus | `bin/session_bus.py`, `bus_nudge.py`; `hooks/session_bus_hook.py` | Staged specs and mail from scripts, addressed by tmux session name, delivered at least once; wake idle recipients. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
@@ -78,6 +79,50 @@ fixed line (never the message) into its empty input box.
 Every script has a `--selftest`; `make test` runs them all with `HOME`
 pointed at a temp dir, plus smoke tests that run each hook the way Claude
 Code does.
+
+## Skill feedback: skills that improve from being corrected
+
+A skill's output gets edited, rejected, or approved by the user every time it runs; that reaction
+is the only signal that says whether the skill is doing the right thing, and it exists only in the
+conversation, not in any hook. `/reflect` (Step 2b) reads the transcript for those reactions and
+logs each one, verbatim, through `bin/skill_feedback.py add` into
+`<claude_home>/skill-feedback/<skill>.jsonl`, one JSON row per line, tagged with a short `habit`
+slug naming the pattern it is evidence of. The ledger is USER DATA, so it lives under the Claude
+home like the rest of a user's state, never inside a skill's own folder: a skill folder may be a
+symlink into a checkout (`install.sh` makes `~/.claude/skills/<name>` exactly that), and a ledger
+written through one would land inside whoever's git repo that checkout happens to be.
+
+`bin/skill_feedback.py propose <skill>` groups unresolved rows by habit and reports which ones
+have enough evidence (by default: 3+ edit/reject rows from 2+ distinct sessions) to act on, with
+exact row citations, the before/after text, any `approve` rows for the same habit as "keep"
+examples, and a ready commit trailer. `propose` never writes to SKILL.md: the proposal is HELD for
+the model to draft and the user to approve.
+
+`bin/skill_feedback.py canary` prints `skill feedback: N skills used, M rows logged`: N is the
+count of distinct skills the session invoked, by Skill tool call or by a user-typed `/<skill>`
+(a typed name counts when it names an installed skill or a plugin `ns:skill`, so built-ins like
+`/clear` do not), excluding `reflect`/`rnr`, the step running the capture. M is this session's row count summed across every ledger under
+`skill-feedback/`. `/reflect` Step 2b runs it and pastes the line verbatim, so the count is never
+eyeballed. If a session id matches transcripts in more than one project folder, it uses the
+newest and names it on stderr. `add` refuses `reflect`/`rnr` for the same reason N excludes them.
+
+**Before shipping a proposed edit, run a blind A/B.** Generate the same few paragraphs twice, once
+under the current SKILL.md (`git show HEAD:<path>/SKILL.md`) and once under the proposed version,
+strip anything that labels which is which, and have the user (or a second model) pick without
+knowing. Ship the edit only if the proposed version wins; a habit that only looks better to the
+model that proposed it isn't a fix.
+
+Try it against the synthetic example (a tiny made-up `commit-message` skill; its SKILL.md lives
+under the example claude_home's `skills/`, its ledger under that same claude_home's
+`skill-feedback/`, both inside `examples/`, neither something `install.sh` ever links):
+
+```sh
+SESSION_NOTES_CONFIG=examples/config.toml python3 bin/skill_feedback.py propose commit-message
+```
+
+That ledger already has one qualifying habit (`no-trailing-summary`: 3 rows across 2 sessions)
+and one still-tentative one (`imperative-mood-subject`: 1 row), so the command's two sections
+both have something to show.
 
 ## Five-minute quickstart
 
