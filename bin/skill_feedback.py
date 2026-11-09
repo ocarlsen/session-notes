@@ -272,6 +272,37 @@ def cmd_add(args):
 
 
 # --------------------------------------------------------------------- propose
+# A `before` shorter than this (after whitespace is collapsed) is too generic to call a
+# match against the skill's text: a three-word phrase can appear in a SKILL.md by chance.
+MIN_QUOTED_CHARS = 20
+
+
+def _norm(text):
+    return " ".join(text.split()).rstrip(".")
+
+
+def _quoted_in_skill(rows, skill_md_text):
+    """Unapplied edit/reject rows whose `before` the SKILL.md itself quotes, verbatim
+    after collapsing whitespace (a SKILL.md wraps and indents its quotes). The user
+    rejected text the skill still teaches as an example: newer feedback wins, so these
+    surface with no row or session threshold."""
+    body = _norm(skill_md_text)
+    hits = []
+    for lineno, row in rows:
+        if row.get("applied") is not None or row.get("verdict") not in ("edit", "reject"):
+            continue
+        needle = _norm(row.get("before") or "")
+        if len(needle) >= MIN_QUOTED_CHARS and needle in body:
+            hits.append((lineno, row))
+    return hits
+
+
+def _skill_md_path(skill, skill_dir=None):
+    d = (os.path.abspath(os.path.expanduser(skill_dir)) if skill_dir
+         else os.path.join(notes_config.load()["paths"]["claude_home"], "skills", skill))
+    return os.path.join(d, "SKILL.md")
+
+
 def cmd_propose(args):
     path = ledger_path_for(args.skill, args.ledger)
     rows = read_rows(path)
@@ -303,6 +334,20 @@ def cmd_propose(args):
             args.skill, habit, ",".join(str(n) for n in row_nums))
 
     print("## skill feedback: %s (%s)" % (args.skill, path))
+    skill_md = _skill_md_path(args.skill, args.skill_dir)
+    if os.path.isfile(skill_md):
+        with open(skill_md, encoding="utf-8") as fh:
+            contradicts = _quoted_in_skill(rows, fh.read())
+        if contradicts:
+            print("\n### contradicts the skill (newer feedback wins, no threshold)")
+            print("SKILL.md still quotes text the user later edited or rejected:")
+            for ln, r in contradicts:
+                print("- %s:%d [%s] habit %s" % (basename, ln, r.get("verdict"), r.get("habit")))
+                print("    quoted:   %s" % _oneline(r.get("before")))
+                print("    reaction: %s" % _oneline(r.get("after_or_quote")))
+                print(trailer(r.get("habit"), [ln]))
+    else:
+        print("\nsupersede check skipped: no SKILL.md at %s (pass --skill-dir)" % skill_md)
     if not qualifying:
         print("\nno qualifying habits yet (need >= %d rows from >= %d sessions)"
               % (args.min_rows, args.min_sessions))
@@ -518,6 +563,8 @@ def build_parser():
     p.add_argument("--min-rows", type=_positive_int, default=3)
     p.add_argument("--min-sessions", type=_positive_int, default=2)
     p.add_argument("--ledger", help="override the ledger file location (mainly for tests)")
+    p.add_argument("--skill-dir", help="the skill's folder, for the supersede check "
+                   "(default <claude_home>/skills/<skill>)")
     p.set_defaults(fn=cmd_propose)
 
     ad = sub.add_parser("applied", help="mark rows as applied by a commit")
@@ -846,6 +893,37 @@ def selftest():
         except SkillFeedbackError as exc:
             check("a row missing session fails loudly as a bad row",
                   "bad row" in str(exc) and "session" in str(exc))
+
+        # -- supersede: one reject of text the SKILL.md quotes surfaces with no
+        #    threshold; a reject of text the skill does not quote stays tentative.
+        sup_dir = os.path.join(tmp, "sup-skill")
+        os.makedirs(sup_dir)
+        with open(os.path.join(sup_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: sup-skill\n---\n\nA good ending: \"Thanks for\n"
+                     "   reading, I hope this helps.\"\n")
+        sup_ledger = os.path.join(tmp, "ledgers", "sup-skill.jsonl")
+        run(["add", "sup-skill", "--skill-dir", sup_dir, "--ledger", sup_ledger,
+             "--verdict", "reject", "--habit", "no-sign-off", "--session", "s1",
+             "--before", "Thanks for reading, I hope this helps.", "--after", "cut the sign-off"])
+        run(["add", "sup-skill", "--skill-dir", sup_dir, "--ledger", sup_ledger,
+             "--verdict", "reject", "--habit", "plain-verbs", "--session", "s1",
+             "--before", "We leverage the cache to accelerate reads.", "--after", "say use"])
+        run(["add", "sup-skill", "--skill-dir", sup_dir, "--ledger", sup_ledger,
+             "--verdict", "approve", "--habit", "no-sign-off", "--session", "s1",
+             "--before", "Thanks for reading, I hope this helps.", "--after", "keep that"])
+        rc, out, _ = run(["propose", "sup-skill", "--ledger", sup_ledger, "--skill-dir", sup_dir])
+        sec = out.split("### contradicts the skill", 1)[-1].split("###", 1)[0]
+        check("supersede: a reject of text SKILL.md quotes (across a line wrap) is flagged",
+              rc == 0 and "### contradicts the skill" in out and "sup-skill.jsonl:1" in sec
+              and "Skill-feedback: sup-skill no-sign-off rows 1" in sec)
+        check("supersede: a reject of unquoted text is not flagged, stays tentative",
+              "sup-skill.jsonl:2" not in sec and "plain-verbs (1 row(s), 1 session(s))" in out)
+        check("supersede: an approve row of quoted text is never flagged",
+              "sup-skill.jsonl:3" not in sec)
+        rc, out, _ = run(["propose", "sup-skill", "--ledger", sup_ledger,
+                          "--skill-dir", os.path.join(tmp, "no-such-skill")])
+        check("supersede: a missing SKILL.md says the check was skipped",
+              rc == 0 and "supersede check skipped" in out)
 
         # -- SKILL.md bytes are unchanged after propose: this command never touches it
         skill_md_path = os.path.join(skill_dir, "SKILL.md")
