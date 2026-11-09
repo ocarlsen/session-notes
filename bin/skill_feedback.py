@@ -12,9 +12,15 @@ ENOUGH evidence to act on. Judgment (what the row quotes, which habit it is evid
 of, what the SKILL.md edit should say) stays with the model; this script never invents
 or paraphrases text on its own.
 
-LEDGER. One JSONL file beside the skill it's about: `<skill dir>/feedback.jsonl`. One
-row per line, literal fields only -- the user's words are quoted verbatim, never
-paraphrased by this script or its caller:
+LEDGER. One JSONL file per skill, under the Claude home, never inside a skill's own
+folder: `<paths.claude_home>/skill-feedback/<skill>.jsonl` (resolved via
+notes_config.py; `--ledger PATH` overrides it, mainly for tests). The ledger is USER
+DATA, so it lives beside a user's other state, not inside a skill's directory: a skill
+folder (`<claude_home>/skills/<name>`) is routinely a symlink INTO a checkout
+(install.sh does exactly this), and writing private rows through a symlink would land
+them inside whoever's git repo that checkout happens to be. The directory is created on
+the first `add`. One row per line, literal fields only -- the user's words are quoted
+verbatim, never paraphrased by this script or its caller:
 
     {"date": "YYYY-MM-DD", "session": "<session id>", "habit": "<kebab-case slug>",
      "before": "<text the skill produced>",
@@ -25,28 +31,20 @@ paraphrased by this script or its caller:
 `no-trailing-summary`), assigned at capture time. It is the grouping key `propose` sorts
 on, so qualifying is mechanical code, never judgment made twice. `applied` stays null
 until a proposal citing the row is committed, then the commit sha (a string). Rows are
-append-only and cited by 1-based line number (`feedback.jsonl:3`); line order never
+append-only and cited by 1-based line number (`<skill>.jsonl:3`); line order never
 changes, only `applied` is ever set in place, by the `applied` command.
 
-SKILL DIR RESOLUTION. `--skill-dir PATH` overrides; otherwise
-`<paths.claude_home>/skills/<skill>` from notes_config.py. Refuses loudly (nonzero exit,
-message naming the path) when the directory or its SKILL.md is missing, so a typo'd
-skill name fails fast instead of quietly starting a new ledger nobody will find.
+SKILL EXISTENCE. `add` (only) refuses loudly (nonzero exit, message naming the path) if
+`<paths.claude_home>/skills/<skill>/SKILL.md` is missing, unless `--skill-dir PATH`
+names where the skill actually lives: a typo'd skill name must not silently start a
+ledger for a skill that doesn't exist. `propose`/`applied`/`canary` never check this --
+the ledger is independent of the skill's directory, so they keep working even after a
+skill is renamed or removed.
 
-WRITE GUARD. Before `add` or `applied` write anything, the ledger's real directory is
-checked against git: if it sits inside some git work tree and the ledger path is not
-covered by that tree's own ignore rules, the write is refused ("ledger would be tracked
-by <toplevel>: add feedback.jsonl to its .gitignore or pass --skill-dir") instead of
-risking a private row landing in a commit. install.sh makes `~/.claude/skills/<name>` a
-symlink POINTING INTO this checkout, so a real ledger lands inside THIS work tree by
-construction; this repo's own `/skills/*/feedback.jsonl` .gitignore rule is what clears
-that case. `propose` and `count` never write, so they never run this check. Even a
-gitignored ledger inside a clone is lost to `git clean -fdx`; see docs/tools.md.
-
-COMMANDS: add, propose, applied, count. Run `skill_feedback.py --help`, or a
+COMMANDS: add, propose, applied, canary. Run `skill_feedback.py --help`, or a
 subcommand's `-h`, for flags; docs/tools.md has the full walkthrough and a worked
-example. `--selftest` exercises every command in temp directories (`--skill-dir`) and
-never touches the real Claude home.
+example. `--selftest` exercises every command in temp directories (`--ledger`,
+`--skill-dir`) and never touches the real Claude home.
 """
 import argparse
 import datetime
@@ -54,7 +52,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -62,11 +59,21 @@ BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 import notes_config  # noqa: E402
 
+# canary reuses find_session's transcript-path lookup (transcripts_for/paths) and its
+# JSONL line reader (iter_lines) rather than writing a second one.
+REPO_ROOT = os.path.dirname(BIN)
+FIND_SESSION_DIR = os.path.join(REPO_ROOT, "skills", "find-session")
+sys.path.insert(0, FIND_SESSION_DIR)
+import find_session  # noqa: E402
+
 VERDICTS = ("edit", "reject", "approve")
 HABIT_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
-LEDGER_NAME = "feedback.jsonl"
+LEDGER_DIR_NAME = "skill-feedback"
+# Skills that run the capture step itself, not a skill being reviewed by it: canary
+# never counts them toward N, since a session always "uses" whichever one invoked it.
+SELF_SKILLS = {"reflect", "rnr"}
 
 
 class SkillFeedbackError(Exception):
@@ -80,11 +87,11 @@ def validate_skill_name(skill):
             "not silently create a new ledger somewhere unexpected" % skill)
 
 
-def skill_dir_for(skill, skill_dir=None, cfg=None):
-    """The skill's directory: `skill_dir` if given, else
-    <paths.claude_home>/skills/<skill>. Refuses loudly if it, or its SKILL.md, is
-    missing. `cfg` (and a call to notes_config.load()) is never needed, and never
-    touched, when `skill_dir` is given."""
+def verify_skill_exists(skill, skill_dir=None, cfg=None):
+    """Refuses loudly if the skill directory, or its SKILL.md, is missing. Only `add`
+    calls this: the ledger lives elsewhere now, so `propose`/`applied`/`canary` never
+    need the skill's directory to exist. `cfg` (and notes_config.load()) is never
+    touched when `skill_dir` is given."""
     validate_skill_name(skill)
     if skill_dir:
         d = os.path.abspath(os.path.expanduser(skill_dir))
@@ -98,55 +105,21 @@ def skill_dir_for(skill, skill_dir=None, cfg=None):
     return d
 
 
-def ledger_path_for(skill, skill_dir=None, cfg=None):
-    return os.path.join(skill_dir_for(skill, skill_dir, cfg), LEDGER_NAME)
+def ledger_dir_for(cfg=None):
+    cfg = cfg or notes_config.load()
+    return os.path.join(cfg["paths"]["claude_home"], LEDGER_DIR_NAME)
 
 
-# ------------------------------------------------------------------- write guard
-def _git_env():
-    """Every git subprocess call below uses this: a git hook exports GIT_DIR (and
-    friends) for the repo being committed to, and an inherited GIT_DIR overrides -C,
-    silently redirecting the call at the hook's repo instead of the ledger's."""
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-
-
-def _git_toplevel(dirpath):
-    """The git work tree root containing `dirpath`, or None (not inside one / no git)."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", dirpath, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=10, env=_git_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return out.stdout.strip()
-
-
-def _git_is_ignored(dirpath, path):
-    try:
-        out = subprocess.run(
-            ["git", "-C", dirpath, "check-ignore", "-q", path],
-            timeout=10, env=_git_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return out.returncode == 0
-
-
-def refuse_if_ledger_would_be_tracked(path):
-    """The write-side chokepoint (called by `add` and `applied` only, never by the
-    read-only `propose`/`count`): refuse rather than silently risk a private row
-    landing inside a commit. See the module docstring's WRITE GUARD section."""
-    real_dir = os.path.dirname(os.path.realpath(path))
-    toplevel = _git_toplevel(real_dir)
-    if toplevel is None:
-        return
-    if not _git_is_ignored(real_dir, os.path.realpath(path)):
-        raise SkillFeedbackError(
-            "ledger would be tracked by %s: add feedback.jsonl to its .gitignore or "
-            "pass --skill-dir" % toplevel)
+def ledger_path_for(skill, ledger=None, cfg=None):
+    """The ledger file for `skill`: `ledger` if given (an explicit override, mainly for
+    tests), else <paths.claude_home>/skill-feedback/<skill>.jsonl. The directory is
+    created lazily, on the first write (_append_row); a read-only command tolerates it
+    being absent (read_rows() reports no rows for a path that doesn't exist yet)."""
+    validate_skill_name(skill)
+    if ledger:
+        return os.path.abspath(os.path.expanduser(ledger))
+    cfg = cfg or notes_config.load()
+    return os.path.join(ledger_dir_for(cfg), skill + ".jsonl")
 
 
 # ------------------------------------------------------------------------ reading
@@ -192,7 +165,8 @@ def _append_row(path, row):
     from the newline bytes already on disk, never len(read_rows()) (a blank line
     consumes a line number without becoming a row, so that count can undershoot). If
     the ledger's last byte isn't a newline, writes one first so the new row can never
-    fuse onto the previous line."""
+    fuse onto the previous line. Creates the ledger's directory if this is its first
+    row."""
     real_path = os.path.realpath(path)
     os.makedirs(os.path.dirname(real_path), exist_ok=True)
     try:
@@ -232,8 +206,8 @@ def _oneline(text):
 
 # ------------------------------------------------------------------------- add
 def cmd_add(args):
-    path = ledger_path_for(args.skill, args.skill_dir, None)
-    refuse_if_ledger_would_be_tracked(path)
+    verify_skill_exists(args.skill, args.skill_dir)
+    path = ledger_path_for(args.skill, args.ledger)
 
     if not HABIT_RE.match(args.habit):
         raise SkillFeedbackError(
@@ -269,7 +243,11 @@ def cmd_add(args):
 
     rows = read_rows(path)
     for lineno, row in rows:
+        # The verdict is part of the key: an approve of the same before/after an
+        # earlier edit covered is a DIFFERENT fact (the user reversed course, or a
+        # later session re-approved it), never the same row logged twice.
         if (row.get("session") == session and row.get("habit") == args.habit
+                and row.get("verdict") == args.verdict
                 and row.get("before", "").strip() == before.strip()
                 and row.get("after_or_quote", "").strip() == after.strip()):
             print("skipped duplicate %s:%d" % (path, lineno))
@@ -291,7 +269,7 @@ def cmd_add(args):
 
 # --------------------------------------------------------------------- propose
 def cmd_propose(args):
-    path = ledger_path_for(args.skill, args.skill_dir, None)
+    path = ledger_path_for(args.skill, args.ledger)
     rows = read_rows(path)
     if not rows:
         print("no feedback rows: %s" % path)
@@ -304,7 +282,7 @@ def cmd_propose(args):
         groups.setdefault(row.get("habit"), []).append((lineno, row))
 
     qualifying, tentative = [], []
-    for habit, items in sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0])):
+    for habit, items in sorted(groups.items()):
         edit_reject = [(ln, r) for ln, r in items if r.get("verdict") in ("edit", "reject")]
         sessions = sorted({r.get("session") for _, r in edit_reject})
         approve_items = [(ln, r) for ln, r in items if r.get("verdict") == "approve"]
@@ -354,8 +332,7 @@ def cmd_propose(args):
 def cmd_applied(args):
     """Read-modify-write with no file lock: never run this while a /reflect might be
     concurrently appending new rows to the same ledger."""
-    path = ledger_path_for(args.skill, args.skill_dir, None)
-    refuse_if_ledger_would_be_tracked(path)
+    path = ledger_path_for(args.skill, args.ledger)
     if not os.path.exists(path):
         raise SkillFeedbackError("no ledger to update: %s" % path)
     if not COMMIT_RE.match(args.commit):
@@ -395,7 +372,7 @@ def cmd_applied(args):
         raw_lines[n - 1] = json.dumps(row, ensure_ascii=False) + "\n"
 
     directory = os.path.dirname(real_path) or "."
-    tmp_path = os.path.join(directory, LEDGER_NAME + ".tmp")
+    tmp_path = real_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             fh.writelines(raw_lines)
@@ -410,16 +387,66 @@ def cmd_applied(args):
     return 0
 
 
-# ----------------------------------------------------------------------- count
-def cmd_count(args):
-    path = ledger_path_for(args.skill, args.skill_dir, None)
-    rows = read_rows(path)
-    total = len(rows)
-    if args.session:
-        session_total = sum(1 for _, r in rows if r.get("session") == args.session)
-        print("%s: %d rows total, %d for session %s" % (args.skill, total, session_total, args.session))
+# ---------------------------------------------------------------------- canary
+def _skill_names_from_transcript(path):
+    """Distinct values of a Skill tool_use block's `skill` input, across the whole
+    transcript. A subagent/reviewer turn (isSidechain) is excluded: this counts the
+    skills THIS session itself invoked, not a forked helper's."""
+    names = set()
+    for _, line in find_session.iter_lines(path):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue          # torn last line of a live append target
+        if entry.get("isSidechain"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") != "Skill":
+                continue
+            skill = (block.get("input") or {}).get("skill")
+            if isinstance(skill, str) and skill:
+                names.add(skill)
+    return names
+
+
+def cmd_canary(args):
+    cfg = notes_config.load()
+    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session:
+        raise SkillFeedbackError("no session: pass --session or set CLAUDE_CODE_SESSION_ID")
+
+    if args.transcript:
+        transcript = os.path.abspath(os.path.expanduser(args.transcript))
+        if not os.path.isfile(transcript):
+            raise SkillFeedbackError("no such transcript: %s" % transcript)
     else:
-        print("%s: %d rows total" % (args.skill, total))
+        transcripts_dir, _ = find_session.paths(cfg)
+        matches = find_session.transcripts_for(transcripts_dir, [session])
+        if not matches:
+            raise SkillFeedbackError(
+                "no transcript found for session %s under %s: pass --transcript"
+                % (session, transcripts_dir))
+        transcript = matches[0]
+
+    names = _skill_names_from_transcript(transcript) - SELF_SKILLS
+    n = len(names)
+
+    ledger_dir = ledger_dir_for(cfg)
+    m = 0
+    if os.path.isdir(ledger_dir):
+        for fn in sorted(os.listdir(ledger_dir)):
+            if not fn.endswith(".jsonl"):
+                continue
+            for _, row in read_rows(os.path.join(ledger_dir, fn)):
+                if row.get("session") == session:
+                    m += 1
+
+    print("skill feedback: %d skills used, %d rows logged" % (n, m))
     return 0
 
 
@@ -449,28 +476,28 @@ def build_parser():
     a.add_argument("--after-file")
     a.add_argument("--session")
     a.add_argument("--date")
-    a.add_argument("--skill-dir")
+    a.add_argument("--skill-dir", help="where the skill itself lives (existence check only)")
+    a.add_argument("--ledger", help="override the ledger file location (mainly for tests)")
     a.set_defaults(fn=cmd_add)
 
     p = sub.add_parser("propose", help="group unresolved rows by habit; report qualifying ones")
     p.add_argument("skill")
     p.add_argument("--min-rows", type=_positive_int, default=3)
     p.add_argument("--min-sessions", type=_positive_int, default=2)
-    p.add_argument("--skill-dir")
+    p.add_argument("--ledger", help="override the ledger file location (mainly for tests)")
     p.set_defaults(fn=cmd_propose)
 
     ad = sub.add_parser("applied", help="mark rows as applied by a commit")
     ad.add_argument("skill")
     ad.add_argument("--rows", required=True)
     ad.add_argument("--commit", required=True)
-    ad.add_argument("--skill-dir")
+    ad.add_argument("--ledger", help="override the ledger file location (mainly for tests)")
     ad.set_defaults(fn=cmd_applied)
 
-    c = sub.add_parser("count", help="row counts for a skill's ledger")
-    c.add_argument("skill")
-    c.add_argument("--session")
-    c.add_argument("--skill-dir")
-    c.set_defaults(fn=cmd_count)
+    cn = sub.add_parser("canary", help="print the derived skill-feedback canary line")
+    cn.add_argument("--transcript", help="a transcript JSONL path (default: locate by --session)")
+    cn.add_argument("--session", help="default: $CLAUDE_CODE_SESSION_ID")
+    cn.set_defaults(fn=cmd_canary)
 
     return ap
 
@@ -520,10 +547,13 @@ def selftest():
         return rc, out.getvalue(), err.getvalue()
 
     tmp = tempfile.mkdtemp(prefix="skill_feedback_selftest_")
-    # Never let a bare `notes_config.load()` (the no-skill-dir refusal path) resolve the
-    # REAL Claude home or a real ~/.config/session-notes/config.toml: point it at an
-    # empty file in the sandbox, which resolves to built-in defaults.
+    # Sandbox BOTH knobs notes_config.load() can resolve from: HOME (so a bare
+    # "~/.claude" default never touches the real home) and SESSION_NOTES_CONFIG
+    # (pointed at an empty file, so a real ~/.config/session-notes/config.toml is
+    # never read either). This script never touches the real Claude home.
+    orig_home = os.environ.get("HOME")
     orig_config_env = os.environ.get("SESSION_NOTES_CONFIG")
+    os.environ["HOME"] = tmp
     empty_cfg = os.path.join(tmp, "empty-config.toml")
     with open(empty_cfg, "w", encoding="utf-8"):
         pass
@@ -533,17 +563,19 @@ def selftest():
         os.makedirs(skill_dir)
         with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
             fh.write("---\nname: a-skill\n---\n\nbody\n")
-        ledger = os.path.join(skill_dir, LEDGER_NAME)
+        ledger = os.path.join(tmp, "ledgers", "a-skill.jsonl")
+        LB = os.path.basename(ledger)
 
         # -- add: missing skill dir / SKILL.md refuses loudly
         rc, out, err = run(["add", "ghost-skill", "--verdict", "edit", "--habit", "x",
                              "--before", "b", "--after", "a", "--session", "s1"])
         check("add refuses a nonexistent skill dir", rc == 2 and "no such skill directory" in err)
 
-        # -- add: a clean row
-        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                           "--habit", "no-trailing-summary", "--before", "before text",
-                           "--after", "after text", "--session", "sess-a", "--date", "2026-10-01"])
+        # -- add: a clean row, at an explicit --ledger override
+        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "edit", "--habit", "no-trailing-summary",
+                           "--before", "before text", "--after", "after text",
+                           "--session", "sess-a", "--date", "2026-10-01"])
         check("add logs the first row", rc == 0 and "logged" in out and ledger in out)
         check("printed line number is 1", out.strip().endswith(":1"))
         rows = read_rows(ledger)
@@ -560,9 +592,10 @@ def selftest():
         check("fixture ledger ends with a newline (precondition)", content.endswith(b"\n"))
         with open(ledger, "wb") as fh:
             fh.write(content.rstrip(b"\n"))  # simulate a ledger with no trailing newline
-        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                           "--habit", "no-trailing-summary", "--before", "second before",
-                           "--after", "second after", "--session", "sess-a"])
+        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "edit", "--habit", "no-trailing-summary",
+                           "--before", "second before", "--after", "second after",
+                           "--session", "sess-a"])
         check("add after a missing trailing newline logs line 2, not a fused line 1",
               rc == 0 and out.strip().endswith(":2"))
         lines_on_disk = open(ledger, encoding="utf-8").read().splitlines()
@@ -572,31 +605,47 @@ def selftest():
 
         # -- add: exact duplicate (even with different surrounding whitespace) is
         #    skipped, not re-logged
-        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                           "--habit", "no-trailing-summary", "--before", "  second before  ",
-                           "--after", "second after\n", "--session", "sess-a"])
+        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "edit", "--habit", "no-trailing-summary",
+                           "--before", "  second before  ", "--after", "second after\n",
+                           "--session", "sess-a"])
         check("duplicate add (modulo surrounding whitespace) is skipped",
               rc == 0 and "skipped duplicate" in out)
         check("duplicate did not grow the ledger", len(read_rows(ledger)) == 2)
 
+        # -- the dedupe key includes verdict: an approve of the same before/after/
+        #    session/habit as the earlier EDIT is a different fact, not a duplicate
+        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "approve", "--habit", "no-trailing-summary",
+                           "--before", "second before", "--after", "second after",
+                           "--session", "sess-a"])
+        check("same before/after/session/habit but a different verdict is NOT a duplicate",
+              rc == 0 and "logged" in out)
+        check("ledger now has 3 rows (the approve was logged, not skipped)",
+              len(read_rows(ledger)) == 3)
+        check("the new row's verdict is approve", read_rows(ledger)[2][1]["verdict"] == "approve")
+
         # -- add: bad habit (including an empty one) / bad verdict / missing session
-        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                           "--habit", "Not_Kebab", "--before", "b", "--after", "a",
-                           "--session", "s1"])
+        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "edit", "--habit", "Not_Kebab", "--before", "b",
+                           "--after", "a", "--session", "s1"])
         check("bad habit slug refused", rc == 2 and "kebab-case" in err)
 
-        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                           "--habit", "", "--before", "b", "--after", "a", "--session", "s1"])
+        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "edit", "--habit", "", "--before", "b",
+                           "--after", "a", "--session", "s1"])
         check("empty habit refused", rc == 2 and "kebab-case" in err)
 
-        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "bogus",
-                           "--habit", "x", "--before", "b", "--after", "a", "--session", "s1"])
+        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "bogus", "--habit", "x", "--before", "b",
+                           "--after", "a", "--session", "s1"])
         check("bad verdict refused by argparse", rc == 2)
 
         env_had = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         try:
-            rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                               "--habit", "x", "--before", "b", "--after", "a"])
+            rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                               "--verdict", "edit", "--habit", "x", "--before", "b",
+                               "--after", "a"])
             check("missing session refused", rc == 2 and "no session" in err)
         finally:
             if env_had is not None:
@@ -606,148 +655,183 @@ def selftest():
         bf = os.path.join(tmp, "before.txt")
         with open(bf, "w", encoding="utf-8") as fh:
             fh.write("multi\nline\nbefore\n")
-        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "reject",
-                           "--habit", "no-trailing-summary", "--before-file", bf,
-                           "--after", "no, drop it", "--session", "sess-b"])
+        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "reject", "--habit", "no-trailing-summary",
+                           "--before-file", bf, "--after", "no, drop it",
+                           "--session", "sess-b"])
         check("add accepts --before-file", rc == 0 and "logged" in out)
         check("file content stored verbatim",
               read_rows(ledger)[-1][1]["before"] == "multi\nline\nbefore\n")
 
         # -- add: invalid --date is refused (not just shape, a real calendar date)
-        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
-                           "--habit", "x", "--before", "b", "--after", "a", "--session", "s1",
-                           "--date", "2026-13-40"])
+        rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--ledger", ledger,
+                           "--verdict", "edit", "--habit", "x", "--before", "b",
+                           "--after", "a", "--session", "s1", "--date", "2026-13-40"])
         check("invalid calendar date refused", rc == 2 and "--date must be" in err)
 
-        # -- propose: below threshold is tentative, not qualifying (3 rows so far: 1
-        #    edit, 1 edit after the newline fix, 1 reject, all habit no-trailing-summary,
-        #    sessions sess-a and sess-b: 2 sessions already, but min-rows defaults to 3
-        #    so one more row is needed to prove the boundary)
-        rc, out, _ = run(["propose", "a-skill", "--skill-dir", skill_dir])
-        check("propose exits 0 below threshold", rc == 0)
+        # Ledger now has exactly 4 rows: 1 edit, 2 edit, 3 approve (same text as 2,
+        # different verdict), 4 reject (a different session). habit no-trailing-summary
+        # throughout. edit_reject = rows 1, 2, 4 (3 rows, sessions sess-a + sess-b = 2):
+        # this ALREADY meets the default 3-rows/2-sessions threshold.
+        check("ledger has exactly 4 rows at this point", len(read_rows(ledger)) == 4)
 
-        # -- propose: a fourth edit/reject row qualifies the habit
-        rc, _, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "reject",
-                        "--habit", "no-trailing-summary", "--before", "before text 2",
-                        "--after", "no, cut the closing line", "--session", "sess-b"])
-        check("fourth row added", rc == 0)
-        rc, out, _ = run(["propose", "a-skill", "--skill-dir", skill_dir])
-        check("propose now qualifies the habit",
+        # -- propose: qualifies on the first call (no extra row needed), and shows the
+        #    approve row as a "keep" example
+        rc, out, _ = run(["propose", "a-skill", "--ledger", ledger])
+        check("propose qualifies the habit with the approve row as a keep example",
               rc == 0 and "habit: no-trailing-summary" in out
-              and "Skill-feedback: a-skill no-trailing-summary rows" in out)
+              and ("Skill-feedback: a-skill no-trailing-summary rows 1,2,4" in out)
+              and "keep (approve) examples" in out)
         check("propose footer is short and points at docs/tools.md",
               "see docs/tools.md" in out)
 
-        # -- an approve row for the same habit shows as a keep example, never counts
-        #    toward the edit/reject threshold on its own
-        rc, _, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "approve",
-                        "--habit", "no-trailing-summary", "--before", "kept as-is",
-                        "--after", "exactly, keep it", "--session", "sess-a"])
-        rc, out, _ = run(["propose", "a-skill", "--skill-dir", skill_dir, "--min-rows", "10"])
-        check("an approve-only group with too few edit/reject rows stays tentative",
+        # -- raising --min-rows past the edit/reject count (3) drops it back to
+        #    tentative; the approve row never counts toward that count
+        rc, out, _ = run(["propose", "a-skill", "--ledger", ledger, "--min-rows", "10"])
+        check("an approve-only-inflated group with too few edit/reject rows stays tentative",
               rc == 0 and "no qualifying habits yet" in out
-              and "no-trailing-summary (4 row(s)" in out)
+              and "no-trailing-summary (3 row(s), 2 session(s))" in out)
 
         # -- --min-rows / --min-sessions must be >= 1
-        rc, _, err = run(["propose", "a-skill", "--skill-dir", skill_dir, "--min-rows", "0"])
+        rc, _, err = run(["propose", "a-skill", "--ledger", ledger, "--min-rows", "0"])
         check("--min-rows 0 refused", rc == 2)
-        rc, _, err = run(["propose", "a-skill", "--skill-dir", skill_dir, "--min-sessions", "-1"])
+        rc, _, err = run(["propose", "a-skill", "--ledger", ledger, "--min-sessions", "-1"])
         check("--min-sessions -1 refused", rc == 2)
 
+        # -- propose threshold boundary, on a dedicated ledger so the arithmetic is
+        #    unambiguous: a NEGATIVE case (3 edit/reject rows, but only 1 distinct
+        #    session: stays tentative) and a POSITIVE case (exactly 3 rows from
+        #    exactly 2 distinct sessions: qualifies at the boundary), asserted on the
+        #    printed report text, not just the exit code.
+        threshold_ledger = os.path.join(tmp, "ledgers", "threshold-skill.jsonl")
+        threshold_dir = os.path.join(tmp, "threshold-skill")
+        os.makedirs(threshold_dir)
+        with open(os.path.join(threshold_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: threshold-skill\n---\n")
+
+        def add_t(verdict, habit, before, after, session):
+            rc, _, _ = run(["add", "threshold-skill", "--skill-dir", threshold_dir,
+                             "--ledger", threshold_ledger, "--verdict", verdict,
+                             "--habit", habit, "--before", before, "--after", after,
+                             "--session", session])
+            return rc
+
+        # h-one: 3 rows, all from the SAME session -- negative boundary.
+        for i in range(3):
+            rc = add_t("edit" if i != 1 else "reject", "h-one", "b%d" % i, "a%d" % i,
+                       "only-session")
+            check("threshold fixture row %d added" % (i + 1), rc == 0)
+        # h-two: exactly 3 rows, from exactly 2 distinct sessions -- positive boundary.
+        add_t("edit", "h-two", "c1", "d1", "sess-x")
+        add_t("reject", "h-two", "c2", "d2", "sess-y")
+        add_t("edit", "h-two", "c3", "d3", "sess-x")
+
+        rc, out, _ = run(["propose", "threshold-skill", "--ledger", threshold_ledger])
+        check("negative boundary: 3 rows from 1 session stays tentative",
+              rc == 0 and "h-one (3 row(s), 1 session(s))" in out
+              and "habit: h-one" not in out)
+        check("positive boundary: exactly 3 rows from 2 sessions qualifies",
+              "habit: h-two" in out
+              and "Skill-feedback: threshold-skill h-two rows 4,5,6" in out)
+
         # -- applied: sets rows in place, preserves order and other lines byte-identical,
-        #    preserves file mode, and refuses a bad commit shape. Ledger has 5 rows now.
+        #    preserves file mode, and refuses a bad commit shape. Back to the main
+        #    a-skill ledger (4 rows): apply rows 1 and 4.
         os.chmod(ledger, 0o640)
         before_bytes = open(ledger, "rb").read()
         before_mode = os.stat(ledger).st_mode
 
-        rc, _, err = run(["applied", "a-skill", "--skill-dir", skill_dir,
-                           "--rows", "1,5", "--commit", "not-hex-ZZ"])
+        rc, _, err = run(["applied", "a-skill", "--ledger", ledger,
+                           "--rows", "1,4", "--commit", "not-hex-ZZ"])
         check("bad commit shape refused", rc == 2 and "git sha" in err)
 
-        rc, out, _ = run(["applied", "a-skill", "--skill-dir", skill_dir,
-                           "--rows", "1,5", "--commit", "deadbee"])
+        rc, out, _ = run(["applied", "a-skill", "--ledger", ledger,
+                           "--rows", "1,4", "--commit", "deadbee"])
         check("applied exits 0", rc == 0 and "deadbee" in out)
         rows_after = read_rows(ledger)
-        check("line order unchanged", len(rows_after) == 5)
+        check("line order unchanged", len(rows_after) == 4)
         check("row 1 now applied", rows_after[0][1]["applied"] == "deadbee")
-        check("row 5 now applied", rows_after[4][1]["applied"] == "deadbee")
-        check("untouched rows 2, 3, 4 stay unapplied",
-              all(rows_after[i][1]["applied"] is None for i in (1, 2, 3)))
+        check("row 4 now applied", rows_after[3][1]["applied"] == "deadbee")
+        check("untouched rows 2 and 3 stay unapplied",
+              rows_after[1][1]["applied"] is None and rows_after[2][1]["applied"] is None)
         after_lines = open(ledger, "rb").read().splitlines(keepends=True)
         before_lines = before_bytes.splitlines(keepends=True)
-        check("rows other than 1 and 5 are byte-identical to before the rewrite",
-              all(after_lines[i] == before_lines[i] for i in (1, 2, 3)))
+        check("rows other than 1 and 4 are byte-identical to before the rewrite",
+              after_lines[1] == before_lines[1] and after_lines[2] == before_lines[2])
         check("file mode is preserved across the atomic rewrite",
               os.stat(ledger).st_mode == before_mode)
-        check("no leftover feedback.jsonl.tmp after a successful applied",
-              not os.path.exists(os.path.join(skill_dir, LEDGER_NAME + ".tmp")))
+        check("no leftover <ledger>.tmp after a successful applied",
+              not os.path.exists(ledger + ".tmp"))
 
         # -- applied: refuses a double-apply and an out-of-range row, without mutating
-        rc, _, err = run(["applied", "a-skill", "--skill-dir", skill_dir,
+        rc, _, err = run(["applied", "a-skill", "--ledger", ledger,
                            "--rows", "1", "--commit", "0ffa5ba"])
         check("double-apply refused", rc == 2 and "already applied" in err)
         check("double-apply refusal left row 1 unchanged",
               read_rows(ledger)[0][1]["applied"] == "deadbee")
 
-        rc, _, err = run(["applied", "a-skill", "--skill-dir", skill_dir,
+        rc, _, err = run(["applied", "a-skill", "--ledger", ledger,
                            "--rows", "99", "--commit", "abc1234"])
         check("out-of-range row refused", rc == 2 and "no row at line 99" in err)
 
-        rc, _, err = run(["applied", "a-skill", "--skill-dir", skill_dir,
+        rc, _, err = run(["applied", "a-skill", "--ledger", ledger,
                            "--rows", "2,99", "--commit", "abc1234"])
         check("a mixed valid+out-of-range request mutates nothing",
               rc == 2 and read_rows(ledger)[1][1]["applied"] is None)
 
         # -- propose excludes applied rows from future qualification
-        rc, out, _ = run(["propose", "a-skill", "--skill-dir", skill_dir, "--min-rows", "1",
+        rc, out, _ = run(["propose", "a-skill", "--ledger", ledger, "--min-rows", "1",
                           "--min-sessions", "1"])
-        check("applied rows (1, 5) are excluded from a later propose",
-              "feedback.jsonl:1" not in out and "feedback.jsonl:5" not in out)
+        check("applied rows (1, 4) are excluded from a later propose",
+              ("%s:1" % LB) not in out and ("%s:4" % LB) not in out)
 
-        # -- malformed / malshaped lines fail loudly, never a silent skip
+        # -- malformed line fails loudly, never a silent skip
         with open(ledger, "a", encoding="utf-8") as fh:
             fh.write("not json at all\n")
-        rc, _, err = run(["propose", "a-skill", "--skill-dir", skill_dir])
-        check("malformed line fails loudly", rc == 2 and ":6: malformed JSON line" in err)
-        rc, _, err = run(["count", "a-skill", "--skill-dir", skill_dir])
-        check("count also fails loudly on a malformed line", rc == 2 and "malformed JSON" in err)
+        rc, _, err = run(["propose", "a-skill", "--ledger", ledger])
+        check("malformed line fails loudly", rc == 2 and ":5: malformed JSON line" in err)
 
-        shaped_dir = os.path.join(tmp, "shaped-skill")
-        os.makedirs(shaped_dir)
-        with open(os.path.join(shaped_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nname: shaped-skill\n---\n")
-        shaped_ledger = os.path.join(shaped_dir, LEDGER_NAME)
+        # -- bad row SHAPE (valid JSON, wrong shape) also fails loudly, via read_rows
+        #    directly: a non-object row, and a row missing a required field.
+        shaped_ledger = os.path.join(tmp, "ledgers", "shaped-skill.jsonl")
+        os.makedirs(os.path.dirname(shaped_ledger), exist_ok=True)
         with open(shaped_ledger, "w", encoding="utf-8") as fh:
             fh.write("[]\n")
-        rc, _, err = run(["count", "shaped-skill", "--skill-dir", shaped_dir])
-        check("a non-object row ([]) fails loudly as a bad row", rc == 2 and "bad row" in err)
+        try:
+            read_rows(shaped_ledger)
+            check("a non-object row ([]) fails loudly as a bad row", False)
+        except SkillFeedbackError as exc:
+            check("a non-object row ([]) fails loudly as a bad row", "bad row" in str(exc))
 
         with open(shaped_ledger, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"date": "2026-01-01", "habit": "x", "before": "b",
                                   "after_or_quote": "a", "verdict": "edit",
                                   "applied": None}) + "\n")  # missing "session"
-        rc, _, err = run(["count", "shaped-skill", "--skill-dir", shaped_dir])
-        check("a row missing session fails loudly as a bad row",
-              rc == 2 and "bad row" in err and "session" in err)
+        try:
+            read_rows(shaped_ledger)
+            check("a row missing session fails loudly as a bad row", False)
+        except SkillFeedbackError as exc:
+            check("a row missing session fails loudly as a bad row",
+                  "bad row" in str(exc) and "session" in str(exc))
 
-        # -- SKILL.md bytes are unchanged after propose: this command never edits the skill
+        # -- SKILL.md bytes are unchanged after propose: this command never touches it
         skill_md_path = os.path.join(skill_dir, "SKILL.md")
         before_skill_md = open(skill_md_path, "rb").read()
-        run(["propose", "a-skill", "--skill-dir", skill_dir])
+        run(["propose", "a-skill", "--ledger", ledger])
         check("SKILL.md bytes unchanged after propose",
               open(skill_md_path, "rb").read() == before_skill_md)
 
-        # -- a clean skill with no ledger: propose says so and exits 0
-        clean_dir = os.path.join(tmp, "clean-skill")
-        os.makedirs(clean_dir)
-        with open(os.path.join(clean_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nname: clean-skill\n---\n")
-        rc, out, _ = run(["propose", "clean-skill", "--skill-dir", clean_dir])
+        # -- a missing ledger (no skill directory needed at all for propose/applied
+        #    now): propose says so and exits 0
+        missing_ledger = os.path.join(tmp, "ledgers", "clean-skill.jsonl")
+        rc, out, _ = run(["propose", "clean-skill", "--ledger", missing_ledger])
         check("missing ledger: propose exits 0 and says so", rc == 0 and "no feedback rows" in out)
-        rc, out, _ = run(["count", "clean-skill", "--skill-dir", clean_dir])
-        check("missing ledger: count reports zero", rc == 0 and "0 rows total" in out)
 
-        # -- skill name validation
+        # -- the count subcommand is gone (canary replaced its only consumer)
+        rc, _, _ = run(["count", "a-skill", "--ledger", ledger])
+        check("count subcommand no longer exists", rc == 2)
+
+        # -- skill name validation (add always checks it, --skill-dir or not)
         rc, _, err = run(["add", "bad/name", "--verdict", "edit", "--habit", "x",
                            "--before", "b", "--after", "a", "--session", "s1"])
         check("skill name with a slash refused", rc == 2 and "invalid skill name" in err)
@@ -758,48 +842,95 @@ def selftest():
         # -- no-args and bad --rows usage
         rc, out, _ = run([])
         check("no subcommand prints help and exits 2", rc == 2)
-        rc, _, err = run(["applied", "a-skill", "--skill-dir", skill_dir,
+        rc, _, err = run(["applied", "a-skill", "--ledger", ledger,
                            "--rows", "not-a-number", "--commit", "abc1234"])
         check("non-numeric --rows refused", rc == 2 and "--rows must be" in err)
 
-        # -- write guard: a skill dir inside an unignored git work tree refuses to
-        #    write; the same dir with a covering .gitignore rule succeeds. Every git
-        #    call here goes through _git_env() for the same reason production code
-        #    does (a hook's inherited GIT_DIR must never redirect it).
-        git_repo = os.path.join(tmp, "git-repo")
-        os.makedirs(git_repo)
-        subprocess.run(["git", "init", "-q"], cwd=git_repo, env=_git_env(), check=True)
-        tracked_skill = os.path.join(git_repo, "tracked-skill")
-        os.makedirs(tracked_skill)
-        with open(os.path.join(tracked_skill, "SKILL.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nname: tracked-skill\n---\n")
+        # -- DESIGN: the default ledger path (no --ledger) resolves under
+        #    <claude_home>/skill-feedback/<skill>.jsonl and the directory is created
+        #    on first write. HOME is sandboxed to `tmp` above, so this never touches
+        #    the real Claude home.
+        rc, out, _ = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
+                           "--habit", "default-path-test", "--before", "b", "--after", "a",
+                           "--session", "s1"])
+        default_ledger = os.path.join(tmp, ".claude", "skill-feedback", "a-skill.jsonl")
+        check("default ledger path resolves under <claude_home>/skill-feedback/<skill>.jsonl",
+              rc == 0 and os.path.isfile(default_ledger))
+        check("default-path row content matches what was logged",
+              read_rows(default_ledger)[0][1]["habit"] == "default-path-test")
 
-        rc, _, err = run(["add", "tracked-skill", "--skill-dir", tracked_skill,
-                           "--verdict", "edit", "--habit", "x", "--before", "b",
-                           "--after", "a", "--session", "s1"])
-        check("write inside an unignored git work tree refuses",
-              rc == 2 and "would be tracked by" in err)
-        check("the refused write never created a ledger",
-              not os.path.exists(os.path.join(tracked_skill, LEDGER_NAME)))
+        # -- canary: counts distinct Skill tool_use names across a transcript
+        #    (excluding reflect/rnr and sidechain/subagent turns), plus the sum of
+        #    this session's rows across every ledger under skill-feedback/.
+        transcripts_dir = os.path.join(tmp, ".claude", "projects", "-tmp-proj")
+        os.makedirs(transcripts_dir)
+        canary_session = "canary-session-1"
+        transcript_path = os.path.join(transcripts_dir, canary_session + ".jsonl")
 
-        with open(os.path.join(git_repo, ".gitignore"), "w", encoding="utf-8") as fh:
-            fh.write("tracked-skill/feedback.jsonl\n")
-        rc, out, _ = run(["add", "tracked-skill", "--skill-dir", tracked_skill,
-                           "--verdict", "edit", "--habit", "x", "--before", "b",
-                           "--after", "a", "--session", "s1"])
-        check("the same write succeeds once covered by .gitignore",
-              rc == 0 and "logged" in out)
+        def skill_call(name, sidechain=False):
+            e = {"type": "assistant",
+                 "message": {"content": [{"type": "tool_use", "name": "Skill",
+                                           "input": {"skill": name}}]}}
+            if sidechain:
+                e["isSidechain"] = True
+            return json.dumps(e)
 
-        # applied is guarded the same way, now that the ledger is gitignored and has
-        # one row from the add above.
-        rc, out, _ = run(["applied", "tracked-skill", "--skill-dir", tracked_skill,
-                           "--rows", "1", "--commit", "abc1234"])
-        check("applied succeeds too, once the ledger is gitignored",
-              rc == 0 and "abc1234" in out)
+        with open(transcript_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join([
+                skill_call("alpha-skill"),
+                skill_call("alpha-skill"),       # same name again: still 1 distinct name
+                skill_call("beta-skill"),
+                skill_call("reflect"),            # excluded: the step running this capture
+                skill_call("gamma-skill", sidechain=True),  # excluded: a subagent's call
+            ]) + "\n")
+
+        alpha_dir = os.path.join(tmp, "alpha-skill")
+        beta_dir = os.path.join(tmp, "beta-skill")
+        os.makedirs(alpha_dir)
+        os.makedirs(beta_dir)
+        with open(os.path.join(alpha_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: alpha-skill\n---\n")
+        with open(os.path.join(beta_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: beta-skill\n---\n")
+
+        # One row for alpha, two for beta, all this session -- M should be 3. A row
+        # under a DIFFERENT session must NOT be counted.
+        run(["add", "alpha-skill", "--skill-dir", alpha_dir, "--verdict", "edit",
+             "--habit", "h1", "--before", "b1", "--after", "a1", "--session", canary_session])
+        run(["add", "beta-skill", "--skill-dir", beta_dir, "--verdict", "edit",
+             "--habit", "h2", "--before", "b2", "--after", "a2", "--session", canary_session])
+        run(["add", "beta-skill", "--skill-dir", beta_dir, "--verdict", "reject",
+             "--habit", "h2", "--before", "b3", "--after", "a3", "--session", canary_session])
+        run(["add", "alpha-skill", "--skill-dir", alpha_dir, "--verdict", "edit",
+             "--habit", "h3", "--before", "bb", "--after", "aa", "--session", "other-session"])
+
+        rc, out, _ = run(["canary", "--transcript", transcript_path, "--session", canary_session])
+        check("canary prints the exact derived line (N=2 skills, M=3 rows)",
+              rc == 0 and out.strip() == "skill feedback: 2 skills used, 3 rows logged")
+
+        rc, out, _ = run(["canary", "--session", canary_session])
+        check("canary locates the transcript by session id without --transcript",
+              rc == 0 and out.strip() == "skill feedback: 2 skills used, 3 rows logged")
+
+        rc, _, err = run(["canary", "--session", "no-such-session"])
+        check("canary refuses loudly when no transcript is found",
+              rc == 2 and "no transcript found" in err)
+
+        env_had2 = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        try:
+            rc, _, err = run(["canary"])
+            check("canary refuses with no session given", rc == 2 and "no session" in err)
+        finally:
+            if env_had2 is not None:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = env_had2
     finally:
         os.environ.pop("SESSION_NOTES_CONFIG", None)
         if orig_config_env is not None:
             os.environ["SESSION_NOTES_CONFIG"] = orig_config_env
+        if orig_home is not None:
+            os.environ["HOME"] = orig_home
+        else:
+            os.environ.pop("HOME", None)
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n%d failure(s)" % len(failures))

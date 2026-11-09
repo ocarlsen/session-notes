@@ -34,10 +34,10 @@ plain Python 3.9+ with no dependencies.
   `/reflect` re-reads each file again right before it writes, so a late
   session's notes add to an earlier session's instead of overwriting them.
 - **`/rnr`** is the end-of-day pair in one word: refresh, then reflect.
-- **`/reflect` also logs how you correct a skill's own output** (edit, reject, approve) into that
-  skill's own `feedback.jsonl`; `bin/skill_feedback.py propose` turns a repeated correction into a
-  SKILL.md change for you to approve, rather than a habit you keep correcting by hand. Detail:
-  docs/tools.md.
+- **`/reflect` also logs how you correct a skill's own output** (edit, reject, approve) to a
+  ledger under your Claude home; `bin/skill_feedback.py propose` prints the evidence and a HELD
+  note, so the model drafts the SKILL.md change and you approve it, rather than a habit you keep
+  correcting by hand. Detail: docs/tools.md.
 
 A project's store defaults to the folder Claude Code already keeps for it,
 `~/.claude/projects/<project>/memory/`, so auto memory loads its index at

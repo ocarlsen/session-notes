@@ -165,8 +165,9 @@ user reacted to it). So capture it HERE, mechanically, every time:
      Text that is multi-line, or happens to start with `-`, goes through `--before-file`/
      `--after-file` (a path, or `-` for stdin), never pasted raw onto the command line.
 3. **Pick a habit slug** naming the pattern the reaction is evidence of (kebab-case, e.g.
-   `no-trailing-summary`). Read that skill's ledger first (`<skill dir>/feedback.jsonl`) and reuse
-   an existing slug for the same habit, so rows accumulate instead of fragmenting.
+   `no-trailing-summary`). Read that skill's ledger first
+   (`<claude_home>/skill-feedback/<skill>.jsonl`) and reuse an existing slug for the same habit,
+   so rows accumulate instead of fragmenting.
 4. **A skill not under `<claude_home>/skills/<name>`** (a plugin's `ns:skill`, or a project's own
    `.claude/skills/`) still counts toward N below, but log nothing for it: never guess a
    `--skill-dir`. Only pass `--skill-dir` when the transcript itself shows the exact path (e.g. the
@@ -186,15 +187,16 @@ user reacted to it). So capture it HERE, mechanically, every time:
    never edits SKILL.md itself; that stays a separate, user-approved step outside `/reflect` (see
    docs/tools.md).
 
-**CANARY, derived, never counted by feel:**
-- **N** = the number of distinct skill names from the item 1 list (including one that got zero
-  rows; excluding /reflect itself, per item 1).
-- **M** = the sum, over those same N skills, of
-  `python3 $SESSION_NOTES/bin/skill_feedback.py count <skill> --session $CLAUDE_CODE_SESSION_ID`
-  (its per-session count is built for exactly this). A skill with no on-disk ledger, or one logged
-  nothing for, contributes 0.
-- Report exactly `skill feedback: N skills used, M rows logged` in Step 6, including the
-  `0 skills used, 0 rows logged` case, so a skipped capture is visible rather than silently absent.
+**CANARY, derived, never counted by feel:** run
+```bash
+python3 $SESSION_NOTES/bin/skill_feedback.py canary
+```
+and paste its printed line, verbatim, into Step 6: `skill feedback: N skills used, M rows logged`
+(N = distinct skills the transcript's own Skill tool calls name, excluding `reflect`/`rnr`; M =
+this session's row count summed across every ledger under `skill-feedback/`). It defaults to
+`$CLAUDE_CODE_SESSION_ID` and locates its own transcript; pass `--transcript PATH` only if it
+can't find one. This includes the `0 skills used, 0 rows logged` case, so a skipped capture is
+visible rather than silently absent.
 
 ---
 
