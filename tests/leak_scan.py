@@ -120,7 +120,30 @@ def scan_text(text, private=None):
     return hits
 
 
+def _git_env():
+    """A git hook exports GIT_DIR (and friends) for the repo being committed to; an
+    inherited GIT_DIR overrides -C, so every git call here strips GIT_* first."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 def repo_files():
+    """Tracked + untracked-but-not-ignored files, relative to ROOT. Ignored files
+    (e.g. a maintainer's own skills/*/feedback.jsonl) are never scanned or printed:
+    scanning private runtime state that .gitignore exists to keep out of commits would
+    defeat the point of ignoring it. Falls back to the old os.walk sweep when ROOT
+    isn't a usable git repo (e.g. a bare directory in a test fixture)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", ROOT, "ls-files", "-co", "--exclude-standard", "-z"],
+            capture_output=True, text=True, timeout=30, env=_git_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        r = None
+    if r is not None and r.returncode == 0:
+        names = [f for f in r.stdout.split("\0") if f]
+        return sorted(f for f in names
+                      if f != ".git" and os.path.splitext(f)[1].lower() not in BINARY_EXT)
+
     out = []
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]

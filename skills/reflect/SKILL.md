@@ -145,6 +145,57 @@ Half-captured (fact in the tracker, reasoning not)? Save only the missing half a
 record. It is a valid and common outcome to conclude there's little or nothing to add. Do NOT
 manufacture memories to look thorough. Less, but only the gaps.
 
+### Step 2b: Skill feedback
+
+A skill's own output can only be corrected by the user who reads it, never recovered from memory
+after the fact and never seen by a hook (a PostToolUse hook sees what the model wrote, not how the
+user reacted to it). So capture it HERE, mechanically, every time:
+
+1. **List the skills loaded this session** from the transcript itself: Skill tool calls, and
+   user-typed `/<skill>` invocations. Not from memory of what seemed used. **/reflect itself is
+   NOT counted** (it is the thing running this step, not a skill being reviewed by it).
+2. **For each one, find the user messages that reacted to its output:**
+   - **`edit`**: the user replaced its text with different text.
+   - **`reject`**: the user rejected it outright.
+   - **`approve`**: the user's message NAMES the specific non-obvious choice being approved
+     ("exactly, no body needed for a pure rename"). A bare "ok", "thanks", or "looks good" is
+     never a row: it carries no evidence of which choice it is approving.
+   - Quote verbatim into `--before`/`--after`; never paraphrase. If the literal text isn't
+     recoverable from the transcript, log nothing for that reaction rather than reconstruct it.
+     Text that is multi-line, or happens to start with `-`, goes through `--before-file`/
+     `--after-file` (a path, or `-` for stdin), never pasted raw onto the command line.
+3. **Pick a habit slug** naming the pattern the reaction is evidence of (kebab-case, e.g.
+   `no-trailing-summary`). Read that skill's ledger first (`<skill dir>/feedback.jsonl`) and reuse
+   an existing slug for the same habit, so rows accumulate instead of fragmenting.
+4. **A skill not under `<claude_home>/skills/<name>`** (a plugin's `ns:skill`, or a project's own
+   `.claude/skills/`) still counts toward N below, but log nothing for it: never guess a
+   `--skill-dir`. Only pass `--skill-dir` when the transcript itself shows the exact path (e.g. the
+   Skill tool's own result named it).
+5. **Write every row through the script, never a hand-typed JSON line**:
+   ```bash
+   python3 $SESSION_NOTES/bin/skill_feedback.py add <skill> --verdict edit|reject|approve \
+     --habit <slug> --before "<literal skill output>" --after "<literal user text>"
+   ```
+   `session` defaults to `$CLAUDE_CODE_SESSION_ID`; pass `--date` only to backdate.
+6. **Run `propose` for every skill that got a row this session**, not only one that looks
+   qualifying by eye:
+   ```bash
+   python3 $SESSION_NOTES/bin/skill_feedback.py propose <skill>
+   ```
+   Note any qualifying habit it reports for Step 6. This is informational only here: `propose`
+   never edits SKILL.md itself; that stays a separate, user-approved step outside `/reflect` (see
+   docs/tools.md).
+
+**CANARY, derived, never counted by feel:**
+- **N** = the number of distinct skill names from the item 1 list (including one that got zero
+  rows; excluding /reflect itself, per item 1).
+- **M** = the sum, over those same N skills, of
+  `python3 $SESSION_NOTES/bin/skill_feedback.py count <skill> --session $CLAUDE_CODE_SESSION_ID`
+  (its per-session count is built for exactly this). A skill with no on-disk ledger, or one logged
+  nothing for, contributes 0.
+- Report exactly `skill feedback: N skills used, M rows logged` in Step 6, including the
+  `0 skills used, 0 rows logged` case, so a skipped capture is visible rather than silently absent.
+
 ---
 
 ## Step 3: In consolidate mode, read existing memory files
@@ -309,6 +360,11 @@ conversation itself does not carry across sessions.
 
 Brief list: files created/updated/deleted and where; CLAUDE.md changes; promotions. One short
 sentence per item. No paragraphs.
+
+**Always include the Step 2b canary line**: `skill feedback: N skills used, M rows logged`, even
+when both are zero (N/M derived as Step 2b describes, never counted by feel). If `propose` (Step
+2b, item 6) found a qualifying habit for any skill, name it and the exact
+`skill_feedback.py propose <skill>` command; do NOT edit that skill's SKILL.md here.
 
 **Then the Step 0b triage, always, including when nothing was filed** ("no new items filed this
 session" is one clause, and its absence is indistinguishable from forgetting to look). One line

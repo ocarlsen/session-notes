@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 examples/state/
+
+# install.sh makes ~/.claude/skills/<name> a symlink POINTING INTO this checkout, so a
+# real feedback.jsonl (bin/skill_feedback.py's ledger, written beside the real skill)
+# lands inside THIS git work tree by construction. Keep it, and its atomic-write temp
+# file, out. Anchored at the repo root so it leaves the synthetic demo ledger under the
+# example claude_home (examples' own home/.claude/skills/*/feedback.jsonl, not a
+# symlink target) untouched.
+/skills/*/feedback.jsonl
+/skills/*/feedback.jsonl.tmp

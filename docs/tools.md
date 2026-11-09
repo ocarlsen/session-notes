@@ -70,6 +70,7 @@ fixed line (never the message) into its empty input box.
 | --- | --- | --- |
 | Config | `bin/notes_config.py`, `config.example.toml` | One TOML file for paths, scopes, boot budgets and time zone. No hardcoded directories. |
 | Scoped memory | `skills/reflect`, `skills/rnr`, `skills/refresh`, `skills/find-session`; `bin/reflect_lock.py`, `append_memory_index.py`, `memory_index_lint.py`, `boot_budget.py`, `memory_hygiene_canary.py` | Write, reload and check memory stores. A lock serializes concurrent reflects; the index writer refuses over-long lines; the budget and canary report drift. |
+| Skill feedback | `bin/skill_feedback.py`; a ledger `<skill dir>/feedback.jsonl` beside each skill | Logs how the user corrects a skill's own output (edit / reject / approve, quoted verbatim), captured by `/reflect` (Step 2b). `propose` groups unresolved rows by habit and reports which have enough evidence (default: 3+ rows from 2+ sessions) to act on; it never edits a SKILL.md itself. |
 | Session coordination | `bin/session_peers.py`, `session_lineage.py`, `handoff_session.py`, `bcast.py`; `hooks/session_pane_registry.py` | List and peek at sibling sessions, launch a worker session and record who launched it, show the lineage tree, broadcast a line you type to every session. |
 | Bus | `bin/session_bus.py`, `bus_nudge.py`; `hooks/session_bus_hook.py` | Staged specs and mail from scripts, addressed by tmux session name, delivered at least once; wake idle recipients. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
@@ -78,6 +79,45 @@ fixed line (never the message) into its empty input box.
 Every script has a `--selftest`; `make test` runs them all with `HOME`
 pointed at a temp dir, plus smoke tests that run each hook the way Claude
 Code does.
+
+## Skill feedback: skills that improve from being corrected
+
+A skill's output gets edited, rejected, or approved by the user every time it runs; that reaction
+is the only signal that says whether the skill is doing the right thing, and it exists only in the
+conversation, not in any hook. `/reflect` (Step 2b) reads the transcript for those reactions and
+logs each one, verbatim, through `bin/skill_feedback.py add` into `<skill dir>/feedback.jsonl`, one
+JSON row per line, tagged with a short `habit` slug naming the pattern it is evidence of.
+
+`bin/skill_feedback.py propose <skill>` groups unresolved rows by habit and reports which ones
+have enough evidence (by default: 3+ edit/reject rows from 2+ distinct sessions) to act on, with
+exact row citations, the before/after text, any `approve` rows for the same habit as "keep"
+examples, and a ready commit trailer. `propose` never writes to SKILL.md: the proposal is HELD for
+the model to draft and the user to approve.
+
+`add` and `applied` (the two commands that write) refuse before touching the ledger if its
+directory sits inside a git work tree that doesn't already ignore it, naming the work tree and
+pointing at `.gitignore` or `--skill-dir`; a real install's skill dir is usually a symlink pointing
+INTO this checkout (`install.sh` links `~/.claude/skills/<name>` here), which is exactly the case
+this repo's own `/skills/*/feedback.jsonl` rule covers. Even a gitignored ledger inside a clone is
+still lost to `git clean -fdx`, so a ledger worth keeping belongs somewhere that command won't
+touch.
+
+**Before shipping a proposed edit, run a blind A/B.** Generate the same few paragraphs twice, once
+under the current SKILL.md (`git show HEAD:<path>/SKILL.md`) and once under the proposed version,
+strip anything that labels which is which, and have the user (or a second model) pick without
+knowing. Ship the edit only if the proposed version wins; a habit that only looks better to the
+model that proposed it isn't a fix.
+
+Try it against the synthetic example (a tiny made-up `commit-message` skill under the example
+claude_home, `home/.claude/skills/` inside `examples/`, not something `install.sh` ever links):
+
+```sh
+SESSION_NOTES_CONFIG=examples/config.toml python3 bin/skill_feedback.py propose commit-message
+```
+
+That ledger already has one qualifying habit (`no-trailing-summary`: 3 rows across 2 sessions)
+and one still-tentative one (`imperative-mood-subject`: 1 row), so the command's two sections
+both have something to show.
 
 ## Five-minute quickstart
 
