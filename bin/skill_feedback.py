@@ -440,13 +440,14 @@ def cmd_applied(args):
 COMMAND_NAME_RE = re.compile(r"<command-name>/?([^<\s]+)</command-name>")
 
 
-def _is_typed_skill(name, skills_dir):
+def _is_typed_skill(name, skills_dirs):
     """A user-typed `/<name>` is a skill (not a built-in like /clear or /model) when it
-    names an installed skill folder, or carries a plugin namespace (`ns:skill`)."""
+    names a skill folder in any of `skills_dirs` (the user's own, plus the project's
+    `.claude/skills/`), or carries a plugin namespace (`ns:skill`)."""
     if ":" in name:
         return True
-    return bool(skills_dir) and SKILL_NAME_RE.match(name) is not None and \
-        os.path.isfile(os.path.join(skills_dir, name, "SKILL.md"))
+    return SKILL_NAME_RE.match(name) is not None and any(
+        os.path.isfile(os.path.join(d, name, "SKILL.md")) for d in skills_dirs if d)
 
 
 def _skill_names_from_transcript(path, skills_dir=None):
@@ -455,7 +456,8 @@ def _skill_names_from_transcript(path, skills_dir=None):
     `<command-name>` marker in a user entry with no Skill tool_use at all. A set, so a
     name invoked both ways counts once. A subagent/reviewer turn (isSidechain) is
     excluded: this counts the skills THIS session itself invoked, not a forked
-    helper's."""
+    helper's. A project skill is looked up under each entry's own `cwd`, so a session
+    that changed directory still finds the project it typed the skill in."""
     names = set()
     for _, line in find_session.iter_lines(path):
         try:
@@ -471,7 +473,9 @@ def _skill_names_from_transcript(path, skills_dir=None):
                 and b.get("type") == "text" and isinstance(b.get("text"), str)]
             for text in texts:
                 for typed in COMMAND_NAME_RE.findall(text):
-                    if _is_typed_skill(typed, skills_dir):
+                    cwd = entry.get("cwd")
+                    project = os.path.join(cwd, ".claude", "skills") if isinstance(cwd, str) else None
+                    if _is_typed_skill(typed, [skills_dir, project]):
                         names.add(typed)
         if not isinstance(content, list):
             continue
@@ -986,10 +990,21 @@ def selftest():
                 e["isSidechain"] = True
             return json.dumps(e)
 
-        def typed(name):
-            return json.dumps({"type": "user", "message": {"role": "user", "content":
-                "<command-message>%s</command-message>\n<command-name>/%s</command-name>"
-                % (name, name)}})
+        def typed(name, cwd=None):
+            e = {"type": "user", "message": {"role": "user", "content":
+                 "<command-message>%s</command-message>\n<command-name>/%s</command-name>"
+                 % (name, name)}}
+            if cwd:
+                e["cwd"] = cwd
+            return json.dumps(e)
+
+        proj_root = os.path.join(tmp, "proj")
+        for name, root in (("epsilon-skill", proj_root),
+                           ("zeta-skill", os.path.join(tmp, "other-proj"))):
+            d = os.path.join(root, ".claude", "skills", name)
+            os.makedirs(d)
+            with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+                fh.write("---\nname: %s\n---\n" % name)
 
         delta_dir = os.path.join(tmp, ".claude", "skills", "delta-skill")
         os.makedirs(delta_dir)
@@ -1006,6 +1021,8 @@ def selftest():
                 typed("delta-skill"),             # typed /delta-skill: counted
                 typed("beta-skill"),              # typed AND called: still 1 name
                 typed("clear"),                   # built-in command, not a skill
+                typed("epsilon-skill", cwd=proj_root),  # a project's own .claude/skills: counted
+                typed("zeta-skill"),              # same name exists only in a project not cwd
             ]) + "\n")
 
         alpha_dir = os.path.join(tmp, "alpha-skill")
@@ -1029,12 +1046,12 @@ def selftest():
              "--habit", "h3", "--before", "bb", "--after", "aa", "--session", "other-session"])
 
         rc, out, _ = run(["canary", "--transcript", transcript_path, "--session", canary_session])
-        check("canary prints the exact derived line (N=3 skills incl. a typed one, M=3 rows)",
-              rc == 0 and out.strip() == "skill feedback: 3 skills used, 3 rows logged")
+        check("canary prints the exact derived line (N=4 skills incl. a typed user and a typed project one, M=3 rows)",
+              rc == 0 and out.strip() == "skill feedback: 4 skills used, 3 rows logged")
 
         rc, out, _ = run(["canary", "--session", canary_session])
         check("canary locates the transcript by session id without --transcript",
-              rc == 0 and out.strip() == "skill feedback: 3 skills used, 3 rows logged")
+              rc == 0 and out.strip() == "skill feedback: 4 skills used, 3 rows logged")
 
         # Same session id in a second project dir, older: still picks the newer one.
         older_dir = os.path.join(tmp, ".claude", "projects", "-tmp-older")
@@ -1045,7 +1062,7 @@ def selftest():
         os.utime(older, (1, 1))
         rc, out, err = run(["canary", "--session", canary_session])
         check("canary picks the newest of several matching transcripts and names it",
-              rc == 0 and out.strip() == "skill feedback: 3 skills used, 3 rows logged"
+              rc == 0 and out.strip() == "skill feedback: 4 skills used, 3 rows logged"
               and "using the newest" in err and transcript_path in err)
 
         rc, _, err = run(["add", "reflect", "--skill-dir", alpha_dir, "--verdict", "edit",
