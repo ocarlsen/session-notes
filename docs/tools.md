@@ -98,6 +98,14 @@ exact row citations, the before/after text, any `approve` rows for the same habi
 examples, and a ready commit trailer. `propose` never writes to SKILL.md: the proposal is HELD for
 the model to draft and the user to approve.
 
+The threshold waits for a habit to repeat, but one case can't wait: the user edited or
+rejected text the SKILL.md itself still quotes as an example. The newer reaction wins, so
+`propose` lists those rows first, under "contradicts the skill", with no threshold (a match
+is the row's `before`, 20+ characters, found in SKILL.md with whitespace collapsed). Fixing
+it may mean keeping the quote as a "don't" example; either way, mark the row `applied` with
+the fixing commit so it stops being flagged. `--skill-dir` points the check at a skill
+outside `<claude_home>/skills/`.
+
 `bin/skill_feedback.py canary` prints `skill feedback: N skills used, M rows logged`: N is the
 count of distinct skills the session invoked, by Skill tool call or by a user-typed `/<skill>`
 (a typed name counts when it names an installed skill or a plugin `ns:skill`, so built-ins like
