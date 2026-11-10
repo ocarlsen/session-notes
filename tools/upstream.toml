@@ -37,6 +37,10 @@ repo = "bin/memory_index_lint.py"
 upstream = "bin/memory_index_lint.py"
 
 [[pair]]
+repo = "bin/skill_feedback.py"
+upstream = "bin/skill_feedback.py"
+
+[[pair]]
 repo = "bin/reflect_lock.py"
 upstream = "bin/reflect_lock.py"
 
