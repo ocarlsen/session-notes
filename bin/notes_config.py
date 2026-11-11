@@ -146,7 +146,11 @@ def _scalar(text, lineno):
 def parse_toml(text):
     """Parse the TOML subset described in the module docstring."""
     if _tomllib is not None:
-        return _tomllib.loads(text)
+        # One error type on every interpreter, so callers catch ConfigError only.
+        try:
+            return _tomllib.loads(text)
+        except _tomllib.TOMLDecodeError as exc:
+            raise ConfigError(str(exc)) from None
     root, cur = {}, None
     cur = root
     for n, raw in enumerate(text.splitlines(), 1):
