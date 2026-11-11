@@ -75,6 +75,7 @@ HONEST LIMITS
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -190,7 +191,10 @@ def compose(text, no_prefix=False, marker=None):
         sys.exit("bcast: nothing to send")
     if "\n" in text:
         sys.exit("bcast: refusing multi-line text (the newline would submit early)")
-    if text.startswith("/") or no_prefix:
+    # A slash COMMAND is "/name" as the first word; "/tmp/notes.txt please read" is prose
+    # that merely starts with a path, and must still carry the marker.
+    first = text.split(None, 1)[0]
+    if re.match(r"^/[A-Za-z][A-Za-z0-9_:.-]*$", first) or no_prefix:
         return text
     return "%s %s" % (marker or prefix(), text)
 
@@ -334,6 +338,8 @@ def selftest():
 
     # A slash command must survive untouched or the receiver will not parse it.
     assert compose("/refresh") == "/refresh"
+    assert compose("/rnr consolidate") == "/rnr consolidate"
+    assert compose("/tmp/notes.txt is ready", marker="[m]") == "[m] /tmp/notes.txt is ready"
     assert compose("check the bus", marker="[m]") == "[m] check the bus"
     assert compose("check the bus") == "%s check the bus" % prefix()
     assert prefix() == notes_config.DEFAULTS["bcast"]["prefix"]

@@ -176,6 +176,32 @@ def record_failure():
         pass
 
 
+def clear_failure():
+    """A hook run that finished cleanly retires this pane's stale failure trace, so
+    bus_nudge and `send` stop treating a long-fixed failure as live."""
+    try:
+        try:
+            import session_bus as bus
+            d = bus.errors_path()
+        except Exception:
+            d = fallback_errors_dir()
+        pane = os.environ.get("TMUX_PANE", "unknown")
+        safe = "".join(c for c in pane if c.isalnum() or c in "-_")[:64] or "unknown"
+        os.unlink(os.path.join(d, safe))
+    except Exception:
+        pass
+
+
+def run_hook():
+    """main() with every failure swallowed into a trace; success clears the trace."""
+    try:
+        main()
+    except Exception:
+        record_failure()
+    else:
+        clear_failure()
+
+
 def selftest():
     """Hermetic: a temp state_dir, a stubbed identity, no tmux."""
     import contextlib
@@ -285,6 +311,11 @@ def selftest():
         trace = os.path.join(bus.errors_path(), "7")
         check("failure trace lands under state_dir", os.path.exists(trace)
               and trace.startswith(os.path.join(tmp, "st")))
+        import subprocess
+        subprocess.run([sys.executable, os.path.abspath(__file__)], input="{}",
+                       capture_output=True, text=True, env=dict(os.environ), timeout=60)
+        check("a clean hook run clears this pane's stale failure trace",
+              not os.path.exists(trace))
         check("fallback errors dir is under the configured state_dir",
               fallback_errors_dir() == os.path.join(tmp, "st", "session-bus", "errors"))
     finally:
@@ -299,8 +330,5 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
-    try:
-        main()
-    except Exception:
-        record_failure()
+    run_hook()
     sys.exit(0)

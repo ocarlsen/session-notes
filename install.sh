@@ -19,7 +19,7 @@
 #   sh install.sh                    ask about the links, then about the two edits
 #   sh install.sh --bin-dir ~/.local/bin
 #   sh install.sh --all --bin-dir ~/.local/bin
-#   sh install.sh --yes              answer yes to both questions
+#   sh install.sh --yes              answer yes to every question
 #   sh install.sh --dry-run          show what would happen
 set -eu
 

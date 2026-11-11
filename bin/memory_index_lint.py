@@ -56,10 +56,17 @@ class UnknownScopeError(ValueError):
     """--scope named a store the config does not define."""
 
 
+def _load_config_or_exit():
+    try:
+        return notes_config.load()
+    except notes_config.ConfigError as exc:
+        sys.exit(f"memory_index_lint: bad config: {exc}")
+
+
 def index_path_for_scope(name, cfg=None):
     """The MEMORY.md of a configured store: "global" is paths.global_store, anything
     else must match a [[scopes]] entry's name. Raises UnknownScopeError otherwise."""
-    cfg = cfg or notes_config.load()
+    cfg = cfg or _load_config_or_exit()
     if name == "global":
         return os.path.join(cfg["paths"]["global_store"], "MEMORY.md")
     for s in cfg.get("scopes", []):
@@ -74,23 +81,33 @@ class HookCapError(ValueError):
     append_memory_index.py chokepoint; carries the ready-to-print refusal message."""
 
 
+class NoIndexError(RuntimeError):
+    """The index file to lint is missing or unreadable (reported as a clean refusal)."""
+
+
 class NoBaselineError(RuntimeError):
     """lint_hooks()/lint() were given no --baseline and no git HEAD copy could be
     found either -- refusing rather than silently treating every existing line as
     new (see module docstring)."""
 
 
-def parse_index(text):
-    """Return {target: (full_line, hook_text)} for every index-shaped line. Last
-    occurrence of a given target wins (an index should have one line per target)."""
-    out = {}
+def parse_index_lines(text):
+    """Every index-shaped line, in order, as (target, full_line, hook_text). A target
+    may legitimately appear on more than one line; callers that must not lose any
+    (the lint) use this rather than parse_index()."""
+    out = []
     for line in text.splitlines():
         m = INDEX_LINE_RE.match(line.rstrip())
         if not m:
             continue
-        target, hook = m.group(1), m.group(2).strip()
-        out[target] = (line, hook)
+        out.append((m.group(1), line, m.group(2).strip()))
     return out
+
+
+def parse_index(text):
+    """Return {target: (full_line, hook_text)} for every index-shaped line. Last
+    occurrence of a given target wins (an index should have one line per target)."""
+    return {t: (line, hook) for t, line, hook in parse_index_lines(text)}
 
 
 def cap_for(target):
@@ -172,12 +189,12 @@ def default_baseline_text(index_path):
 
 
 def _load_baseline(index_path, baseline_path):
-    """Returns the baseline {target: (line, hook)} dict, or raises NoBaselineError."""
+    """Returns the baseline as parse_index_lines() output, or raises NoBaselineError."""
     if baseline_path:
         if not os.path.isfile(baseline_path):
             raise NoBaselineError(f"--baseline path does not exist: {baseline_path}")
         text = Path(baseline_path).read_text(encoding="utf-8", errors="replace")
-        return parse_index(text)
+        return parse_index_lines(text)
     text = default_baseline_text(index_path)
     if text is None:
         raise NoBaselineError(
@@ -185,7 +202,7 @@ def _load_baseline(index_path, baseline_path):
             "refusing to run rather than treat every existing line as new "
             "(pass --baseline explicitly, e.g. a pre-write snapshot)"
         )
-    return parse_index(text)
+    return parse_index_lines(text)
 
 
 def lint_hooks(index_path, baseline_path=None):
@@ -198,14 +215,21 @@ def lint_hooks(index_path, baseline_path=None):
     if `baseline_path` is None and no git HEAD copy is available (see module
     docstring) -- never silently falls back to "everything is new."
     """
-    text = Path(index_path).read_text(encoding="utf-8", errors="replace")
-    current = parse_index(text)
-    baseline = _load_baseline(index_path, baseline_path)
+    try:
+        text = Path(index_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise NoIndexError(f"cannot read index {index_path}: {exc.strerror or exc}")
+    current = parse_index_lines(text)
+    baseline_lines = {}
+    for t, bline, _ in _load_baseline(index_path, baseline_path):
+        baseline_lines.setdefault(t, set()).add(bline)
 
     offenders = []
-    for target, (line, hook) in current.items():
-        base = baseline.get(target)
-        if base is not None and base[0] == line:
+    # EVERY line is judged on its own: a second line for a target must not ride on an
+    # older identical-target line being grandfathered.
+    for target, line, hook in current:
+        base = baseline_lines.get(target)
+        if base is not None and line in base:
             continue  # pre-existing, unchanged: grandfathered
         result = check_line(line)
         if not result["ok"]:
@@ -428,6 +452,46 @@ def selftest():
         offenders_messy = lint_hooks(str(messy_idx), str(empty_baseline))
         check(offenders_messy == [], "prose / malformed lines are ignored, never crash")
 
+        # --- a target on two lines: a new over-cap line is not grandfathered by an
+        # older line for the same target (the dict-per-target parse lost the old one) ---
+        old_line = "- [R](reference_dup.md) - short hook"
+        new_line = f"- [R](reference_dup.md) - {long_ref_hook}"
+        dup_base = d / "dup_base.md"
+        _write(dup_base, old_line + "\n")
+        dup_idx = d / "dup_idx.md"
+        _write(dup_idx, new_line + "\n" + old_line + "\n")
+        check([o["target"] for o in lint_hooks(str(dup_idx), str(dup_base))] == ["reference_dup.md"],
+              "a new over-cap line is flagged even when an older line for its target is unchanged")
+
+        # --- a missing index and a bad config are clean exits, not tracebacks ---
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc_missing = main([str(d / "nope.md"), "--baseline", str(dup_base)])
+            except Exception:
+                rc_missing = "traceback"
+        check(rc_missing == 2, "a missing index file is refused (rc 2), not a traceback")
+
+        bad_cfg = d / "bad.toml"
+        bad_cfg.write_text("this is not toml\n")
+        saved_env = os.environ.get("SESSION_NOTES_CONFIG")
+        os.environ["SESSION_NOTES_CONFIG"] = str(bad_cfg)
+        try:
+            try:
+                index_path_for_scope("global")
+                outcome = "no error"
+            except SystemExit as exc:
+                outcome = "exit" if exc.code else "exit0"
+            except Exception:
+                outcome = "traceback"
+        finally:
+            if saved_env is None:
+                os.environ.pop("SESSION_NOTES_CONFIG", None)
+            else:
+                os.environ["SESSION_NOTES_CONFIG"] = saved_env
+        check(outcome == "exit", "a bad config is a clean sys.exit(message), not a traceback")
+
     print("\nSELFTEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -474,9 +538,11 @@ def main(argv=None):
 
     try:
         ok, lines = lint(args.index_file, args.baseline, args.as_path)
-    except NoBaselineError as e:
+    except (NoBaselineError, NoIndexError) as e:
         print(f"REFUSED TO RUN: {e}", file=sys.stderr)
         return 2
+    except notes_config.ConfigError as e:
+        sys.exit(f"memory_index_lint: bad config: {e}")
 
     for ln in lines:
         print(ln)

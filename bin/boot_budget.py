@@ -118,6 +118,10 @@ def native_load_chars(path):
 
 # A line whose first non-whitespace char is "@" is a Claude Code import.
 _IMPORT_RE = re.compile(r"^[ \t]*@(\S.*)$")
+# An import mid-sentence ("See @~/notes.md for details"): "@" after whitespace, so an
+# email address never matches. Trailing sentence punctuation is not part
+# of the path.
+_INLINE_IMPORT_RE = re.compile(r"(?<=\s)@(\S+)")
 
 # A fenced code block delimiter (``` or ~~~, 3+ chars, optional leading whitespace and
 # a language tag after). An @-line INSIDE a fence is markdown showing example syntax,
@@ -252,16 +256,18 @@ def resolve_imports(path, visited=None, order=None):
         if in_fence:
             continue
         m = _IMPORT_RE.match(line)
-        if not m:
-            continue
-        raw = m.group(1).strip()
-        if not raw:
-            continue
-        expanded = _tilde(raw)
-        if not os.path.isabs(expanded):
-            expanded = os.path.join(base_dir, expanded)
-        expanded = os.path.normpath(expanded)
-        resolve_imports(expanded, visited, order)
+        if m:
+            raws = [m.group(1).strip()]  # line-leading: the rest of the line is the path
+        else:
+            raws = [r.rstrip(".,;:!?)]}'\"") for r in _INLINE_IMPORT_RE.findall(line)]
+        for raw in raws:
+            if not raw:
+                continue
+            expanded = _tilde(raw)
+            if not os.path.isabs(expanded):
+                expanded = os.path.join(base_dir, expanded)
+            expanded = os.path.normpath(expanded)
+            resolve_imports(expanded, visited, order)
     return order
 
 
@@ -290,7 +296,9 @@ def boot_files_for_scope(root):
     root = os.path.normpath(_tilde(root))
     home = os.path.normpath(HOME)
     global_claude = os.path.join(_config_dir(), "CLAUDE.md")
-    chain = [global_claude]
+    # ~/CLAUDE.md loads in every session started under HOME, so it is budgeted for every
+    # scope (deduped by realpath if the config dir is HOME/.claude and it is the same file).
+    chain = [global_claude, os.path.join(home, "CLAUDE.md")]
 
     if os.path.abspath(root) != os.path.abspath(home):
         rel = os.path.relpath(root, home)
@@ -730,6 +738,19 @@ def selftest():
             check(str(global_claude) in widget_files, "nested scope still includes global CLAUDE.md")
             check(str(scope_claude) in widget_files, "nested scope includes its own CLAUDE.md")
             check(str(scope_mem) in widget_files, "nested scope resolves its own @import")
+
+            # --- ~/CLAUDE.md is budgeted, and an inline @import is followed ---
+            inline_target = tmp_home / "inline_target.md"
+            _write(inline_target, "i" * 30)
+            home_claude = tmp_home / "CLAUDE.md"
+            _write(home_claude, f"# home\nSee @{inline_target} for details.\nmail " + "a" + "@" + "b.com\n")
+            home_files = boot_files_for_scope(str(widget_root))
+            check(str(home_claude) in home_files,
+                  "~/CLAUDE.md is part of every scope's boot set")
+            check(str(inline_target) in home_files,
+                  "an inline mid-sentence @import is followed")
+            check(str(tmp_home / "b.com") not in home_files, "an email address is not an import")
+            home_claude.unlink()
 
             # --- boot_files_for_scope: HOME level's .claude/CLAUDE.md is the global file
             # already in `chain`, never appended (and counted) a second time ---

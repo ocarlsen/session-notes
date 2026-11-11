@@ -53,6 +53,7 @@ disk at all.
 """
 import fcntl
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -142,7 +143,12 @@ def append_line(path, line, enforce_cap=True, pin=False):
         pass
 
     effective_path = target_path_for(path, line, pin)
-    directory = os.path.dirname(os.path.abspath(effective_path)) or "."
+    # Write through a symlink, not over it: os.replace onto the link path would swap the
+    # link for a regular file. Keep the "is this the hot file" comparison on the
+    # un-resolved path, and do all I/O on the real target.
+    is_cold = effective_path != path
+    effective_path = os.path.realpath(effective_path)
+    directory = os.path.dirname(effective_path) or "."
     os.makedirs(directory, exist_ok=True)
     lock_path = effective_path + ".lock"
     with open(lock_path, "a+") as lock:
@@ -152,7 +158,7 @@ def append_line(path, line, enforce_cap=True, pin=False):
                 with open(effective_path, encoding="utf-8") as fh:
                     content = fh.read()
             except FileNotFoundError:
-                content = REFERENCE_HEADER if effective_path != path else ""
+                content = REFERENCE_HEADER if is_cold else ""
 
             if line in content.splitlines():
                 return False
@@ -166,6 +172,10 @@ def append_line(path, line, enforce_cap=True, pin=False):
             try:
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_fh:
                     tmp_fh.write(content)
+                try:
+                    shutil.copymode(effective_path, tmp_path)  # mkstemp is 0600
+                except FileNotFoundError:
+                    pass
                 os.replace(tmp_path, effective_path)
             except Exception:
                 if os.path.exists(tmp_path):
@@ -205,6 +215,21 @@ def selftest():
         check("append_line returns True on first append (new file)", ok is True)
         check("file created with exactly the one line",
               open(p, encoding="utf-8").read() == "- [Foo](foo.md) - a thing\n")
+
+        # symlinked MEMORY.md stays a symlink, and the target keeps its mode
+        real_dir = os.path.join(d, "real")
+        os.makedirs(real_dir)
+        real_md = os.path.join(real_dir, "MEMORY.md")
+        with open(real_md, "w", encoding="utf-8") as fh:
+            fh.write("- [Seed](seed.md) - seed\n")
+        os.chmod(real_md, 0o644)
+        link = os.path.join(d, "link-MEMORY.md")
+        os.symlink(real_md, link)
+        append_line(link, "- [Bar](bar.md) - via link")
+        check("a symlinked MEMORY.md is still a symlink after append", os.path.islink(link))
+        check("the symlink target received the line",
+              "via link" in open(real_md, encoding="utf-8").read())
+        check("the target keeps mode 0644", (os.stat(real_md).st_mode & 0o777) == 0o644)
 
         # (2) idempotent no-op on an identical line
         ok2 = append_line(p, "- [Foo](foo.md) - a thing")

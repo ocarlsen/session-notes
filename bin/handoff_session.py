@@ -266,6 +266,8 @@ def selftest():
     # 5. Mode selection is by flag PRESENCE, not payload truthiness.
     rc = main(["--name", "x", "--prompt", "go.", "--spec", "s", "--dry-run"])
     check("--prompt + --spec is refused with rc 2", rc == 2, "got rc=%r" % rc)
+    rc = main(["--name", "x", "--dry-run"])
+    check("neither --prompt nor --spec is refused with rc 2", rc == 2, "got rc=%r" % rc)
     rc = main(["--name", "x", "--prompt", "", "--dry-run"])
     check("empty --prompt is refused with rc 2 (not degraded to STAGED)", rc == 2,
           "got rc=%r" % rc)
@@ -361,6 +363,13 @@ def main(argv=None):
               "parking the same text on the bus would re-deliver it up to twice more, fenced as "
               "untrusted text carrying no authority.\n  For a long spec: write it to a file and "
               "have --prompt say to read that file.", file=sys.stderr)
+        return 2
+
+    # Neither mode: nothing to run and nothing to park, so the spawn would be a bare idle
+    # session that prints a "STAGED" note about a spec that does not exist.
+    if not auto_mode and not staged_mode:
+        print("handoff_session: give --prompt/--prompt-file (auto-start) or --spec/--spec-file "
+              "(staged); with neither there is nothing to hand off.", file=sys.stderr)
         return 2
 
     # An empty payload in either mode is an authoring accident (truncated file, empty $VAR),
