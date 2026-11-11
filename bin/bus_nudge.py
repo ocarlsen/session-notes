@@ -31,6 +31,8 @@ GUARDS
     `bcast.input_box_empty`.
   * At most CAP nudges per session per rolling hour, so two sessions trading
     acknowledgments cannot run all night. Hitting the cap is announced once.
+  * A session with a RECORDED DELIVERY FAILURE is skipped (announced once): its hook
+    is broken, so a nudge would burn a billed turn and still deliver nothing.
   * NUDGE asks for no thank-you or ack replies, which stops most ping-pong
     before the cap is needed.
 """
@@ -67,8 +69,9 @@ def under_cap(stamps, now, cap=CAP, window=WINDOW):
     return len(stamps) < cap
 
 
-def tick(history, capped, dry_run=False, now=None, cap=CAP):
+def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None):
     now = now or time.time()
+    errored = errored if errored is not None else set()
     panes = session_peers.list_peers() or []
     by_session = {}
     for p in panes:
@@ -78,7 +81,17 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP):
     for name, created in session_bus.live_sessions().items():
         if not has_fresh_mail(session_bus.undelivered(name, created=created)):
             capped.discard(name)
+            errored.discard(name)
             continue
+        if session_bus.delivery_errors(name):
+            if name not in errored:
+                errored.add(name)
+                print("%s  SKIPPING %s: a delivery failure is recorded for it (see the "
+                      "session bus errors dir); a nudge would not be delivered. Fix the "
+                      "hook, then clear that file." % (time.strftime("%H:%M"), name),
+                      flush=True)
+            continue
+        errored.discard(name)
         stamps = history.setdefault(name, [])
         if not under_cap(stamps, now, cap):
             if name not in capped:
@@ -137,6 +150,45 @@ def selftest():
     check("nudge carries no bcast prefix to forge", not NUDGE.startswith(bcast.prefix()))
     check("nudge names no person, only the loop", NUDGE.startswith("[bus-nudge]"))
 
+    # A session whose hook is failing must not be nudged (each nudge is a billed turn),
+    # and the skip is announced once, not every tick.
+    import contextlib
+    import io
+    sent = []
+    saved = (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+             session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
+             session_peers.peek)
+    pane = {"is_claude": True, "is_self": False, "tmux_session": "alpha", "state": "idle",
+            "name": "alpha:0", "pane_id": "%1"}
+    session_peers.list_peers = lambda: [pane]
+    session_bus.live_sessions = lambda: {"alpha": 1}
+    session_bus.undelivered = lambda n, created=None: [{"_offers": 0}]
+    session_bus.delivery_errors = lambda n, panes=None: ["/x/errors/1"]
+    bcast.send = lambda pid, text: sent.append(pid)
+    bcast.log = lambda *a, **k: None
+    bcast.input_box_empty = lambda lines: True
+    session_peers.peek = lambda p: []
+    try:
+        hist, cap_set, err_set = {}, set(), set()
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(3):
+                tick(hist, cap_set)
+        check("a session with delivery errors is never nudged", sent == [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for _ in range(3):
+                tick(hist, cap_set, errored=err_set)
+        check("the skip is announced exactly once",
+              out.getvalue().count("SKIPPING alpha") == 1)
+        session_bus.delivery_errors = lambda n, panes=None: []
+        with contextlib.redirect_stdout(io.StringIO()):
+            tick(hist, cap_set, errored=err_set)
+        check("a healthy session is nudged again", sent == ["%1"])
+    finally:
+        (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+         session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
+         session_peers.peek) = saved
+
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
@@ -152,12 +204,12 @@ def main():
     if args.selftest:
         return selftest()
 
-    history, capped = {}, set()
+    history, capped, errored = {}, set(), set()
     print("bus_nudge: every %ds, cap %d/session/hour%s. Ctrl-C to stop."
           % (args.interval, args.cap, " (dry run)" if args.dry_run else ""), flush=True)
     try:
         while True:
-            tick(history, capped, dry_run=args.dry_run, cap=args.cap)
+            tick(history, capped, dry_run=args.dry_run, cap=args.cap, errored=errored)
             if args.once:
                 return 0
             time.sleep(args.interval)

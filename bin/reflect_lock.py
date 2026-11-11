@@ -59,6 +59,7 @@ out. Three deliberate properties:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -203,6 +204,53 @@ def break_reason(holder, age):
     return None
 
 
+BREAK_MUTEX_STALE_SECS = 60  # a break takes microseconds; an older mutex is a crashed breaker's
+
+
+def _break_stale(holder):
+    """Break the lock we just judged stale. Return True if the lock is now free to create.
+
+    The live lock file is NEVER moved or renamed: any window in which LOCK does not exist
+    lets a third acquirer O_EXCL-create it while a breaker still holds (and may then discard)
+    a live record. Breakers are instead serialized by an flock on a PERMANENT file,
+    LOCK + ".breaking" (never unlinked, so there is no stale-mutex cleanup to race on, and a
+    crashed breaker's lock dies with its process). While holding it, the breaker re-reads LOCK
+    and unlinks it only if the record is still the stale one it judged; if the record changed
+    (someone already broke it and took the lock), it backs off and the caller reports
+    contention. Creating the lock stays a plain O_EXCL.
+    """
+    lock = lock_path()
+    fd = os.open(lock + ".breaking", os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False  # another breaker is working: contention
+    try:
+        cur, cur_age = read_lock()
+        if cur is None:
+            return True  # already gone: just create
+        if cur != holder:
+            return False  # replaced since we judged it: not ours to break
+        why = break_reason(cur, cur_age)
+        if why is None:
+            return False
+        print(
+            f"WARNING: BREAKING STALE LOCK: held by {cur.get('session')}: {why}.",
+            file=sys.stderr,
+        )
+        try:
+            os.unlink(lock)
+        except FileNotFoundError:
+            pass
+        return True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def try_acquire(ident, label, pid, pid_source):
     """Return 'acquired' | 'mine' | holder-string."""
     holder, age = read_lock()
@@ -211,14 +259,11 @@ def try_acquire(ident, label, pid, pid_source):
             return "mine"
         why = break_reason(holder, age)
         if why:
-            print(
-                f"WARNING: BREAKING STALE LOCK: held by {holder.get('session')}: {why}.",
-                file=sys.stderr,
-            )
-            try:
-                os.unlink(lock_path())
-            except FileNotFoundError:
-                pass
+            if not _break_stale(holder):
+                # Lost the break race (or it was fresh after all): re-read.
+                holder, age = read_lock()
+                if holder is not None:
+                    return f"{holder.get('session')} ({int(age or 0)}s)"
         else:
             return f"{holder.get('session')} ({int(age or 0)}s)"
     lock = lock_path()
@@ -311,6 +356,157 @@ def _selftest():
             check("fresh + dead claude pid: breaks early", bool(break_reason(*read_lock())), True)
             put({**base, "pid": os.getpid(), "pid_source": "claude"})
             check("fresh + live claude pid: must NOT break", break_reason(*read_lock()), None)
+
+            # Two acquirers judge the SAME stale lock; the first finishes (breaks it and
+            # holds a fresh one) before the second acts on its judgment. Exactly one may
+            # win. Old unlink-based break: the second unlinks the fresh lock, both win.
+            import threading
+            put({"id": "sid-ghost", "session": "ghost", "pid": dead_pid,
+                 "pid_source": "shell"}, age_s=STALE_SECS + 60)
+            real_br = break_reason
+            barrier = threading.Barrier(2)
+            first_done = threading.Event()
+            seen = threading.local()
+            results = {}
+
+            def gated_break_reason(h, a):
+                r = real_br(h, a)
+                if r and not getattr(seen, "gated", False):
+                    seen.gated = True
+                    barrier.wait(5)
+                    if threading.current_thread().name == "B":
+                        first_done.wait(5)
+                return r
+
+            def racer(name):
+                results[name] = try_acquire("sid-" + name, name, live, "claude")
+                if name == "A":
+                    first_done.set()
+
+            globals()["break_reason"] = gated_break_reason
+            try:
+                ts = [threading.Thread(target=racer, args=(n,), name=n) for n in "AB"]
+                for th in ts:
+                    th.start()
+                for th in ts:
+                    th.join(15)
+            finally:
+                globals()["break_reason"] = real_br
+            check("stale-break race: exactly one acquires",
+                  sorted(1 if v == "acquired" else 0 for v in results.values()), [0, 1])
+            check("no side-file leftovers (the permanent .breaking mutex is allowed)",
+                  [n for n in os.listdir(d) if n not in (".reflect.lock", ".reflect.lock.breaking")], [])
+            os.unlink(LOCK)
+
+            # Three parties: A and B both judge the stale lock; A breaks and takes it; then
+            # B's break runs and, in its first filesystem step, C polls. Whatever B does with
+            # the lock in that window, exactly one party may hold it and the lock must name
+            # that party. (A rename-aside break fails this: LOCK is absent mid-break, C
+            # creates it, and A's live record is lost.)
+            put({"id": "sid-ghost", "session": "ghost", "pid": dead_pid,
+                 "pid_source": "shell"}, age_s=STALE_SECS + 60)
+            barrier3 = threading.Barrier(2)
+            a_done = threading.Event()
+            gate_open = threading.Event()
+            seen3 = threading.local()
+            res3 = {}
+
+            def gated3(h, a):
+                r = real_br(h, a)
+                if r and not getattr(seen3, "gated", False):
+                    seen3.gated = True
+                    barrier3.wait(5)
+                    if threading.current_thread().name == "B":
+                        a_done.wait(5)
+                        gate_open.set()
+                return r
+
+            real_open3, real_rename3 = os.open, os.rename
+            fired = []
+
+            def after_b_first_step(fn):
+                def wrapped(*args, **kw):
+                    out = fn(*args, **kw)
+                    if (threading.current_thread().name == "B" and gate_open.is_set()
+                            and not fired):
+                        fired.append(1)
+                        res3["C"] = try_acquire("sid-C", "C", live, "claude")
+                    return out
+                return wrapped
+
+            def racer3(name):
+                res3[name] = try_acquire("sid-" + name, name, live, "claude")
+                if name == "A":
+                    a_done.set()
+
+            globals()["break_reason"] = gated3
+            os.open, os.rename = after_b_first_step(real_open3), after_b_first_step(real_rename3)
+            try:
+                ts3 = [threading.Thread(target=racer3, args=(n,), name=n) for n in "AB"]
+                for th in ts3:
+                    th.start()
+                for th in ts3:
+                    th.join(15)
+            finally:
+                globals()["break_reason"] = real_br
+                os.open, os.rename = real_open3, real_rename3
+            winners = sorted(k for k, v in res3.items() if v == "acquired")
+            holder3, _ = read_lock()
+            check("three-party break: exactly one holder",
+                  (len(winners) == 1 and "C" in res3), True)
+            check("three-party break: the lock names the one holder",
+                  len(winners) == 1 and holder3 is not None and holder3.get("session") == winners[0], True)
+            os.unlink(LOCK)
+
+            # Mutex race: X holds the break mutex (stopped inside its critical section) while
+            # Y, which judged the same stale lock, attempts its own break. Y must not get in:
+            # exactly one party acquires and the lock names it.
+            put({"id": "sid-ghost", "session": "ghost", "pid": dead_pid,
+                 "pid_source": "shell"}, age_s=STALE_SECS + 60)
+            barrier4 = threading.Barrier(2)
+            x_holds, y_done = threading.Event(), threading.Event()
+            seen4, x_reads, res4 = threading.local(), [], {}
+            real_read4 = read_lock
+
+            def gated4(h, a):
+                r = real_br(h, a)
+                if r and not getattr(seen4, "gated", False):
+                    seen4.gated = True
+                    barrier4.wait(5)
+                    if threading.current_thread().name == "Y":
+                        x_holds.wait(3)
+                return r
+
+            def read4():
+                out = real_read4()
+                if threading.current_thread().name == "X":
+                    x_reads.append(1)
+                    if len(x_reads) == 2:  # the re-read made while holding the mutex
+                        x_holds.set()
+                        y_done.wait(3)
+                return out
+
+            def racer4(name):
+                res4[name] = try_acquire("sid-" + name, name, live, "claude")
+                if name == "Y":
+                    y_done.set()
+
+            globals()["break_reason"], globals()["read_lock"] = gated4, read4
+            try:
+                ts4 = [threading.Thread(target=racer4, args=(n,), name=n) for n in "XY"]
+                for th in ts4:
+                    th.start()
+                for th in ts4:
+                    th.join(15)
+            finally:
+                globals()["break_reason"], globals()["read_lock"] = real_br, real_read4
+            win4 = sorted(k for k, v in res4.items() if v == "acquired")
+            holder4, _ = real_read4()
+            check("mutex race: exactly one acquires",
+                  len(win4) == 1 and len(res4) == 2, True)
+            check("mutex race: the lock names the one holder",
+                  len(win4) == 1 and holder4 is not None and holder4.get("session") == win4[0], True)
+            os.unlink(LOCK)
     finally:
         LOCK = real
 

@@ -61,11 +61,16 @@ SKIP_PREFIXES = ("You are ", "Caveat:", "This session is being continued",
                  "<!--", "/private/tmp/")
 
 
+def is_regex(pattern, raw=False):
+    """True when the caller gave a regex (--raw, or metacharacters in the pattern)."""
+    return bool(raw or re.search(r"[\\\[\](){}|^$*+?]", pattern))
+
+
 def anchor(pattern, raw=False):
     """Bare alphanumeric words get \\b anchors so 'meter' cannot match
     'parameter'. A pattern carrying regex metacharacters is passed through
     untouched: the caller asked for a regex, so give them one."""
-    if raw or re.search(r"[\\\[\](){}|^$*+?]", pattern):
+    if is_regex(pattern, raw):
         return pattern
     return r"\b" + r"\b.{0,80}\b".join(re.escape(w) for w in pattern.split()) + r"\b"
 
@@ -215,6 +220,8 @@ def main(argv=None):
     ap.add_argument("--window", type=int, default=110,
                     help="context characters either side of the match")
     args = ap.parse_args(argv)
+    if args.since is not None and not args.all:
+        ap.error("--since only applies with --all")
     transcripts, registry = paths()
 
     try:
@@ -223,7 +230,9 @@ def main(argv=None):
         print("bad pattern: %s" % exc, file=sys.stderr)
         return 2
     roles = {"any": ("user", "assistant")}.get(args.role, (args.role,))
-    prefilter = literal_prefilter(args.pattern)
+    # A literal-word prefilter is only sound for bare words: for a regex like
+    # "alpha|beta" the longest literal is not required to appear in a match.
+    prefilter = None if is_regex(args.pattern, args.raw) else literal_prefilter(args.pattern)
 
     mapping, unmapped = live_sessions(registry)
     if args.all:
@@ -334,6 +343,22 @@ def selftest():
         check("live pane attributed", mapping == {"sid-alpha": ("alpha", "/tmp/alpha")})
         check("restarted pane is unmapped", unmapped == 1)
         check("no tmux = nothing live", live_sessions(registry, [])[0] == {})
+
+        with open(os.path.join(proj, "sid-gamma.jsonl"), "w") as fh:
+            fh.write(entry("user", "only the word beta appears here") + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_re = main(["--all", "--raw", "alpha|beta"])
+        check("regex alternation is not cut by the literal prefilter",
+              rc_re == 0 and "sid-gamma" in buf.getvalue())
+        errbuf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(errbuf):
+                main(["--since", "5", "dimensions"])
+            since_rc = "ran"
+        except SystemExit as exc:
+            since_rc = exc.code
+        check("--since without --all is a usage error", since_rc == 2)
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

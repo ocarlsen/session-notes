@@ -219,7 +219,7 @@ def _read_index_targets(index_md):
     targets = []
     if not index_md.exists():
         return targets
-    for n, line in enumerate(index_md.read_text(encoding="utf-8").splitlines(), 1):
+    for n, line in enumerate(index_md.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         m = INDEX_LINK_RE.search(line)
         if m:
             targets.append((n, m.group(1)))
@@ -342,7 +342,12 @@ def run_checks(store_path, threshold=DEFAULT_GLOBAL_INDEX_THRESHOLD):
     # 4 & 5. Frontmatter: slugs + drift.
     slug_map = {}  # normalized slug -> [files]
     for fname in disk_files:
-        text = (store_path / fname).read_text(encoding="utf-8")
+        try:
+            text = (store_path / fname).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # One undecodable file must not abort the whole run.
+            findings["frontmatter_drift"].append("%s: not valid UTF-8, cannot be parsed" % fname)
+            continue
         fm = parse_frontmatter(text)
         if fm is None:
             findings["frontmatter_drift"].append(
@@ -373,7 +378,7 @@ def run_checks(store_path, threshold=DEFAULT_GLOBAL_INDEX_THRESHOLD):
     #    due, so it must not cry wolf (see docstring on why not 40k). Each store gets
     #    its own threshold; a scope store with a smaller budget must not silently
     #    inherit the global store's larger one.
-    index_size = len(memory_md.read_text(encoding="utf-8")) if memory_md.exists() else 0
+    index_size = len(memory_md.read_text(encoding="utf-8", errors="replace")) if memory_md.exists() else 0
     if index_size > threshold:
         msg = (
             "MEMORY.md is {:,} chars, over the {:,} threshold ({} index lines) -- "
@@ -467,6 +472,32 @@ def _scope_roots_for_store(cfg, store_dir):
     return roots
 
 
+def _decode_slug_dir(slug):
+    """The existing directory whose projects/ folder name (notes_config.encode_project_dir)
+    is `slug`, or None. The encoding is lossy ('/' and '.' both become '-'), so walk the
+    filesystem instead of inverting it: descend only into a directory whose own encoding
+    is a prefix of the slug."""
+    def walk(dirpath, depth=0):
+        if depth > 40:
+            return None
+        try:
+            entries = list(os.scandir(dirpath))
+        except OSError:
+            return None
+        for e in entries:
+            enc = notes_config.encode_project_dir(e.path)
+            if not e.is_dir():
+                continue
+            if enc == slug:
+                return e.path
+            if slug.startswith(enc + "-"):
+                found = walk(e.path, depth + 1)
+                if found:
+                    return found
+        return None
+    return walk(os.sep)
+
+
 def orphan_store_findings(cfg, reached=None):
     """One finding per non-empty store whose MEMORY.md no entry point reaches, so the
     whole store loads nowhere. When a store has a MEMORY.md, ONLY that file is checked:
@@ -479,7 +510,10 @@ def orphan_store_findings(cfg, reached=None):
     MEMORY.md sits at that scope's native auto memory path (<claude_home>/projects/
     <slug>/memory/MEMORY.md): that file loads on its own, natively, every time a
     session starts in that scope. A custom store path native auto memory does not
-    know about gets no such pass. [] when clean."""
+    know about gets no such pass. The same holds for an UNCONFIGURED store at
+    <claude_home>/projects/<slug>/memory whose slug names a real project folder: with
+    auto memory on (the default), Claude Code itself wrote it and loads it there, so it
+    is not an orphan even though no config entry names the project. [] when clean."""
     reached = reached_files(cfg) if reached is None else reached
     known = {os.path.realpath(str(s)) for _, s, _ in configured_stores(cfg)}
     findings = []
@@ -491,10 +525,20 @@ def orphan_store_findings(cfg, reached=None):
         if memory_md.is_file():
             import boot_budget
             memory_rp = os.path.realpath(str(memory_md))
+            roots = _scope_roots_for_store(cfg, store_dir)
             if any(memory_rp == os.path.realpath(boot_budget.native_memory_path(root))
                    and boot_budget.is_auto_memory_enabled(root)
-                   for root in _scope_roots_for_store(cfg, store_dir)):
+                   for root in roots):
                 continue  # natively loaded; not an orphan
+            projects_rp = os.path.realpath(str(Path(cfg["paths"]["claude_home"]) / "projects"))
+            if (not roots
+                    and os.path.dirname(os.path.dirname(os.path.realpath(str(store_dir)))) == projects_rp
+                    and os.path.basename(str(store_dir)) == "memory"):
+                proj_root = _decode_slug_dir(os.path.basename(os.path.dirname(str(store_dir))))
+                # Judged against the project's OWN settings: one that turned auto memory
+                # off for itself keeps its store flagged.
+                if proj_root and boot_budget.is_auto_memory_enabled(proj_root):
+                    continue  # an unconfigured project's own native auto memory
         if content_files:
             holds = "%d memory files" % len(content_files)
         else:
@@ -880,6 +924,60 @@ def selftest():
         check(len(hit) == 1 and "not in the config" in hit[0],
               "check 10: an unreached, unconfigured store is flagged with the config hint")
 
+        # A non-UTF-8 memory file and a non-UTF-8 index are reported/tolerated, not fatal.
+        bad_store = Path(d) / "bad-utf8-store"
+        _write(bad_store / "MEMORY.md", "# Memory Index\n\n- [B](feedback_b.md) -- hook\n")
+        (bad_store / "feedback_b.md").write_bytes(b"\xff\xfe not utf8")
+        try:
+            bad_findings, _ = run_checks(bad_store)
+            check(any("feedback_b.md" in f and "UTF-8" in f
+                      for f in bad_findings["frontmatter_drift"]),
+                  "a non-UTF-8 memory file is a finding, not a crash")
+        except UnicodeDecodeError:
+            check(False, "a non-UTF-8 memory file is a finding, not a crash")
+        (bad_store / "MEMORY.md").write_bytes(b"# Memory Index\n\xff\n")
+        try:
+            run_checks(bad_store)
+            check(True, "a non-UTF-8 MEMORY.md does not abort the run")
+        except UnicodeDecodeError:
+            check(False, "a non-UTF-8 MEMORY.md does not abort the run")
+
+        # A bad config exits with a one-line message, not a traceback.
+        import subprocess
+        bad_cfg = Path(d) / "bad.toml"
+        bad_cfg.write_text("this is not toml\n")
+        run = subprocess.run([sys.executable, os.path.abspath(__file__)],
+                             env=dict(os.environ, SESSION_NOTES_CONFIG=str(bad_cfg)),
+                             capture_output=True, text=True, timeout=60)
+        check(run.returncode != 0 and "Traceback" not in run.stderr and run.stderr.strip(),
+              "a bad config is a clean nonzero exit with a message, not a traceback")
+
+        # Check 10 (default config): an UNCONFIGURED project's own native auto memory
+        # store (slug names a real folder, auto memory on by default) is not an orphan.
+        import boot_budget as _bb
+        _orig_ovr = _bb.CONFIG_DIR_OVERRIDE
+        _orig_dis = os.environ.pop("CLAUDE_CODE_DISABLE_AUTO_MEMORY", None)
+        _bb.CONFIG_DIR_OVERRIDE = cfg["paths"]["claude_home"]
+        try:
+            native_proj = os.path.join(d, "native-proj")
+            os.makedirs(native_proj, exist_ok=True)
+            native_store = projects / notes_config.encode_project_dir(native_proj) / "memory"
+            _write(native_store / "MEMORY.md", "# Memory Index\n\n- [N](feedback_n.md) -- hook\n")
+            _write(native_store / "feedback_n.md", _mem_file("n"))
+            hit = [f for f in orphan_store_findings(cfg) if str(native_store) in f]
+            check(hit == [], "check 10: default config, an unconfigured project's native "
+                  "auto memory store is NOT flagged as an orphan")
+            # The project's own settings turn auto memory off: its store is flagged again.
+            _write(os.path.join(native_proj, ".claude", "settings.json"),
+                   '{"autoMemoryEnabled": false}')
+            hit_off = [f for f in orphan_store_findings(cfg) if str(native_store) in f]
+            check(len(hit_off) == 1, "check 10: a project that turned auto memory off in its "
+                  "own settings keeps its un-imported store flagged")
+        finally:
+            _bb.CONFIG_DIR_OVERRIDE = _orig_ovr
+            if _orig_dis is not None:
+                os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = _orig_dis
+
         # Check 10: RESUME.md reached but MEMORY.md not, still flagged.
         _write(Path(scope_store) / "RESUME.md", "narrative\n")
         _write(scope_claude, "# alpha\n@%s\n" % (Path(scope_store) / "RESUME.md"))
@@ -958,7 +1056,11 @@ def main():
 
     if args.selftest:
         return selftest()
-    return report_mode(notes_config.load())
+    try:
+        cfg = notes_config.load()
+    except notes_config.ConfigError as exc:
+        sys.exit("memory_hygiene_canary: bad config: %s" % exc)
+    return report_mode(cfg)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # session-notes: the full toolkit
 
-The README covers the default install: two skills and three commands. This page is everything else in the repo, and the reference for the default pieces too. `sh install.sh --all` links all of it.
+The README covers the default install: three skills and three commands. This page is everything else in the repo, and the reference for the default pieces too. `sh install.sh --all` links all of it.
 
 ## The mental model
 
