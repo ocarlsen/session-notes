@@ -112,7 +112,10 @@ def _strip_comment(line):
 def _scalar(text, lineno):
     text = text.strip()
     if text.startswith('"') and text.endswith('"') and len(text) >= 2:
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise ConfigError("line %d: bad string %r" % (lineno, text)) from None
     if text.startswith("'") and text.endswith("'") and len(text) >= 2:
         return text[1:-1]
     if text in ("true", "false"):
@@ -250,11 +253,11 @@ def load(path=None, env=None):
     base = None
     if os.path.exists(path):
         base = os.path.dirname(os.path.abspath(path))
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             try:
                 data = parse_toml(fh.read())
-            except ConfigError as exc:
-                raise ConfigError("%s: %s" % (path, exc))
+            except (ConfigError, UnicodeDecodeError) as exc:
+                raise ConfigError("%s: %s" % (path, exc)) from None
         _merge(cfg, data)
     return _resolve(cfg, base)
 
@@ -340,6 +343,16 @@ store = "/tmp/beta-store"
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)
+    # Malformed TOML is a ConfigError on every interpreter (tomllib or the mini parser).
+    for bad in ('this is not toml\n', 'x = "a"b"\n', 'x = ["a"b", "c"]\n'):
+        try:
+            parse_toml(bad)
+            got = "parsed"
+        except ConfigError:
+            got = "ConfigError"
+        except Exception as exc:
+            got = type(exc).__name__
+        check("bad TOML %r is a ConfigError" % bad, got == "ConfigError")
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
