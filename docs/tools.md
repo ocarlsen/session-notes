@@ -8,7 +8,7 @@ The README covers the default install: three skills and three commands. This pag
                      every session loads (native CLAUDE.md imports)
   ~/.claude/CLAUDE.md ──@──> global store: MEMORY.md (index) + RESUME.md
                                            + one .md file per memory
-  ~/code/app/CLAUDE.md ─@──> app's store:  MEMORY.md + RESUME.md + files
+  ~/code/app/CLAUDE.md ─@──> app's store:  RESUME.md (auto memory loads MEMORY.md) + files
          (loads only in sessions started under ~/code/app)
 
   /reflect   writes durable lessons to the right store (lock-serialized)
