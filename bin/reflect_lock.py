@@ -86,12 +86,17 @@ def lock_path():
 
 
 def _tmux_name():
-    """The current tmux session's name, or None. Label only, never an identity."""
-    if not os.environ.get("TMUX"):
+    """This pane's tmux session name, or None. Pinned to $TMUX_PANE: a bare
+    `tmux display-message` answers for the most recently used client, i.e.
+    whatever pane the user last typed in, so without a pane it would name
+    ANOTHER session (and a plain shell would then share that session's lock
+    identity). No pane, no name."""
+    pane = os.environ.get("TMUX_PANE")
+    if not os.environ.get("TMUX") or not pane:
         return None
     try:
         out = subprocess.run(
-            ["tmux", "display-message", "-p", "#S"],
+            ["tmux", "display-message", "-p", "-t", pane, "#S"],
             capture_output=True, text=True, timeout=5,
         )
         return out.stdout.strip() or None
@@ -325,6 +330,20 @@ def _selftest():
         print(f"  {'ok  ' if ok else 'FAIL'} {name}: got {got!r} want {want!r}")
         if not ok:
             fails.append(name)
+
+    # No pane, no tmux name: never the current client's session (would hand a plain
+    # shell another session's lock identity).
+    saved_env = {k: os.environ.get(k) for k in ("TMUX", "TMUX_PANE")}
+    try:
+        os.environ["TMUX"] = "/tmp/tmux-selftest/default,1,0"
+        os.environ.pop("TMUX_PANE", None)
+        check("tmux name without TMUX_PANE", _tmux_name(), None)
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def put(rec, age_s=0):
         with open(LOCK, "w") as fh:
