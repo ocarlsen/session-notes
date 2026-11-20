@@ -42,11 +42,14 @@ It asks `[y/N]` before each step:
 3. Append two tables to `~/.codex/config.toml` (keeping a `.bak-session-notes`
    copy). `shell_environment_policy.set` gives the skills `SESSION_NOTES` and
    `SESSION_NOTES_AGENT`. `sandbox_workspace_write.writable_roots` lets
-   `$reflect` write `~/.codex/session-notes` from the default sandbox. If
-   either table already exists, the text is printed instead.
+   `$reflect` write `~/.codex/session-notes` from the CLI's default sandbox.
+   If either table already exists, the text is printed instead.
 4. Add [`AGENTS.snippet.md`](../AGENTS.snippet.md) to `~/.codex/AGENTS.md`. It tells
    Codex that only `$reflect` writes the store. Without it, a "remember this"
    turn makes Codex write memory files by hand before any skill loads.
+5. Add two lines to `~/.codex/rules/default.rules` that approve exactly one
+   command, `python3 <repo>/bin/codex_save.py commit`, so the desktop app saves
+   memory without asking (see Saving memory below).
 
 Then trust the hook: `/hooks` in the CLI, or Settings > Hooks in the app. Codex
 trusts a hook by its hash, so an edited hook needs trusting again.
@@ -67,8 +70,31 @@ trusts a hook by its hash, so an edited hook needs trusting again.
   `$rnr` runs the refresh and reflect procedures inline.
 - **Reflect lock.** The same lock, keyed on `CODEX_THREAD_ID`. A Codex launched
   from a Claude pane inherits `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`, and
-  codex mode ignores both. The skills wait on the lock in 60-second
-  foreground slices, because Codex has no background shell call.
+  codex mode ignores both. `codex_save.py commit` takes it, waits up to 15
+  minutes for another holder, and releases it.
+
+## Saving memory
+
+The desktop app gives each chat its own sandbox: writable in the project
+folder, a scratch folder and `/tmp`, and nothing else. It ignores
+`writable_roots` in `config.toml`, so any write to `~/.codex/session-notes` is
+an approval prompt. A saved approval rule matches only an exact command line,
+because the app runs every command as `/bin/zsh -lc "<command>"`.
+
+So the skills save in two steps with `bin/codex_save.py`:
+
+1. `stage` queues each change (a memory file, an index line, or a new
+   RESUME.md) in `/tmp/session-notes-<uid>/<thread>/`. It writes only `/tmp`,
+   so it runs in the sandbox without asking.
+2. `commit` is always the same text, so the rule from step 5 of the install
+   approves it. It takes the lock, applies the queue through the same helpers
+   as before (`append_memory_index.py` for index lines), and releases the lock.
+
+A RESUME change carries the hash of the file the model read
+(`codex_save.py hash`). If another session wrote RESUME.md in between, commit
+skips that change and says to re-read and stage again, instead of overwriting.
+A command with anything in front of `commit` (a `cd`, an env prefix) does not
+match the rule and falls back to an approval prompt.
 
 ## Limits
 
@@ -78,13 +104,9 @@ trusts a hook by its hash, so an edited hook needs trusting again.
   `boot_budget.py` (the Codex hook caps its own output instead),
   `memory_hygiene_canary.py`, and `skill_feedback.py canary` (Codex documents
   its transcript format as unstable).
-- In the desktop app, a save asks for approval: the app does not apply
-  `sandbox_workspace_write.writable_roots`, so taking the lock, writing the
-  memory file and appending the index line each need a yes. "Allow similar
-  commands" on the lock prompts saves an exact-command rule in
-  `~/.codex/rules/default.rules`, so those stop asking. The file and index
-  writes change every time, so they keep asking. The CLI asks for none of
-  these. Tracked in the issue linked from the PR that added Codex support.
+- Without the rule from install step 5, the desktop app asks once per save,
+  for `codex_save.py commit`. "Allow similar commands" on that prompt saves
+  the same rule.
 - The boot load happens once per session, the same as on the Claude side. A
   session that is already open picks up another session's writes with
   `$refresh`.

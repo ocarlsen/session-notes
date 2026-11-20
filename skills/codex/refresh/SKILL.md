@@ -8,7 +8,8 @@ description: "Reload stale context in a long-running Codex session: re-read the 
 ## First: find the checkout (do not trust the working folder)
 
 Run this once and use the path it prints, as a literal absolute path, everywhere this skill or the
-adapter says `$SESSION_NOTES`. Put `SESSION_NOTES_AGENT=codex` in front of every helper call.
+adapter says `$SESSION_NOTES`. Put `SESSION_NOTES_AGENT=codex` in front of every helper call
+except `codex_save.py commit`, which must run with exactly its own text.
 
 ```bash
 python3 -c "import os; p=os.path.realpath(os.path.expanduser(os.environ.get('CODEX_HOME','~/.codex')+'/skills/refresh')); print(p.rsplit('/skills/codex/',1)[0])"
