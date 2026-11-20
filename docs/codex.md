@@ -78,6 +78,13 @@ trusts a hook by its hash, so an edited hook needs trusting again.
   `boot_budget.py` (the Codex hook caps its own output instead),
   `memory_hygiene_canary.py`, and `skill_feedback.py canary` (Codex documents
   its transcript format as unstable).
+- In the desktop app, a save asks for approval: the app does not apply
+  `sandbox_workspace_write.writable_roots`, so taking the lock, writing the
+  memory file and appending the index line each need a yes. "Allow similar
+  commands" on the lock prompts saves an exact-command rule in
+  `~/.codex/rules/default.rules`, so those stop asking. The file and index
+  writes change every time, so they keep asking. The CLI asks for none of
+  these. Tracked in the issue linked from the PR that added Codex support.
 - The boot load happens once per session, the same as on the Claude side. A
   session that is already open picks up another session's writes with
   `$refresh`.
