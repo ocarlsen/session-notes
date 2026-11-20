@@ -69,6 +69,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -77,7 +78,14 @@ import uuid
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 if BIN not in sys.path:
-    sys.path.insert(0, BIN)
+    # Run as a command: this repo's bin/ goes first. Loaded as a library by some
+    # other program (a job importing this file by path to append mail): add it LAST,
+    # so that program's own same-named modules (its own session_peers, say) still
+    # win its later imports. notes_config exists only here, so it resolves either way.
+    if __name__ == "__main__":
+        sys.path.insert(0, BIN)
+    else:
+        sys.path.append(BIN)
 import notes_config  # noqa: E402
 
 SELF = os.path.join(BIN, "session_bus.py")
@@ -94,7 +102,8 @@ def state_dir():
     global _STATE
     if _STATE is None:
         cfg = notes_config.load()
-        _STATE = os.path.join(cfg["paths"]["state_dir"], "session-bus")
+        # shared, not per-agent: a Codex pane pulls the mailbox a Claude loop writes.
+        _STATE = os.path.join(cfg["paths"]["shared_state_dir"], "session-bus")
     return _STATE
 
 
@@ -146,6 +155,11 @@ MAX_BODY = 4000
 # interrupted turn gets the second offer it exists for. If Stop ever fired on an
 # interrupt anyway, the cost would be that one lost re-offer, never a duplicate.
 DELIVERIES = int(os.environ.get("CLAUDE_SESSION_BUS_DELIVERIES", "2"))
+# A hookless harness (Codex) is offered mail by bus_nudge, one offer per
+# nudge, and nothing confirms it was pulled. Retiring at DELIVERIES would make each
+# message pullable for exactly one nudge window, so a missed pull loses it silently.
+# One window more: the next nudge's pull shows it again, labeled [RE-DELIVERY].
+HOOKLESS_DELIVERIES = DELIVERIES + 1
 BROADCAST = "*"
 STATE_MAX_AGE = 7 * 86400   # prune dead sessions' state files after a week
 
@@ -187,6 +201,34 @@ def session_info(env=None):
     if len(parts) > 1 and parts[1].strip().isdigit():
         created = int(parts[1].strip())
     return parts[0].strip(), created
+
+
+# A hookless agent's shell often cannot say which session it is in. Codex's
+# sandbox refuses the tmux socket, and a RESUMED Codex session runs its commands in
+# the app-server daemon, whose environment has no TMUX/TMUX_PANE at all (observed
+# 2026-11-20: fresh `codex` saw TMUX_PANE, `codex resume` saw it empty). So bus_nudge,
+# which reads tmux directly, names the mailbox in the pull command: `inbox --nudged
+# --as <name>:<created>`. The address comes from tmux state, never message content,
+# and is refused unless it matches _ADDRESS_RE, so it can carry no shell syntax.
+# Do not widen this class: whoever names a session already chooses what gets typed
+# into its pane here, and the first character must not be "-" (argparse would read
+# the address as an option and the pull would fail).
+_ADDRESS_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9_-]{0,63}):(\d{1,12})")
+
+
+def as_address(name, created):
+    """'name:created' for the pull command, or None when either part cannot be
+    typed safely (bus_nudge then skips the nudge rather than guess)."""
+    if not isinstance(created, int):
+        return None
+    addr = "%s:%d" % (name, created)
+    return addr if _ADDRESS_RE.fullmatch(addr) else None
+
+
+def parse_address(value):
+    """Inverse of as_address: (name, created) or (None, None)."""
+    m = _ADDRESS_RE.fullmatch(value or "")
+    return (m.group(1), int(m.group(2))) if m else (None, None)
 
 
 def my_id(env=None):
@@ -341,12 +383,14 @@ def append(msg, path=None):
     return msg
 
 
-def undelivered(name, path=None, seen_dir=None, created=None):
+def undelivered(name, path=None, seen_dir=None, created=None, deliveries=None):
     """Live messages addressed to this session that the hook has not handed over.
 
     `created` is the recipient's #{session_created}. A message pinned to a
     different `to_created` was addressed to an earlier session that happened to
     share this name (only possible across a tmux server restart) and is skipped.
+    `deliveries` overrides the retirement threshold (default DELIVERIES, the hook's);
+    the hookless pull path passes HOOKLESS_DELIVERIES.
     """
     ledger = _ledger(state_key(name, created), seen_dir)
     out = []
@@ -359,7 +403,7 @@ def undelivered(name, path=None, seen_dir=None, created=None):
         if not isinstance(mid, str) or not mid:
             continue
         offers = ledger.get(mid, 0)
-        if offers >= DELIVERIES:
+        if offers >= (deliveries or DELIVERIES):
             continue
         # Carry the offer count so the renderer can flag a re-delivery; a
         # recipient that already acted on this message must be able to tell.
@@ -405,7 +449,7 @@ def _ledger(key, seen_dir=None):
     return out
 
 
-def record_offer(key, ids, seen_dir=None, path=None):
+def record_offer(key, ids, seen_dir=None, path=None, cap=None):
     """Record that these ids were handed over ONCE.
 
     A message is done only after DELIVERIES offers, so an offer lost to an
@@ -416,6 +460,9 @@ def record_offer(key, ids, seen_dir=None, path=None):
     Locked like append(): two claude processes sharing one tmux SESSION (two
     panes in the same session) share one mailbox, and an unlocked
     read-modify-write there would drop an increment.
+
+    `cap` overrides the ceiling (default DELIVERIES); bus_nudge passes
+    HOOKLESS_DELIVERIES when it records the offer for a hookless pane.
     """
     seen_dir = seen_dir or seen_path()
     os.makedirs(seen_dir, exist_ok=True)
@@ -426,7 +473,7 @@ def record_offer(key, ids, seen_dir=None, path=None):
         led = _ledger(key, seen_dir)
         live_ids = {m.get("id") for m in _live(_read(path))}
         for i in ids:
-            led[i] = min(led.get(i, 0) + 1, DELIVERIES)
+            led[i] = min(led.get(i, 0) + 1, cap or DELIVERIES)
         # Bounded: an id leaves the ledger exactly when its message expires.
         led = {i: c for i, c in led.items() if i in live_ids or i in ids}
         fd, tmp = tempfile.mkstemp(dir=seen_dir, prefix=".seen_", suffix=".tmp")
@@ -580,9 +627,17 @@ def nudge_session_name(cfg=None):
     return cfg.get("bus", {}).get("nudge_session") or DEFAULT_NUDGE_SESSION
 
 
+# The directory this file was LAUNCHED from (abspath, not realpath). With install.sh's
+# links that is the linked bin/, so the restart line starts bus_nudge by the linked
+# path, and its pull nudge then names the linked session_bus.py an agent's allow
+# rule matches. Without links it is the repo's bin/, same as BIN.
+LAUNCH_BIN = os.path.dirname(os.path.abspath(__file__))
+
+
 def nudge_restart_line(cfg=None):
     return "tmux new-session -d -s %s 'python3 %s'" % (
-        nudge_session_name(cfg), os.path.join(BIN, "bus_nudge.py"))
+        nudge_session_name(cfg),
+        os.path.join(LAUNCH_BIN, "bus_nudge.py").replace(os.path.expanduser("~"), "~", 1))
 
 
 def nudge_down_note(cfg=None):
@@ -602,20 +657,52 @@ def nudge_loop_running():
 
 
 def cmd_inbox(args):
-    me, created = session_info()
+    if getattr(args, "as_addr", None):
+        me, created = parse_address(args.as_addr)
+        if not me:
+            print("session_bus: --as wants <session>:<created>, e.g. 1824:1795190000",
+                  file=sys.stderr)
+            return 2
+    else:
+        me, created = session_info()
     if not me:
         print("session_bus: not inside tmux; no address, no inbox.", file=sys.stderr)
         return 2
-    pending = undelivered(me, created=created)
+    if getattr(args, "nudged", False):
+        pending = nudged_view(undelivered(me, created=created, deliveries=HOOKLESS_DELIVERIES))
+    else:
+        pending = undelivered(me, created=created)
     if not pending:
         print(f"session {me}: no undelivered messages")
         return 0
-    # Deliberately NON-destructive: the hook owns marking messages delivered, so
-    # a manual peek can never make one vanish before it is injected.
-    for m in pending:
-        age = int((time.time() - m["ts"]) / 60)
-        print(f"[{m['id']}] from {_flat(m['from'])} ({age}m ago): {m['body']}")
+    # Deliberately NON-destructive: the hook (or, for a hookless harness, bus_nudge at
+    # nudge time) owns marking messages offered, so a pull can never make one vanish,
+    # and a sandboxed puller could not write the ledger anyway. Rendered with the same
+    # fenced, sender-attributed frame the hook injects, [RE-DELIVERY] included.
+    print(render_injection(me, pending))
     return 0
+
+
+def nudged_view(msgs):
+    """`inbox --nudged`, the pull a hookless harness runs on bus_nudge's prompt.
+    bus_nudge counts one offer per nudge, up to HOOKLESS_DELIVERIES: a message is
+    shown in the pull after the nudge that first announced it (0 -> 1, unlabeled)
+    and again after the next nudge (1 -> 2, [RE-DELIVERY]), then retires. The nudge's
+    own offer is not a re-delivery, so _offers is shown one lower. A message that
+    arrived after the nudge (0 offers) waits for its own nudge."""
+    return [dict(m, _offers=m["_offers"] - 1) for m in msgs if m.get("_offers", 0) >= 1]
+
+
+def agent_harnesses():
+    """{session: harness} for sessions running a NON-Claude agent (e.g. Codex), from
+    session_peers' harness table. {} when tmux is unavailable."""
+    try:
+        import session_peers
+        panes = session_peers.list_peers() or []
+    except Exception:
+        return {}
+    return {p["tmux_session"]: p["harness"] for p in panes
+            if p.get("is_agent") and not p.get("is_claude")}
 
 
 def cmd_peers(args):
@@ -625,15 +712,18 @@ def cmd_peers(args):
         print("session_bus: tmux reports no sessions", file=sys.stderr)
         return 1
     panes = panes_by_session()
+    harness = agent_harnesses()
     bad = 0
     for name in sorted(alive, key=lambda s: (len(s), s)):
         mark = "*" if name == me else " "
         errs = delivery_errors(name, panes)
+        h = harness.get(name)
+        note = f"  ({h}: no hook; bus_nudge prompts it to pull `inbox --nudged`)" if h else ""
         if errs:
             bad += 1
             print(f" {mark} {name:<8} !! DELIVERY HOOK ERRORED -> {errs[0]}")
         else:
-            print(f" {mark} {name:<8} ok")
+            print(f" {mark} {name:<8} ok{note}")
     print("\n(* = this session; lists EVERY tmux session, not only Claude ones. Claude-only roster with\n names/cwd: session_peers.py)")
     if bad:
         print(f"{bad} session(s) have a recorded delivery failure; messages to "
@@ -992,9 +1082,76 @@ def selftest():
               nudge_session_name({"paths": {}}) == DEFAULT_NUDGE_SESSION)
         check("nudge session is configurable",
               nudge_session_name({"bus": {"nudge_session": "nb"}}) == "nb")
-        check("restart line names the repo's bus_nudge.py",
-              nudge_restart_line({"bus": {"nudge_session": "nb"}}).endswith(
-                  os.path.join(BIN, "bus_nudge.py") + "'"))
+        line = nudge_restart_line({"bus": {"nudge_session": "nb"}})
+        cmd_path = os.path.expanduser(line.rsplit(" ", 1)[1].rstrip("'"))
+        check("restart line starts bus_nudge.py by this file's launch path",
+              cmd_path == os.path.join(LAUNCH_BIN, "bus_nudge.py"))
+        check("... which resolves to this repo's bus_nudge.py",
+              os.path.realpath(cmd_path) == os.path.join(BIN, "bus_nudge.py"))
+
+        # The bus lives in the tmux-wide state dir: a Codex-mode process (every Codex
+        # shell command has SESSION_NOTES_AGENT=codex) must open the same bus.jsonl.
+        # bus_path() itself, resolved fresh in each mode (BUS unset, _STATE cleared).
+        saved_state, saved_bus = _STATE, BUS
+        saved_agent = os.environ.get("SESSION_NOTES_AGENT")
+        try:
+            BUS = None
+            resolved = {}
+            for kind in ("claude", "codex"):
+                os.environ["SESSION_NOTES_AGENT"] = kind
+                _STATE = None
+                resolved[kind] = bus_path()
+            check("bus_path() is the same in claude and codex mode",
+                  resolved["claude"] == resolved["codex"])
+        finally:
+            _STATE, BUS = saved_state, saved_bus
+            if saved_agent is None:
+                os.environ.pop("SESSION_NOTES_AGENT", None)
+            else:
+                os.environ["SESSION_NOTES_AGENT"] = saved_agent
+
+        # The pull names its mailbox; the address must be tmux-shaped only.
+        check("as_address/parse_address round-trip",
+              parse_address(as_address("busprobe", 1795191350)) == ("busprobe", 1795191350))
+        check("as_address refuses a name that could carry shell syntax",
+              all(as_address(n, 1) is None for n in
+                  ["a b", "x;rm", "`x`", "$(x)", "a\nb", "", "x" * 65, "-x", "_x"]))
+        check("as_address refuses a missing created", as_address("1824", None) is None)
+        check("parse_address refuses junk",
+              all(parse_address(v) == (None, None) for v in
+                  ["1824", "1824:", ":1", "1824:12x", "a b:1", "1824:1;ls"]))
+
+        # inbox --nudged: show the batch the nudge announced, unlabeled the first time.
+        batch = [{"id": "a", "_offers": 0}, {"id": "b", "_offers": 1}]
+        nv = nudged_view(batch)
+        check("nudged_view: only nudged (>=1 offer) messages, first pull not a re-delivery",
+              [m["id"] for m in nv] == ["b"] and nv[0]["_offers"] == 0)
+        # Ledger simulation of the hookless lifecycle: a missed pull must be retried.
+        hb, hs = os.path.join(tmp, "hbus.jsonl"), os.path.join(tmp, "hseen")
+        hk = state_key("cx", None)
+        hnow = time.time()
+        append({"id": "m1", "ts": hnow, "from": "173", "to": "cx", "body": "one"}, path=hb)
+
+        def nudge_and_pull():
+            ids = [m["id"] for m in undelivered("cx", path=hb, seen_dir=hs,
+                                                 deliveries=HOOKLESS_DELIVERIES)]
+            record_offer(hk, ids, seen_dir=hs, path=hb, cap=HOOKLESS_DELIVERIES)
+            return {m["id"]: m["_offers"] for m in nudged_view(
+                undelivered("cx", path=hb, seen_dir=hs, deliveries=HOOKLESS_DELIVERIES))}
+        v1 = nudge_and_pull()                      # m1 announced; pull missed
+        append({"id": "m2", "ts": hnow, "from": "173", "to": "cx", "body": "two"}, path=hb)
+        v2 = nudge_and_pull()
+        v3 = nudge_and_pull()
+        check("hookless: first pull shows m1 unlabeled", v1 == {"m1": 0})
+        check("hookless: a missed pull is retried next nudge, labeled re-delivery",
+              v2 == {"m1": 1, "m2": 0})
+        check("hookless: retired after two nudge windows", v3 == {"m2": 1})
+        check("hookless threshold leaves the hook's DELIVERIES untouched",
+              [m["id"] for m in undelivered("cx", path=hb, seen_dir=hs)] == [])
+        out = render_injection("busprobe", [{"id": "d", "ts": hnow, "from": "173",
+                                             "body": "hello", "_offers": 1}])
+        check("inbox renders the fenced, sender-attributed frame incl. [RE-DELIVERY]",
+              "from session 173" in out and "RE-DELIVERY" in out and "|  hello" in out)
     finally:
         BUS = orig_bus
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1019,6 +1176,12 @@ def main():
     s.set_defaults(fn=cmd_send)
 
     s = sub.add_parser("inbox", help="peek undelivered mail (non-destructive)")
+    s.add_argument("--nudged", action="store_true",
+                   help="the pull bus_nudge asks a hookless harness (Codex) to run: show "
+                        "only the batch the nudge announced")
+    s.add_argument("--as", dest="as_addr", metavar="SESSION:CREATED",
+                   help="read this mailbox instead of asking tmux which session this is "
+                        "(bus_nudge supplies it: a hookless agent's shell may not know)")
     s.set_defaults(fn=cmd_inbox)
 
     s = sub.add_parser("peers", help="list addressable sessions")

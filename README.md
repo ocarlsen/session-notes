@@ -125,7 +125,9 @@ The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
 `~/.codex/skills` and adds a SessionStart hook that loads the index and
 RESUME at startup, on resume and after compaction. Codex keeps its own store
 under `~/.codex/session-notes`, separate from Claude's, and the tools refuse a
-Codex path under `~/.claude`. The three commands are Claude Code only for now.
+Codex path under `~/.claude`. The three commands are Claude Code only for now, but
+`bcast` and the bus reach Codex panes too: an idle Codex pane gets bus mail by pulling
+its inbox when `bus_nudge` asks it to.
 Setup and limits are in [docs/codex.md](docs/codex.md).
 
 ## Honest limits

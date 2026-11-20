@@ -51,7 +51,7 @@ def paths(cfg=None):
     """(transcripts_dir, registry_path) from the config."""
     cfg = cfg or notes_config.load()
     return (os.path.join(cfg["paths"]["claude_home"], "projects"),
-            os.path.join(cfg["paths"]["state_dir"], REGISTRY_NAME))
+            os.path.join(cfg["paths"]["shared_state_dir"], REGISTRY_NAME))
 
 # Entries that are plumbing rather than conversation. A match inside one of
 # these is never the thing anyone is looking for.

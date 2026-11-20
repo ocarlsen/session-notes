@@ -20,7 +20,10 @@ codex mode every store and the state dir live under `agent.codex_home`
 (~/.codex/session-notes/...), and a resolved path under claude_home is refused, so
 one agent never reads or writes the other's memory. `paths.global_store`,
 `paths.state_dir` and a scope's `store` describe the Claude side and are ignored in
-codex mode; scope ROOTS are shared, since they name folders, not memory.
+codex mode; scope ROOTS are shared, since they name folders, not memory. One
+exception holds no memory: `paths.shared_state_dir`, the configured state_dir NOT
+moved by codex mode, keeps tmux-wide state every agent must agree on (the bus
+mailbox, bcast's log, pane state, the pane registry).
 
 Python 3.11+ ships tomllib; on older interpreters (macOS still ships 3.9) a
 small parser below handles the subset the example config uses: tables,
@@ -264,6 +267,11 @@ def _resolve(cfg, base=None, env=None):
     p = cfg["paths"]
     for k in ("claude_home", "state_dir"):
         p[k] = _abs(p[k], base)
+    # Tmux-wide state that every agent on the machine must agree on (the bus
+    # mailbox, bcast's log, pane state, the pane registry): the configured
+    # state_dir, NOT moved by codex mode. It holds no memory, so the
+    # no-piggyback rule below does not apply to it.
+    p["shared_state_dir"] = p["state_dir"]
     if kind == "codex":
         notes = os.path.join(a["codex_home"], "session-notes")
         p["state_dir"] = os.path.join(notes, "state")
@@ -384,6 +392,13 @@ def state_path(*parts, cfg=None):
     return os.path.join(cfg["paths"]["state_dir"], *parts)
 
 
+def shared_state_path(*parts, cfg=None):
+    """A path under the tmux-wide state dir, the same for every agent (see
+    paths.shared_state_dir): bus mailbox, bcast log, pane state, pane registry."""
+    cfg = cfg or load()
+    return os.path.join(cfg["paths"]["shared_state_dir"], *parts)
+
+
 def selftest():
     import tempfile
     fails = []
@@ -466,6 +481,13 @@ store = "/tmp/beta-store"
         check("claude mode is the default", cc["agent"]["kind"] == "claude"
               and cc["paths"]["global_store"] == os.path.join(d, "claude/g"))
         cx = load(f, env={"SESSION_NOTES_AGENT": "codex"})
+        check("tmux-wide state is the same dir for both agents (a Codex pane pulls the "
+              "mailbox a Claude loop writes)",
+              cx["paths"]["shared_state_dir"] == cc["paths"]["shared_state_dir"]
+              == cc["paths"]["state_dir"])
+        check("shared_state_path joins under the shared dir",
+              shared_state_path("session-bus", cfg=cx)
+              == os.path.join(cc["paths"]["state_dir"], "session-bus"))
         cxs = [cx["paths"]["state_dir"], cx["paths"]["global_store"], cx["scopes"][0]["store"]]
         check("codex mode: all stores under codex_home",
               all(x.startswith(os.path.join(d, "codex", "session-notes")) for x in cxs))

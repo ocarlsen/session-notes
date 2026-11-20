@@ -21,7 +21,7 @@ The README covers the default install: three skills and three commands. This pag
                                         worker
        session_peers.py --me          parent: lead (live | exited)
 
-  bcast "pause and post status"  ──>  every Claude pane, prefixed and logged
+  bcast "pause and post status"  ──>  every agent pane, prefixed and logged
 ```
 
 - **Stores.** A store is a folder: `MEMORY.md` is a one-line-per-memory index

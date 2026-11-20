@@ -54,6 +54,33 @@ It asks `[y/N]` before each step:
 Then trust the hook: `/hooks` in the CLI, or Settings > Hooks in the app. Codex
 trusts a hook by its hash, so an edited hook needs trusting again.
 
+## Sessions and the bus
+
+Codex has no prompt hook, so bus mail cannot ride its next prompt the way it does in
+Claude Code. Instead `bus_nudge.py` types one fixed line into an idle Codex pane, asking
+it to run `session_bus.py inbox --nudged --as <session>:<created>`. The mail arrives as
+that command's output, fenced and attributed to its sender. The loop reads the address
+from tmux, because a Codex shell often cannot: the sandbox refuses the tmux socket, and a
+resumed session (`codex resume`) runs commands in a daemon with no `TMUX_PANE`.
+
+`bcast` reaches Codex panes too, but only when the input box is empty and idle (never an
+approval prompt, a running turn or typed text). A bare slash command such as `/refresh`
+goes to Claude panes only: Codex rejects one it does not know and leaves it typed in the box.
+
+Sending FROM Codex does not work yet: `session_bus.py send` needs to know which session
+is sending, and the sandbox hides that.
+
+To let the read-only session tools run without an approval prompt each time, add rules
+like these to `~/.codex/rules/default.rules` (replace `<bin>` with the directory holding
+`session_bus.py`, as an absolute path). Nothing that types into a pane is allowed:
+`send-keys` and `session_bus.py send` still ask.
+
+```
+prefix_rule(pattern=["tmux", ["list-sessions","list-panes","display-message"]], decision="allow")
+prefix_rule(pattern=["tmux", "capture-pane", "-p"], decision="allow")
+prefix_rule(pattern=["python3", "<bin>/session_bus.py", ["inbox","peers"]], decision="allow")
+```
+
 ## How the pieces map
 
 - **Boot load.** AGENTS.md has no `@import`, so `hooks/codex_session_start.py`

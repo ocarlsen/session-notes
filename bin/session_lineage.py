@@ -74,7 +74,7 @@ def registry_path(cfg=None):
     """<state_dir>/session_panes.json, resolved at call time."""
     import notes_config
     cfg = cfg or notes_config.load()
-    return os.path.join(cfg["paths"]["state_dir"], REGISTRY_NAME)
+    return os.path.join(cfg["paths"]["shared_state_dir"], REGISTRY_NAME)
 
 
 def read_registry(path=None):
@@ -378,7 +378,8 @@ def selftest():
     import tempfile
     tmp = tempfile.mkdtemp(prefix="lineage_")
     try:
-        cfg = {"paths": {"state_dir": os.path.join(tmp, "st")}}
+        cfg = {"paths": {"state_dir": os.path.join(tmp, "st"),
+                         "shared_state_dir": os.path.join(tmp, "st")}}
         check("registry lives at <state_dir>/session_panes.json",
               registry_path(cfg) == os.path.join(tmp, "st", "session_panes.json"))
         bad = os.path.join(tmp, "bad.json")

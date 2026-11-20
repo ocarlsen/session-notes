@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bcast.py -- type one line into EVERY live tmux Claude session at once.
+"""bcast.py -- type one line into EVERY live tmux agent session (Claude Code, Codex) at once.
 
 For a user who keeps N parallel Claude Code sessions as N tmux sessions. Some
 inputs are addressed to all of them at once ("/refresh", "check the bus"),
@@ -35,7 +35,7 @@ from one the user typed there themselves:
 The sender's own pane is always excluded, otherwise a broadcast feeds itself.
 
 USAGE
-  bcast /refresh                 every other Claude pane runs /refresh
+  bcast /refresh                 every other agent pane runs /refresh
   bcast "check the bus"          prose, prefixed with the attribution marker
   bcast --to 8,12 "g2g"          only those sessions (name, %pane-id, or tmux
                                  session name; same resolution as --peek)
@@ -52,8 +52,16 @@ USAGE
                                  or half-typed line (DANGEROUS: see below)
 
 HONEST LIMITS
-  - tmux-hosted Claude sessions on THIS machine only, same as session_peers.
+  - tmux-hosted agent sessions on THIS machine only, same as session_peers.
     Every other machine needs its own bcast run.
+  - Codex panes are recognised through session_peers' harness table. A Codex
+    pane qualifies only when that table's tests say it is idle with an EMPTY
+    input box (dim placeholder after the › prompt); an approval menu, a
+    running turn, typed text or any screen the table does not recognise is
+    skipped. A pane of any harness the table does not know is never a
+    target. --force bypasses these tests too. A bare slash command
+    (`bcast /refresh`) goes to Claude panes only: Codex rejects an unknown
+    one and leaves it typed in the box.
   - Delivery is a keystroke, not a protocol: nothing here can confirm the
     receiving session ACTED on the line; it confirms the keystrokes were
     sent.
@@ -128,11 +136,39 @@ def prefix(cfg=None):
 
 def log_path(cfg=None):
     cfg = cfg or notes_config.load()
-    return os.path.join(cfg["paths"]["state_dir"], "bcast.jsonl")
+    return os.path.join(cfg["paths"]["shared_state_dir"], "bcast.jsonl")
 
 
-def targets(panes, only=None, idle_only=False, force=False, peek=None):
-    """Claude panes to broadcast to, minus self. Returns (targets, skipped)
+def is_agent(p):
+    """Any pane session_peers recognises as an agent. Falls back to is_claude
+    for an older session_peers with no harness table."""
+    return p.get("is_agent", p["is_claude"])
+
+
+def screen_ready(p, peek, peek_raw):
+    """(ok, reason). Claude: bcast's own empty ❯ box test. Any other harness:
+    session_peers.ready_for_input on the raw -e screen (idle AND empty box),
+    which returns False for a harness it has no tests for."""
+    if p["is_claude"]:
+        screen = peek(p)
+        if screen is None:
+            return False, "peek failed: screen unreadable"
+        if not input_box_empty(screen):
+            return False, "no empty input box: menu, prompt or typed text"
+        return True, ""
+    ready = getattr(session_peers, "ready_for_input", None)
+    if ready is None:
+        return False, "no screen test for this harness"
+    raw = peek_raw(p)
+    if raw is None:
+        return False, "peek failed: screen unreadable"
+    if not ready(p, raw):
+        return False, "%s not ready: working, menu, prompt or typed text" % (p.get("harness") or "agent")
+    return True, ""
+
+
+def targets(panes, only=None, idle_only=False, force=False, peek=None, peek_raw=None):
+    """Agent panes to broadcast to, minus self. Returns (targets, skipped)
     where skipped is a list of (pane, reason) for the report.
 
     Unless `force`, a pane only qualifies if its visible screen -- read with
@@ -142,6 +178,8 @@ def targets(panes, only=None, idle_only=False, force=False, peek=None):
     skipped with a reason instead of getting a keystroke."""
     if peek is None:
         peek = session_peers.peek
+    if peek_raw is None:
+        peek_raw = getattr(session_peers, "peek_raw", lambda p: None)
     out, skipped = [], []
     wanted = None
     if only:
@@ -157,7 +195,7 @@ def targets(panes, only=None, idle_only=False, force=False, peek=None):
             wanted.add(pane["pane_id"])
 
     for p in panes:
-        if not p["is_claude"]:
+        if not is_agent(p):
             continue
         if p["is_self"]:
             skipped.append((p, "self"))
@@ -168,17 +206,27 @@ def targets(panes, only=None, idle_only=False, force=False, peek=None):
             skipped.append((p, "working"))
             continue
         if not force:
-            screen = peek(p)
-            if screen is None:
-                skipped.append((p, "peek failed: screen unreadable"))
-                continue
-            if not input_box_empty(screen):
-                skipped.append((p, "no empty input box: menu, prompt or typed text"))
+            ok, why = screen_ready(p, peek, peek_raw)
+            if not ok:
+                skipped.append((p, why))
                 continue
         out.append(p)
     out.sort(key=session_sort_key)
     skipped.sort(key=lambda t: session_sort_key(t[0]))
     return out, skipped
+
+
+def slash_filter(picked, payload):
+    """A slash command is a Claude Code command: split non-Claude panes off as
+    skipped. Observed on a Codex 0.170.0 pane: Codex answers "Unrecognized
+    command '/refresh'" and LEAVES the text in its input box, so the pane then
+    reads as half-typed and every later nudge or broadcast skips it until
+    someone clears it."""
+    if not payload.startswith("/"):
+        return picked, []
+    keep = [p for p in picked if p["is_claude"]]
+    drop = [(p, "slash command is Claude-only") for p in picked if not p["is_claude"]]
+    return keep, drop
 
 
 def compose(text, no_prefix=False, marker=None):
@@ -272,8 +320,20 @@ def _pad(text, width):
 def describe(p, marker="->"):
     """One row: a marker (target vs skipped), `<session>:`, the raw
     pane_title (busy glyph and all), then the cwd, since that is what tells
-    two identically-named sessions apart before you broadcast into them."""
+    two identically-named sessions apart before you broadcast into them.
+
+    When the pane carries a display label (the tmux session option @display,
+    session_peers' `display` field), the label replaces the session name but the
+    leading busy glyph is kept; if the session's messaging name differs from
+    its tmux session name, " (msg: <name>)" is appended so it stays visible."""
     title = p["pane_title"] or p["name"] or "(unnamed)"
+    display = p.get("display")
+    if display:
+        glyph = title[:1] if title[:1] and (title[:1] == session_peers.IDLE_GLYPH
+                                            or session_peers._is_spinner(title[:1])) else ""
+        title = ("%s %s" % (glyph, display)) if glyph else display
+        if p["name"] != p["tmux_session"]:
+            title += " (msg: %s)" % p["name"]
     return "  %-4s %-*s %s %s" % (
         marker,
         SESSION_WIDTH,
@@ -287,9 +347,11 @@ def selftest():
     sep = session_peers._SEP
 
     def mk(title, pane_id, cmd="2.1.220"):
-        return sep.join(
-            [title.split()[-1], "0", pane_id, title, "/tmp", "111", cmd, "opus"]
-        )
+        fields = [title.split()[-1], "0", pane_id, title, "/tmp", "111", cmd, "opus"]
+        # Pad to session_peers' CURRENT field count, so a field added there
+        # does not break this fixture.
+        fields += [""] * (len(session_peers._FIELDS) - len(fields))
+        return sep.join(fields)
 
     panes = [
         session_peers.parse_pane_line(mk("✳ alpha", "%1")),
@@ -439,6 +501,79 @@ def selftest():
     assert sorted(p["pane_id"] for p in got) == ["%21", "%22", "%23"], got
     assert skipped == [], skipped
 
+    # Codex panes. Raw capture-pane -e rows from a live Codex CLI 0.170.0
+    # scratch pane (the same captures session_peers' selftest uses). Needs a
+    # session_peers with the harness table; skipped (and said so) without one.
+    if hasattr(session_peers, "ready_for_input"):
+        cx_empty = "\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m"
+        cx_typed = "\x1b[1m›\x1b[0m half a thought"
+        cx_working = "• \x1b[1mWorking\x1b[0m \x1b[2m(6s • esc to interrupt)\x1b[0m"
+        footer = "  \x1b[38;2;246;226;183mGPT-6-Luna default\x1b[39m · /tmp"
+        cx_menu = ["  Would you like to run the following command?",
+                   "  $ touch ~/.busprobe_approval_probe",
+                   "\x1b[1m› 1. Yes, proceed (y)\x1b[0m",
+                   "  2. Yes, and don't ask again (p)",
+                   "  3. No, and tell Codex what to do differently (esc)",
+                   "  Press enter to confirm or esc to cancel"]
+        raws = {
+            "%31": ["", cx_empty, "", footer],
+            "%32": ["", cx_typed, "", footer],
+            "%33": [cx_working, "", cx_empty, "", footer],
+            "%34": cx_menu,
+        }
+
+        def mkcx(sess, pane_id):
+            fields = [sess, "0", pane_id, "Show tmux | " + sess, "/tmp", "1", "codex", ""]
+            fields += [""] * (len(session_peers._FIELDS) - len(fields))
+            p = session_peers.parse_pane_line(sep.join(fields))
+            p["is_self"] = False
+            return p
+
+        cx_panes = [mkcx("cxe", "%31"), mkcx("cxt", "%32"), mkcx("cxw", "%33"), mkcx("cxm", "%34")]
+        assert all(p["harness"] == "codex" and not p["is_claude"] for p in cx_panes), cx_panes
+        # Claude panes must never be judged by the Codex test, nor Codex by the Claude one.
+        def no_peek(p):
+            raise AssertionError("Claude peek used on a codex pane")
+        got, skipped = targets(cx_panes, peek=no_peek, peek_raw=lambda p: raws[p["pane_id"]])
+        assert [p["pane_id"] for p in got] == ["%31"], got
+        assert sorted(p["pane_id"] for p, _ in skipped) == ["%32", "%33", "%34"], skipped
+        assert all(r.startswith("codex not ready") for _, r in skipped), skipped
+        got, skipped = targets(cx_panes, peek=no_peek, peek_raw=lambda p: None)
+        assert got == [] and {r for _, r in skipped} == {"peek failed: screen unreadable"}, skipped
+        # --to resolves a Codex pane by tmux session name (was "matched nothing").
+        got, _ = targets(cx_panes + guard_panes, only=["cxe"], peek=fake_peek,
+                         peek_raw=lambda p: raws[p["pane_id"]])
+        assert [p["pane_id"] for p in got] == ["%31"], got
+        # Mixed fleet: each pane judged by its own harness's test.
+        got, _ = targets(cx_panes + guard_panes, peek=fake_peek,
+                         peek_raw=lambda p: raws[p["pane_id"]])
+        assert sorted(p["pane_id"] for p in got) == ["%23", "%31"], got
+        # A plain shell pane is never a target, even with --force.
+        sh = session_peers.parse_pane_line(sep.join(
+            ["sh", "0", "%35", "zsh", "/tmp", "1", "zsh", ""]
+            + [""] * (len(session_peers._FIELDS) - 8)))
+        sh["is_self"] = False
+        got, _ = targets([sh], force=True, peek=fake_peek, peek_raw=lambda p: [])
+        assert got == [], got
+        # A slash command never goes to a Codex pane; prose does.
+        mixed = cx_panes[:1] + guard_panes[2:]
+        keep, drop = slash_filter(mixed, "/refresh")
+        assert [p["pane_id"] for p in keep] == ["%23"], keep
+        assert [(p["pane_id"], r) for p, r in drop] == [("%31", "slash command is Claude-only")], drop
+        keep, drop = slash_filter(mixed, prefix() + " check the bus")
+        assert len(keep) == 2 and drop == [], (keep, drop)
+    else:
+        print("bcast selftest: SKIPPED Codex cases (session_peers has no harness table)")
+
+    # A display label replaces the name in describe(), keeping the busy glyph.
+    lab = session_peers.parse_pane_line(mk("⠁ worker", "%40"))
+    lab["display"] = "range parsing"
+    lab["tmux_session"] = "7"  # messaging name "worker" now differs from it
+    row = describe(lab)
+    assert "⠁ range parsing" in row and "(msg: worker)" in row, row
+    plain = session_peers.parse_pane_line(mk("✳ worker", "%41"))
+    assert "✳ worker" in describe(plain) and "msg:" not in describe(plain), describe(plain)
+
     print("bcast selftest: OK")
 
 
@@ -486,6 +621,8 @@ def main():
     if not args.text:
         ap.error("nothing to send (pass the text, or --list)")
     payload = compose(" ".join(args.text), no_prefix=args.no_prefix)
+    picked, dropped = slash_filter(picked, payload)
+    skipped = skipped + dropped
 
     if not picked:
         print("bcast: no target sessions")
