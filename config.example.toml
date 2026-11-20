@@ -3,6 +3,17 @@
 # shown are the defaults. Relative paths resolve against this file's folder.
 # Unknown keys are an error, so a typo fails loudly instead of being ignored.
 
+[agent]
+# Which agent these tools serve: "claude" or "codex". $SESSION_NOTES_AGENT overrides
+# it per process; install.sh --codex sets that variable for Codex, so one config file
+# serves both agents. The two keep separate memories: in codex mode every store and
+# the state dir live under <codex_home>/session-notes/, the [paths] stores below and a
+# scope's `store` are ignored, and a path under claude_home is refused.
+kind = "claude"
+codex_home = "~/.codex"
+# Most characters the Codex SessionStart hook injects (index + RESUME files).
+codex_boot_bytes = 12000
+
 [paths]
 # Claude Code's own directory (transcripts live under projects/).
 claude_home = "~/.claude"

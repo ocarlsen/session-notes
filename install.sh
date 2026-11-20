@@ -21,6 +21,9 @@
 #   sh install.sh --all --bin-dir ~/.local/bin
 #   sh install.sh --yes              answer yes to every question
 #   sh install.sh --dry-run          show what would happen
+#   sh install.sh --codex            set up OpenAI Codex instead (docs/codex.md): link the
+#                                    Codex skills into ~/.codex/skills, offer the hooks.json
+#                                    and config.toml edits; never touches ~/.claude
 set -eu
 
 REPO=$(cd "$(dirname "$0")" && pwd)
@@ -30,6 +33,7 @@ BIN_DIR=""
 DRY=0
 ALL=0
 YES=0
+CODEX=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,7 +41,8 @@ while [ $# -gt 0 ]; do
     --dry-run|-n) DRY=1; shift ;;
     --all) ALL=1; shift ;;
     --yes|-y) YES=1; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --codex) CODEX=1; shift ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -67,7 +72,8 @@ link() {  # link SRC DEST: create or refresh a symlink, never clobber a real fil
 SKILLS="reflect refresh rnr"
 TOOLS="handoff_session session_peers bcast"
 if [ "$ALL" = 1 ]; then
-  SKILLS=$(for d in "$REPO"/skills/*/; do basename "$d"; done)
+  # skills/codex/ holds the Codex variants (install.sh --codex), not a Claude skill.
+  SKILLS=$(for d in "$REPO"/skills/*/; do n=$(basename "$d"); [ "$n" = codex ] || echo "$n"; done)
   TOOLS="$TOOLS session_bus bus_nudge reflect_lock append_memory_index memory_index_lint \
          boot_budget memory_hygiene_canary notes_config"
 fi
@@ -83,6 +89,82 @@ ask() {  # ask QUESTION: 0 on a yes. --yes answers yes; no answer means no.
   read -r answer || answer=""
   case "$answer" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
 }
+
+if [ "$CODEX" = 1 ]; then
+  # Codex keeps its own memory under <codex home>/session-notes; nothing here touches ~/.claude.
+  CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+  echo "Codex skills to link into $(tilde "$CODEX_DIR/skills"): \$reflect \$refresh \$rnr"
+  if [ "$ASK" = 0 ] || ask "Link these 3 skills?"; then
+    run mkdir -p "$CODEX_DIR/skills"
+    for name in reflect refresh rnr; do
+      link "$REPO/skills/codex/$name" "$CODEX_DIR/skills/$name"
+    done
+  else
+    echo "Skipped the skills."
+  fi
+
+  CODEX_HOOKS=$(cat <<JSON
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SESSION_NOTES_AGENT=codex python3 $REPO/hooks/codex_session_start.py",
+            "statusMessage": "Loading session notes",
+            "timeout": 10,
+            "additionalContextLimit": 4000
+          }
+        ]
+      }
+    ]
+  }
+}
+JSON
+)
+  CODEX_TOML=$(cat <<TOML
+
+# session-notes: the skills find the tools through these, and \$reflect may write its store.
+[shell_environment_policy]
+set = { SESSION_NOTES = "$REPO", SESSION_NOTES_AGENT = "codex" }
+
+[sandbox_workspace_write]
+writable_roots = ["$CODEX_DIR/session-notes"]
+TOML
+)
+  HJ="$CODEX_DIR/hooks.json" CT="$CODEX_DIR/config.toml"
+  echo
+  if [ "$ASK" = 1 ] && [ ! -e "$HJ" ]; then
+    echo "$(tilde "$HJ") does not exist yet. It would contain:"; echo "$CODEX_HOOKS"
+    if ask "Write it?"; then
+      printf '%s\n' "$CODEX_HOOKS" > "$HJ"; echo "wrote $(tilde "$HJ")"
+    else
+      echo "Skipped hooks.json."
+    fi
+  else
+    echo "Merge into $(tilde "$HJ") by hand (an existing file is never edited):"; echo "$CODEX_HOOKS"
+  fi
+  echo
+  if [ "$ASK" = 1 ] && ! grep -q -E '^\[(shell_environment_policy|sandbox_workspace_write)\]' "$CT" 2>/dev/null; then
+    echo "Would append to $(tilde "$CT"):"; echo "$CODEX_TOML"
+    if ask "Append it (keeping a .bak-session-notes copy)?"; then
+      if [ -e "$CT" ]; then cp "$CT" "$CT.bak-session-notes"; fi
+      printf '%s\n' "$CODEX_TOML" >> "$CT"; echo "appended to $(tilde "$CT")"
+    else
+      echo "Skipped config.toml."
+    fi
+  else
+    echo "Add to $(tilde "$CT") by hand, merging into any table of the same name:"; echo "$CODEX_TOML"
+  fi
+  cat <<TXT
+
+Then trust the hook: /hooks in the Codex CLI, or Settings > Hooks in the desktop app.
+Codex trusts a hook by its hash, so re-trust it after any edit. Details: docs/codex.md
+TXT
+  exit 0
+fi
 
 count() { set -- $1; echo $#; }
 

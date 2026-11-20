@@ -118,6 +118,16 @@ toolkit (the `/find-session` skill, memory checks, the message
 bus for scripts, a clock hook and an example guard hook), described in
 [docs/tools.md](docs/tools.md).
 
+## Works with Codex
+
+The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
+`sh install.sh --codex` links `$refresh`, `$reflect` and `$rnr` into
+`~/.codex/skills` and adds a SessionStart hook that loads the index and
+RESUME at startup, on resume and after compaction. Codex keeps its own store
+under `~/.codex/session-notes`, separate from Claude's, and the tools refuse a
+Codex path under `~/.claude`. The three commands are Claude Code only for now.
+Setup and limits are in [docs/codex.md](docs/codex.md).
+
 ## Honest limits
 
 - Tested on macOS, on one machine. The three commands need tmux today; the
