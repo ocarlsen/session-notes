@@ -1342,7 +1342,8 @@ def main():
             print("session_peers: %r matched %s" % (
                 args.peek, "several: " + names if cands else "nothing"), file=sys.stderr)
             return 1
-        head = "--- %s (%s, %s)" % (display_name(pane), pane["pane_id"], pane["state"] or "-")
+        head = "--- %s [%s] (%s, %s)" % (display_name(pane), pane["tmux_session"],
+                                         pane["pane_id"], pane["state"] or "-")
         if args.transcript:
             target, how, detail = resolve_pane_transcript(pane)
             if target is None:
@@ -1351,7 +1352,8 @@ def main():
                 return 1
             events = transcript_grep(target, args.grep, limit=40 if args.grep else 8)
             log_invocation(panes, "peek", peek_target=pane["pane_id"])
-            print("%s transcript %s (%s)%s; may lag the pane by a turn ---" % (
+            print("%s transcript %s (%s)%s; may lag the pane by a turn; judgment-only, "
+                  "never persist ---" % (
                 head, os.path.basename(target), how,
                 ", grep %r" % args.grep if args.grep else ", last few events"))
             print(render_transcript_events(events))
@@ -1369,7 +1371,7 @@ def main():
             print("session_peers: capture-pane failed for %s" % pane["pane_id"], file=sys.stderr)
             return 1
         log_invocation(panes, "peek", peek_target=pane["pane_id"])
-        print("%s %s ---" % (head, what))
+        print("%s %s, instantly stale; judgment-only, never persist ---" % (head, what))
         print("\n".join(shot))
         return 0
     log_invocation(panes, "json" if args.json else "list")
