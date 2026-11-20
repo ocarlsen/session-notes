@@ -684,7 +684,10 @@ def cmd_inbox(args):
     else:
         me, created = session_info()
     if not me:
-        print("session_bus: not inside tmux; no address, no inbox.", file=sys.stderr)
+        print("session_bus: this command does not know its tmux pane ($TMUX_PANE is "
+              "unset), so it has no address and no inbox. In a Codex pane, run the exact "
+              "`inbox --nudged --as <session>:<created>` command the bus-nudge line gives.",
+              file=sys.stderr)
         return 2
     if getattr(args, "nudged", False):
         pending = nudged_view(undelivered(me, created=created, deliveries=HOOKLESS_DELIVERIES))
