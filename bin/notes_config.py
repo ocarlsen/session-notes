@@ -20,7 +20,10 @@ codex mode every store and the state dir live under `agent.codex_home`
 (~/.codex/session-notes/...), and a resolved path under claude_home is refused, so
 one agent never reads or writes the other's memory. `paths.global_store`,
 `paths.state_dir` and a scope's `store` describe the Claude side and are ignored in
-codex mode; scope ROOTS are shared, since they name folders, not memory.
+codex mode; scope ROOTS are shared, since they name folders, not memory. One
+exception holds no memory: `paths.shared_state_dir`, the configured state_dir NOT
+moved by codex mode, keeps tmux-wide state every agent must agree on (the bus
+mailbox, bcast's log, pane state, the pane registry).
 
 Python 3.11+ ships tomllib; on older interpreters (macOS still ships 3.9) a
 small parser below handles the subset the example config uses: tables,

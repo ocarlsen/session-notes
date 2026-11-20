@@ -1091,19 +1091,24 @@ def selftest():
 
         # The bus lives in the tmux-wide state dir: a Codex-mode process (every Codex
         # shell command has SESSION_NOTES_AGENT=codex) must open the same bus.jsonl.
+        # bus_path() itself, resolved fresh in each mode (BUS unset, _STATE cleared).
         saved_state, saved_bus = _STATE, BUS
+        saved_agent = os.environ.get("SESSION_NOTES_AGENT")
         try:
-            env = dict(os.environ)
+            BUS = None
             resolved = {}
             for kind in ("claude", "codex"):
-                env["SESSION_NOTES_AGENT"] = kind
-                cfg_k = notes_config.load(env=env)
-                resolved[kind] = os.path.join(cfg_k["paths"]["shared_state_dir"],
-                                              "session-bus", "bus.jsonl")
-            check("bus path is the same in claude and codex mode",
+                os.environ["SESSION_NOTES_AGENT"] = kind
+                _STATE = None
+                resolved[kind] = bus_path()
+            check("bus_path() is the same in claude and codex mode",
                   resolved["claude"] == resolved["codex"])
         finally:
             _STATE, BUS = saved_state, saved_bus
+            if saved_agent is None:
+                os.environ.pop("SESSION_NOTES_AGENT", None)
+            else:
+                os.environ["SESSION_NOTES_AGENT"] = saved_agent
 
         # The pull names its mailbox; the address must be tmux-shaped only.
         check("as_address/parse_address round-trip",
