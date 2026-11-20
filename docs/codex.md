@@ -76,7 +76,8 @@ pane, so it needs both:
   run from the pane and keep it.
 - **Approval outside the sandbox:** the sandbox refuses the tmux socket, so the lookup fails
   inside it. Approve the send when Codex asks, or add an allow rule for
-  `<bin>/session_bus.py send` if you want Codex to send without asking.
+  `<bin>/session_bus.py send` if you want Codex to send without asking. That rule also
+  covers `send --all --broadcast-confirm`, which reaches every session at once.
 
 To let the read-only session tools run without an approval prompt each time, add rules
 like these to `~/.codex/rules/default.rules` (replace `<bin>` with the directory holding

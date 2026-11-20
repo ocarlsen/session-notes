@@ -554,9 +554,10 @@ def no_address_note(env=None):
     never = " Do not type into another pane (tmux send-keys) to reach it."
     if env.get("TMUX") and env.get("TMUX_PANE"):
         if in_codex(env):
-            return ("session_bus: the sandbox blocked the tmux lookup that tells which "
-                    "session is sending. Run this same command again, asking the user to "
-                    "approve running it outside the sandbox." + never)
+            return ("session_bus: tmux did not answer the lookup that tells which session "
+                    "is sending, most likely because the sandbox refuses the tmux socket. "
+                    "Run this same command again, asking the user to approve running it "
+                    "outside the sandbox." + never)
         return ("session_bus: tmux did not answer for pane %s, so this session's "
                 "address is unknown; cannot send." % env["TMUX_PANE"])
     if in_codex(env):
@@ -1150,9 +1151,9 @@ def selftest():
         check("Codex with a pane (sandbox blocked tmux): ask approval to run outside it",
               "outside the sandbox" in no_address_note(cx_pane)
               and "send-keys" in no_address_note(cx_pane))
-        check("Codex without a pane: names --no-daemon and says tell the user",
-              "--no-daemon" in no_address_note({"CODEX_THREAD_ID": "t1"})
-              and "Tell" in no_address_note({"CODEX_THREAD_ID": "t1"}))
+        cx_nopane = no_address_note({"CODEX_THREAD_ID": "t1"})
+        check("Codex without a pane: names --no-daemon, says tell the user, never send-keys",
+              "--no-daemon" in cx_nopane and "Tell" in cx_nopane and "send-keys" in cx_nopane)
         check("outside Codex, a pane tmux did not answer for is named",
               "%9" in no_address_note({"TMUX": "/t,1,0", "TMUX_PANE": "%9"}))
         check("outside Codex, no pane: names the missing $TMUX_PANE",
