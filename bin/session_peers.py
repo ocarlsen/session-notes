@@ -77,6 +77,10 @@ _FIELDS = (
     ("pane_pid", "#{pane_pid}"),
     ("pane_current_command", "#{pane_current_command}"),
     ("model", "#{@claude_model}"),
+    ("session_created", "#{session_created}"),
+    # A display-only label a launcher may set as the tmux SESSION option @display
+    # (empty when unset). Listings print pane["label"]: this, else the session name.
+    ("display", "#{@display}"),
 )
 _FMT = _SEP.join(fmt for _, fmt in _FIELDS)
 
@@ -249,8 +253,14 @@ def parse_pane_line(line, self_pane=None):
     version = cmd if _VERSION_RE.fullmatch(cmd) else ""
     pane["claude_version"] = version
     pane["is_claude"] = bool(version or pane["model"])
+    # Which agent harness runs here: "claude", a HARNESSES key, or "". Claude is
+    # decided first, so a Claude pane can never be claimed by another harness.
+    pane["harness"] = "claude" if pane["is_claude"] else next(
+        (n for n, h in HARNESSES.items() if h["command"].fullmatch(cmd)), "")
+    pane["is_agent"] = bool(pane["harness"])
     pane["state"] = busy_state(pane["pane_title"]) if pane["is_claude"] else ""
     pane["name"] = session_name(pane["pane_title"]) if pane["is_claude"] else pane["pane_title"]
+    pane["label"] = pane["display"] or pane["name"]
     if self_pane is None:
         self_pane = os.environ.get("TMUX_PANE", "")
     pane["is_self"] = bool(self_pane) and pane["pane_id"] == self_pane
@@ -279,20 +289,34 @@ def list_peers():
 
 
 def find_pane(panes, target):
-    """Resolve a target to one pane: a %pane-id, else an exact tmux session
-    name, else a unique case-insensitive substring of a Claude session name.
-    Returns (pane, None) on a unique match, else (None, candidates)."""
+    """Resolve a target to one pane: a %pane-id; else an exact tmux session name
+    (any agent pane, so a Codex session resolves); else a unique case-insensitive
+    substring of a Claude session name, then of a Claude pane's label. The
+    substring tiers are Claude-only: another harness's title is free task text
+    and must never capture a fuzzy target. Within a tier, a single Claude pane
+    wins a tie. Returns (pane, None) on a unique match, else (None, candidates)."""
     if target.startswith("%"):
         hits = [p for p in panes if p["pane_id"] == target]
         return (hits[0], None) if hits else (None, [])
-    claude = [p for p in panes if p["is_claude"]]
-    hits = [p for p in claude if p["tmux_session"] == target]
-    if not hits:
-        low = target.lower()
-        hits = [p for p in claude if low in p["name"].lower()]
-    if len(hits) == 1:
-        return hits[0], None
-    return None, hits
+
+    def one(hits):
+        if len(hits) == 1:
+            return hits[0]
+        claude = [p for p in hits if p["is_claude"]]
+        return claude[0] if len(claude) == 1 else None
+
+    low = target.lower()
+    tiers = (
+        (lambda p: p.get("is_agent", p["is_claude"]), lambda p: p["tmux_session"] == target),
+        (lambda p: p["is_claude"], lambda p: low in p["name"].lower()),
+        (lambda p: p["is_claude"], lambda p: low in (p.get("label") or "").lower()),
+    )
+    for eligible, match in tiers:
+        hits = [p for p in panes if eligible(p) and match(p)]
+        if hits:
+            hit = one(hits)
+            return (hit, None) if hit else (None, hits)
+    return None, []
 
 
 # ---------------------------------------------------------------- peek
@@ -378,6 +402,83 @@ def peek(pane, lines=0):
         return None
     out = [l for l in render_captured(r.stdout.splitlines()) if l.strip()]
     return out[-lines:] if lines else out
+
+
+def peek_raw(pane):
+    """The visible screen as RAW capture-pane -e lines (escapes kept), for the
+    harness screen tests below, which need dim to tell a placeholder from typed
+    text. None if tmux refused."""
+    try:
+        r = _tmux(["capture-pane", "-p", "-e", "-t", pane["pane_id"]])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.splitlines()
+
+
+# ---------------------------------------------------------------- harnesses
+# Agents other than Claude Code that run in tmux. Claude Code is recognized by the
+# version/model rule in parse_pane_line, and its empty-box test lives in
+# bcast.input_box_empty. A harness listed here carries:
+#   command    regex fullmatched against #{pane_current_command}
+#   hook       False: it has no prompt hook to inject bus mail, so bus_nudge types
+#              a fixed "pull your inbox" line and the agent runs session_bus.py inbox
+#   empty_box  raw -e screen -> True only on an empty input box (safe to type + Enter)
+#   busy       raw -e screen -> True while the agent works or shows a dialog
+# The Codex signatures were read off a live Codex CLI 0.170.0 pane (fixtures in the
+# selftest). A TUI change that breaks one fails CLOSED: no empty box, no keystroke.
+# Busy = any status row ("• Working (6s • esc to interrupt)", "• Booting MCP server
+# (2s"), the interrupt hint in any case, or an approval dialog. Quoted text that
+# happens to match only delays a nudge until it scrolls off.
+_CODEX_BUSY_RE = re.compile(r"esc to interrupt|Press enter to confirm|^\s*•.*\(\d+[hms]\b",
+                            re.I)
+
+
+def codex_input_box_empty(raw_lines):
+    """The LAST line starting with Codex's › chevron is its input box. A positive
+    signature, so an unrecognized screen fails closed: after the chevron there must
+    be visible text and all of it dim (the "Ask Codex to do anything" placeholder),
+    and the row below must be blank (a draft whose first line is empty shows a bare
+    › with the text on the next row). Typed text is not dim; an approval menu's last
+    › row is "› 1. Yes, proceed", not dim. No › line at all -> False."""
+    lines = list(raw_lines or [])
+    for i in range(len(lines) - 1, -1, -1):
+        chars = _styled_chars(lines[i])
+        plain = "".join(c for c, _ in chars)
+        lead = len(plain) - len(plain.lstrip())
+        if not plain[lead:].startswith("›"):
+            continue
+        rest = [d for c, d in chars[lead + 1:] if c not in (" ", "\xa0")]
+        below = ("".join(c for c, _ in _styled_chars(lines[i + 1]))
+                 if i + 1 < len(lines) else "")
+        return bool(rest) and all(rest) and not below.replace("\xa0", " ").strip()
+    return False
+
+
+def codex_busy(raw_lines):
+    """A status row, the interrupt hint, or an approval dialog on screen."""
+    return any(_CODEX_BUSY_RE.search("".join(c for c, _ in _styled_chars(l)))
+               for l in raw_lines or [])
+
+
+HARNESSES = {
+    "codex": {
+        "command": re.compile(r"codex"),
+        "hook": False,
+        "empty_box": codex_input_box_empty,
+        "busy": codex_busy,
+    },
+}
+
+
+def ready_for_input(pane, raw_lines):
+    """For a non-Claude harness pane: True only when idle with an empty input box.
+    Claude panes are not judged here (bcast.input_box_empty owns that)."""
+    h = HARNESSES.get(pane.get("harness"))
+    if h is None:
+        return False
+    return not h["busy"](raw_lines) and h["empty_box"](raw_lines)
 
 
 # ---------------------------------------------------------------- output
@@ -478,7 +579,7 @@ def selftest():
             fails.append(name)
 
     def line(title, pane_id="%1", cmd="2.1.220", model="", session="4"):
-        return _SEP.join([session, "0", pane_id, title, "/tmp/w", "123", cmd, model])
+        return _SEP.join([session, "0", pane_id, title, "/tmp/w", "123", cmd, model, "1", ""])
 
     p = parse_pane_line(line("⠐ build api"), self_pane="%9")
     check("version title is claude", p["is_claude"] and p["claude_version"] == "2.1.220")
@@ -532,7 +633,7 @@ def selftest():
 
     # ---- hook state over title state (no files: read and parents are stubbed)
     def hs(title, pane_id, pid):
-        return parse_pane_line(_SEP.join(["4", "0", pane_id, title, "/w", pid, "2.1.281", ""]))
+        return parse_pane_line(_SEP.join(["4", "0", pane_id, title, "/w", pid, "2.1.281", "", "1", ""]))
     recs = {"%1": {"state": "working", "claude_pid": "11"},   # claude is the pane process
             "%2": {"state": "working", "claude_pid": "222"},  # claude is a child of the shell
             "%3": {"state": "working", "claude_pid": "333"},  # an earlier claude, now gone
@@ -566,13 +667,13 @@ def selftest():
     import session_lineage as sl
 
     def cl(title, pane_id, session, pid):
-        return _SEP.join([session, "0", pane_id, title, "/tmp/w", pid, "2.1.220", ""])
+        return _SEP.join([session, "0", pane_id, title, "/tmp/w", pid, "2.1.220", "", "1", ""])
     tpanes = [parse_pane_line(cl(IDLE_GLYPH + " lead", "%1", "lead", "101"), self_pane="%2"),
               parse_pane_line(cl("\u2810 worker", "%2", "wk", "102"), self_pane="%2"),
               parse_pane_line(cl(IDLE_GLYPH + " sub", "%3", "sub", "103"), self_pane="%2"),
               parse_pane_line(cl(IDLE_GLYPH + " orphan", "%4", "orph", "104"), self_pane="%2"),
               parse_pane_line(cl(IDLE_GLYPH + " stale", "%5", "stale", "105"), self_pane="%2"),
-              parse_pane_line(_SEP.join(["sh", "0", "%6", "zsh", "/tmp", "106", "zsh", ""]))]
+              parse_pane_line(_SEP.join(["sh", "0", "%6", "zsh", "/tmp", "106", "zsh", "", "1", ""]))]
     treg = {"%1": {"claude_pid": "101"},
             "%2": {"claude_pid": "102", "parent": {"session": "lead", "created": "10"}},
             "%3": {"claude_pid": "103", "parent": {"session": "wk", "created": "20"}},
@@ -628,6 +729,100 @@ def selftest():
           == "parent: lead (live; from env, not in registry)")
     check("me: outside tmux says so",
           render_me(tpanes, treg, tlive, self_pane="", env={}).startswith("not in tmux"))
+    # Display label: @display, when set, is what listings print; the name stays the
+    # messaging name.
+    lp = parse_pane_line(_SEP.join(["4", "0", "%7", IDLE_GLYPH + " worker", "/w", "1",
+                                    "2.1.220", "", "1690000100", "login fix"]))
+    check("display field carries the raw @display value", lp["display"] == "login fix")
+    check("label prefers @display; name stays the messaging name",
+          lp["label"] == "login fix" and lp["name"] == "worker")
+    check("session_created field parses", lp["session_created"] == "1690000100")
+    check("no @display -> label falls back to the name",
+          parse_pane_line(line(IDLE_GLYPH + " docs"))["label"] == "docs")
+    check("find_pane resolves a unique label substring",
+          find_pane([lp], "login")[0] is lp)
+
+    # Harness table. Fixture lines are raw capture-pane -e rows read off a live
+    # Codex CLI 0.170.0 pane on 2026-11-20.
+    def chk(cond, name):
+        check(name, cond)
+    working = line("⠐ build api", pane_id="%31", session="31")
+    shell = _SEP.join(["2", "0", "%5", "zsh-title", "/tmp/h", "999", "zsh", "",
+                       "1690000050", ""])
+    cx_empty = "\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m"
+    cx_typed = "\x1b[1m›\x1b[0m half a thought"
+    cx_history = ("\x1b[1;2m\x1b[38;2;238;238;238m› \x1b[0m\x1b[38;2;238;238;238m"
+                  "\x1b[48;2;68;68;68mRun exactly this one shell command\x1b[0m")
+    cx_working = "• \x1b[1mWorking\x1b[0m \x1b[2m(6s • esc to interrupt)\x1b[0m"
+    cx_menu = ["  Would you like to run the following command?",
+               "  $ touch ~/.busprobe_approval_probe",
+               "\x1b[1m› 1. Yes, proceed (y)\x1b[0m",
+               "  2. Yes, and don't ask again (p)",
+               "  3. No, and tell Codex what to do differently (esc)",
+               "  Press enter to confirm or esc to cancel"]
+    footer = "  \x1b[38;2;246;226;183mGPT-6-Luna default\x1b[39m · /tmp"
+    chk(codex_input_box_empty([cx_history, "", cx_empty, "", footer]),
+          "codex: dim placeholder after › = empty box (history › row above ignored)")
+    chk(not codex_input_box_empty([cx_history, cx_typed, footer]),
+          "codex: typed text after › refused")
+    chk(not codex_input_box_empty([cx_history] + cx_menu), "codex: approval menu refused")
+    chk(not codex_input_box_empty([]), "codex: blank screen refused")
+    chk(not codex_input_box_empty(["\x1b[1m›\x1b[0m ", "  his second line", footer]),
+          "codex: bare › with a draft on the next row refused (no placeholder = not empty)")
+    chk(not codex_input_box_empty(["\x1b[1m›\x1b[0m ", "", footer]),
+          "codex: bare › with no placeholder refused (positive signature only)")
+    chk(not codex_input_box_empty([cx_empty, "  draft continues", footer]),
+          "codex: placeholder row with text right below refused")
+    chk(codex_busy(["• Booting MCP server (2s • Esc to interrupt)", cx_empty]),
+          "codex: capitalised Esc / other status rows count as busy")
+    chk(codex_busy(["• Compacting (12s)", cx_empty]), "codex: any '• ... (Ns' status row = busy")
+    chk(not codex_busy(["• TMUX=[/tmp/x,1,2] TMUX_PANE=[%1]", "  Worked for 7s • 8:16 AM",
+                          cx_empty]), "codex: finished-turn rows are not busy")
+    chk(codex_busy([cx_working, cx_empty]) and not codex_busy([cx_empty, "", footer]),
+          "codex: 'esc to interrupt' = busy; idle screen is not")
+    chk(codex_busy(cx_menu), "codex: approval dialog counts as busy")
+    cxp = {"harness": "codex"}
+    chk(ready_for_input(cxp, [cx_empty, "", footer]), "codex: idle + empty = ready")
+    chk(not ready_for_input(cxp, [cx_working, cx_empty]),
+          "codex: working with an empty box (Codex keeps the box live) NOT ready")
+    chk(not ready_for_input({"harness": "claude"}, [cx_empty]),
+          "ready_for_input never judges a Claude pane")
+    # anti-population, both ways: the Codex matcher must refuse a Claude pane's empty box,
+    # and Claude's detection must never claim a codex process.
+    rule = "─" * 40
+    chk(not codex_input_box_empty([rule, "❯\xa0", rule]),
+          "codex box test refuses Claude's empty ❯ box")
+    cxline = _SEP.join(["1824", "0", "%1873", "Show tmux | 1824", "/tmp/p", "1", "codex",
+                        "", "1690000000", ""])
+    p = parse_pane_line(cxline)
+    chk(p["harness"] == "codex" and p["is_agent"] and not p["is_claude"],
+          "codex pane -> harness codex, is_agent, NOT is_claude")
+    p = parse_pane_line(working)
+    chk(p["harness"] == "claude" and p["is_agent"], "claude pane -> harness claude")
+    p = parse_pane_line(shell)
+    chk(p["harness"] == "" and not p["is_agent"], "zsh pane -> no harness")
+    p = parse_pane_line(cxline.replace("codex", "codexfoo", 1).replace("Show tmux", "x"))
+    chk(not p["is_agent"], "codex regex is a fullmatch (codexfoo is not codex)")
+    # find_pane resolves a Codex pane by tmux session name (bcast --to 1824), but
+    # never a plain shell pane.
+    cx = parse_pane_line(cxline)
+    sh = parse_pane_line(shell)
+    chk(find_pane([cx, sh], "1824")[0] is cx, "find_pane resolves a codex pane by session")
+    chk(find_pane([sh], sh["tmux_session"])[0] is None, "find_pane still skips a shell pane")
+    # Tie between a Claude and a Codex pane in one session: a single Claude pane wins.
+    cl = parse_pane_line(working)
+    cx2 = dict(cx, tmux_session=cl["tmux_session"], pane_id="%999")
+    chk(find_pane([cx2, cl], cl["tmux_session"])[0] is cl, "find_pane tie: the Claude pane wins")
+    cx3 = dict(cx2, pane_id="%998")
+    chk(find_pane([cx2, cx3], cl["tmux_session"])[0] is None, "find_pane: two codex panes stay ambiguous")
+    # Substring tiers are Claude-only: a Codex title containing the target never
+    # captures it, not even over a Claude pane's @display label.
+    cxt = dict(cx, name="fix the release notes now", pane_id="%997", tmux_session="cxs")
+    lab = dict(cl, label="ticket 42: release notes", pane_id="%996", tmux_session="cls")
+    chk(find_pane([cxt, lab], "release notes")[0] is lab, "codex title never shadows a claude label")
+    chk(find_pane([cxt], "release notes")[0] is None, "codex pane never matched by substring")
+    chk(find_pane([cxt], "cxs")[0] is cxt, "codex pane matched by exact session name")
+
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 

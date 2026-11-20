@@ -26,6 +26,11 @@ for f in "$ROOT"/bin/*.py "$ROOT"/hooks/*.py "$ROOT"/skills/*/*.py "$ROOT"/tools
     echo "FAIL ${f#$ROOT/}"; echo "$out" | tail -20 | sed 's/^/    /'; fail=1
   fi
 done
+if out=$(python3 "$ROOT/tests/test_snippets.py" 2>&1); then
+  echo "PASS tests/test_snippets.py"
+else
+  echo "FAIL tests/test_snippets.py"; echo "$out" | sed 's/^/    /'; fail=1
+fi
 if out=$(python3 "$ROOT/tests/test_hooks.py" 2>&1); then
   echo "PASS tests/test_hooks.py"
 else
