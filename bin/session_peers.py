@@ -123,7 +123,7 @@ def pane_state_path(pane_id, cfg=None):
     """<state_dir>/pane_state/<pane id, alphanumerics only>.json."""
     import notes_config
     safe = "".join(c for c in (pane_id or "") if c.isalnum()) or "nopane"
-    return notes_config.state_path(PANE_STATE_DIR, safe + ".json", cfg=cfg)
+    return notes_config.shared_state_path(PANE_STATE_DIR, safe + ".json", cfg=cfg)
 
 
 def write_pane_state(pane_id, state, claude_pid, cfg=None):
@@ -157,7 +157,7 @@ def sweep_pane_state(live, current_pane, cfg=None):
         return
     import notes_config
     try:
-        state_dir = notes_config.state_path(PANE_STATE_DIR, cfg=cfg)
+        state_dir = notes_config.shared_state_path(PANE_STATE_DIR, cfg=cfg)
         current_stem = "".join(c for c in (current_pane or "") if c.isalnum()) or "nopane"
         live_stems = {"".join(c for c in p if c.isalnum()) or "nopane" for p in live}
         now = time.time()

@@ -62,7 +62,7 @@ def fallback_errors_dir():
     state_dir otherwise, so a broken config is recorded rather than lost."""
     try:
         import notes_config
-        root = notes_config.load()["paths"]["state_dir"]
+        root = notes_config.load()["paths"]["shared_state_dir"]
     except Exception:
         try:
             import notes_config

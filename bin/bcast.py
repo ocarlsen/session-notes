@@ -136,7 +136,7 @@ def prefix(cfg=None):
 
 def log_path(cfg=None):
     cfg = cfg or notes_config.load()
-    return os.path.join(cfg["paths"]["state_dir"], "bcast.jsonl")
+    return os.path.join(cfg["paths"]["shared_state_dir"], "bcast.jsonl")
 
 
 def is_agent(p):

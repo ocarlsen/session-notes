@@ -78,7 +78,14 @@ import uuid
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 if BIN not in sys.path:
-    sys.path.insert(0, BIN)
+    # Run as a command: this repo's bin/ goes first. Loaded as a library by some
+    # other program (a job importing this file by path to append mail): add it LAST,
+    # so that program's own same-named modules (its own session_peers, say) still
+    # win its later imports. notes_config exists only here, so it resolves either way.
+    if __name__ == "__main__":
+        sys.path.insert(0, BIN)
+    else:
+        sys.path.append(BIN)
 import notes_config  # noqa: E402
 
 SELF = os.path.join(BIN, "session_bus.py")
@@ -95,7 +102,8 @@ def state_dir():
     global _STATE
     if _STATE is None:
         cfg = notes_config.load()
-        _STATE = os.path.join(cfg["paths"]["state_dir"], "session-bus")
+        # shared, not per-agent: a Codex pane pulls the mailbox a Claude loop writes.
+        _STATE = os.path.join(cfg["paths"]["shared_state_dir"], "session-bus")
     return _STATE
 
 
@@ -619,9 +627,17 @@ def nudge_session_name(cfg=None):
     return cfg.get("bus", {}).get("nudge_session") or DEFAULT_NUDGE_SESSION
 
 
+# The directory this file was LAUNCHED from (abspath, not realpath). With install.sh's
+# links that is the linked bin/, so the restart line starts bus_nudge by the linked
+# path, and its pull nudge then names the linked session_bus.py an agent's allow
+# rule matches. Without links it is the repo's bin/, same as BIN.
+LAUNCH_BIN = os.path.dirname(os.path.abspath(__file__))
+
+
 def nudge_restart_line(cfg=None):
     return "tmux new-session -d -s %s 'python3 %s'" % (
-        nudge_session_name(cfg), os.path.join(BIN, "bus_nudge.py"))
+        nudge_session_name(cfg),
+        os.path.join(LAUNCH_BIN, "bus_nudge.py").replace(os.path.expanduser("~"), "~", 1))
 
 
 def nudge_down_note(cfg=None):
@@ -1066,9 +1082,28 @@ def selftest():
               nudge_session_name({"paths": {}}) == DEFAULT_NUDGE_SESSION)
         check("nudge session is configurable",
               nudge_session_name({"bus": {"nudge_session": "nb"}}) == "nb")
-        check("restart line names the repo's bus_nudge.py",
-              nudge_restart_line({"bus": {"nudge_session": "nb"}}).endswith(
-                  os.path.join(BIN, "bus_nudge.py") + "'"))
+        line = nudge_restart_line({"bus": {"nudge_session": "nb"}})
+        cmd_path = os.path.expanduser(line.rsplit(" ", 1)[1].rstrip("'"))
+        check("restart line starts bus_nudge.py by this file's launch path",
+              cmd_path == os.path.join(LAUNCH_BIN, "bus_nudge.py"))
+        check("... which resolves to this repo's bus_nudge.py",
+              os.path.realpath(cmd_path) == os.path.join(BIN, "bus_nudge.py"))
+
+        # The bus lives in the tmux-wide state dir: a Codex-mode process (every Codex
+        # shell command has SESSION_NOTES_AGENT=codex) must open the same bus.jsonl.
+        saved_state, saved_bus = _STATE, BUS
+        try:
+            env = dict(os.environ)
+            resolved = {}
+            for kind in ("claude", "codex"):
+                env["SESSION_NOTES_AGENT"] = kind
+                cfg_k = notes_config.load(env=env)
+                resolved[kind] = os.path.join(cfg_k["paths"]["shared_state_dir"],
+                                              "session-bus", "bus.jsonl")
+            check("bus path is the same in claude and codex mode",
+                  resolved["claude"] == resolved["codex"])
+        finally:
+            _STATE, BUS = saved_state, saved_bus
 
         # The pull names its mailbox; the address must be tmux-shaped only.
         check("as_address/parse_address round-trip",
