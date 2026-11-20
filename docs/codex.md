@@ -68,7 +68,8 @@ approval prompt, a running turn or typed text). A bare slash command such as `/r
 goes to Claude panes only: Codex rejects one it does not know and leaves it typed in the box.
 
 Sending FROM Codex does not work yet: `session_bus.py send` needs to know which session
-is sending, and the sandbox hides that.
+is sending. A resumed session's commands run in a daemon with no `TMUX_PANE`, so it cannot
+tell, whether or not the command is sandboxed.
 
 To let the read-only session tools run without an approval prompt each time, add rules
 like these to `~/.codex/rules/default.rules` (replace `<bin>` with the directory holding
