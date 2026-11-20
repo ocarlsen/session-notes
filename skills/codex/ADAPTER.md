@@ -4,11 +4,10 @@ The Codex skills run the SAME procedure as the Claude Code skills in `skills/<na
 (one source of truth, so a fix there reaches both agents). Read that file and follow it, with
 every substitution below applied. Where a substitution says "skip", skip the step silently.
 
-`$SESSION_NOTES` is the session-notes checkout and `$SESSION_NOTES_AGENT` is `codex`; install.sh
-sets both in Codex's `shell_environment_policy`. If `$SESSION_NOTES_AGENT` is not `codex`, prefix
-every helper call with `SESSION_NOTES_AGENT=codex`, or the helpers will resolve Claude's stores.
-If `$SESSION_NOTES` is unset, find the checkout (the directory holding `bin/notes_config.py`
-that this skill folder links into) and say so once.
+`$SESSION_NOTES` below means the checkout path each Codex SKILL.md resolves first, from its own
+symlink. Do not rely on the environment variable alone: a session started from Codex's agent
+command center can run without it. Every helper call gets `SESSION_NOTES_AGENT=codex` in front,
+or the helpers resolve Claude's stores. Never run a `bin/` script from the current folder.
 
 ## Two memories, never one
 

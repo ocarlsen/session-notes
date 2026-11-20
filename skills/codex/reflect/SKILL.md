@@ -5,6 +5,19 @@ description: "End-of-session reflection for Codex: checks for uncommitted work, 
 
 # $reflect (Codex)
 
+## First: find the checkout (do not trust the working folder)
+
+Run this once and use the path it prints, as a literal absolute path, everywhere this skill or the
+adapter says `$SESSION_NOTES`. Put `SESSION_NOTES_AGENT=codex` in front of every helper call.
+
+```bash
+python3 -c "import os; p=os.path.realpath(os.path.expanduser(os.environ.get('CODEX_HOME','~/.codex')+'/skills/reflect')); print(p.rsplit('/skills/codex/',1)[0])"
+```
+
+If it fails, use `$SESSION_NOTES` when that holds a directory with `skills/codex/ADAPTER.md`.
+Never fall back to a `bin/` or `skills/` in the current folder: a session-notes checkout there may
+be an older version without the Codex code. If neither works, stop and say so.
+
 1. Read `$SESSION_NOTES/skills/codex/ADAPTER.md`: the Codex substitutions.
 2. Read `$SESSION_NOTES/skills/reflect/SKILL.md` in full, and follow it step by step with every
    substitution from the adapter applied. An argument of `consolidate` selects its consolidate
