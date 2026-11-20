@@ -71,8 +71,10 @@ trusts a hook by its hash, so an edited hook needs trusting again.
 
 - The commands (`handoff_session`, `session_peers`, `bcast`) and the bus are
   Claude Code only, so `$refresh` does not peek at sibling sessions.
-- `skill_feedback.py canary` reads Claude Code transcripts and refuses in
-  codex mode, because Codex documents its transcript format as unstable.
+- Three checks are Claude Code only and print a one-line skip in codex mode:
+  `boot_budget.py` (the Codex hook caps its own output instead),
+  `memory_hygiene_canary.py`, and `skill_feedback.py canary` (Codex documents
+  its transcript format as unstable).
 - The boot load happens once per session, the same as on the Claude side. A
   session that is already open picks up another session's writes with
   `$refresh`.

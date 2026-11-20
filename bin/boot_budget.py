@@ -1084,6 +1084,9 @@ def main(argv=None):
 
     if args.selftest:
         return selftest()
+    if notes_config.skip_in_codex("boot_budget", "it measures Claude Code's boot prefix; the Codex "
+                                  "SessionStart hook caps its own output at agent.codex_boot_bytes"):
+        return 0
 
     # A crash here must NEVER look like exit 1 ("over budget") to a caller (e.g. a
     # pre-commit hook branching on the exit code) -- exit 2 is reserved for "this tool

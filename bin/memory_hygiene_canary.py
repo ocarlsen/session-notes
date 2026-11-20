@@ -1060,6 +1060,9 @@ def main():
         cfg = notes_config.load()
     except notes_config.ConfigError as exc:
         sys.exit("memory_hygiene_canary: bad config: %s" % exc)
+    if notes_config.skip_in_codex("memory_hygiene_canary", "its checks include Claude Code's own "
+                                  "per-project stores", cfg):
+        return 0
     return report_mode(cfg)
 
 

@@ -17,6 +17,19 @@ anything under `~/.claude` (or the configured `paths.claude_home`), even to comp
 keeps the two agents' memories separate on purpose. The helpers refuse a Codex path under
 the Claude home; do not work around that.
 
+## Writing memory
+
+Only the reflect procedure writes the store. When the user says "remember this" outside
+`$reflect`, say it will be saved at the next `$reflect` (or run `$reflect` if they ask), and do
+not write store files by hand: a hand-written MEMORY.md line skips the index helper's checks.
+New index lines go through `append_memory_index.py`, never an editor or a heredoc.
+
+## Reporting a refresh
+
+Compare against the memory block the SessionStart hook injected at boot, or the last `$refresh`
+in this session. If there was neither (an empty store at boot), everything the refresh finds is
+NEW to this session: report each item as new, never "no material changes".
+
 ## Paths
 
 | In the shared skill | In Codex |
@@ -38,5 +51,5 @@ the Claude home; do not work around that.
 | a command run backgrounded (`run_in_background: true`) | run it in the foreground in short slices: `reflect_lock.py wait --timeout 60`, repeated up to 15 times while it exits 2, saying once whose lock you are waiting on. Still never ask "wait or go?". After 15 slices, report a stuck holder and ask. |
 | `session_peers.py`, `--peek`, ListAgents, SendMessage, the bus | skip: sibling peeks and messages are Claude Code and tmux only for now. Say nothing about siblings. |
 | "Skill tool calls" when listing skills used (reflect Step 2b) | skills the user invoked as `$name` this session |
-| the skill-feedback canary line (reflect Step 2b) | skip: `skill_feedback.py canary` refuses in codex mode |
+| `boot_budget.py`, `memory_hygiene_canary.py`, `skill_feedback.py canary` | skip them. In codex mode each prints a one-line skip and exits 0, so if one runs anyway, that line is not a finding. |
 | `/reflect`, `/refresh`, `/rnr` in prose and replies | `$reflect`, `$refresh`, `$rnr` |

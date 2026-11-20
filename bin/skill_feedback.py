@@ -505,10 +505,10 @@ def _skill_names_from_transcript(path, skills_dir=None):
 
 def cmd_canary(args):
     cfg = notes_config.load()
-    if cfg["agent"]["kind"] == "codex":
-        # The canary parses Claude Code transcripts; Codex's transcript format is
-        # documented as unstable, so there is nothing safe to parse yet.
-        raise SkillFeedbackError("canary reads Claude Code transcripts only; not available in codex mode")
+    # The canary parses Claude Code transcripts; Codex's transcript format is documented
+    # as unstable, so there is nothing safe to parse yet.
+    if notes_config.skip_in_codex("skill_feedback canary", "it reads Claude Code transcripts", cfg):
+        return 0
     session = args.session or _env_session()
     if not session:
         raise SkillFeedbackError("no session: pass --session or set %s" % _session_var())
@@ -1004,8 +1004,8 @@ def selftest():
             check("codex mode: ledger under codex_home", rc == 0 and os.path.isfile(codex_ledger))
             check("codex mode: session from CODEX_THREAD_ID",
                   rc == 0 and read_rows(codex_ledger)[0][1]["session"] == "thr-9")
-            rc, _, err = run(["canary", "--session", "x"])
-            check("codex mode: canary refuses", rc == 2 and "codex mode" in err)
+            rc, out, _ = run(["canary", "--session", "x"])
+            check("codex mode: canary skips cleanly", rc == 0 and "skipped in codex mode" in out)
         finally:
             for k, v in saved.items():
                 if v is None:

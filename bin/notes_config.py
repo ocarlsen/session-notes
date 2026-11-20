@@ -364,6 +364,20 @@ def stores_for(cwd, cfg=None):
     return out
 
 
+def skip_in_codex(tool, why, cfg=None):
+    """True (after one line on stdout) when this is a Claude-only check running in
+    codex mode. The caller then exits 0: a planned skip, not a failure, so a model
+    chaining it after a write does not read the write as failed."""
+    try:
+        kind = (cfg or load())["agent"]["kind"]
+    except ConfigError:
+        return False  # the caller's own load() reports the bad config
+    if kind != "codex":
+        return False
+    print("%s: skipped in codex mode (%s)" % (tool, why))
+    return True
+
+
 def state_path(*parts, cfg=None):
     """A path under the state dir (created on demand by callers)."""
     cfg = cfg or load()
@@ -483,6 +497,21 @@ store = "/tmp/beta-store"
             check("codex store under claude_home refused", False)
         except ConfigError as exc:
             check("codex store under claude_home refused", "under claude_home" in str(exc))
+        import contextlib
+        import io
+        with open(f, "w") as fh:
+            fh.write("")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            os.environ["SESSION_NOTES_AGENT"] = "codex"
+            try:
+                skipped = skip_in_codex("t", "why", load(f))
+            except ConfigError:
+                skipped = None
+            finally:
+                os.environ.pop("SESSION_NOTES_AGENT", None)
+        check("skip_in_codex in codex mode", skipped is True and "skipped in codex mode" in buf.getvalue())
+        check("skip_in_codex in claude mode", skip_in_codex("t", "why", load(f, env={})) is False)
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)
