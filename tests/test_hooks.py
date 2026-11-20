@@ -130,6 +130,35 @@ def main():
         r, el = run_hook("session_bus_hook.py", "not json at all", home)
         well_formed("session_bus_hook bad payload", r, el)
 
+        # Codex SessionStart: silent on an empty store, one valid JSON object once the
+        # store has content, under the budget, and nothing created under ~/.claude.
+        claude_before = sorted(os.walk(os.path.join(home, ".claude")))
+        repo = os.path.join(home, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        start = dict(base, cwd=repo, hook_event_name="SessionStart", source="startup")
+        r, el = run_hook("codex_session_start.py", start, home)
+        well_formed("codex_session_start empty store", r, el)
+        check("codex_session_start: silent on an empty store", r.stdout.strip() == "", r.stdout[:200])
+        gstore = os.path.join(home, ".codex", "session-notes", "global")
+        os.makedirs(gstore)
+        with open(os.path.join(gstore, "RESUME.md"), "w") as fh:
+            fh.write("# RESUME\n\n- synthetic resume line\n")
+        for source in ("startup", "resume", "compact"):
+            r, el = run_hook("codex_session_start.py", dict(start, source=source), home)
+            well_formed("codex_session_start " + source, r, el)
+            try:
+                ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+            except (ValueError, KeyError, TypeError):
+                ctx = ""
+            check("codex_session_start %s: injects RESUME" % source, "synthetic resume line" in ctx,
+                  r.stdout[:200])
+            check("codex_session_start %s: under the 12000-char cap" % source, len(ctx) <= 12000)
+        r, el = run_hook("codex_session_start.py", "not json at all", home)
+        well_formed("codex_session_start bad payload", r, el)
+        check("codex_session_start: no writes under ~/.claude",
+              sorted(os.walk(os.path.join(home, ".claude"))) == claude_before)
+
         traces = swallowed_traces(home)
         check("no swallowed tracebacks", not traces,
               "; ".join(open(t).read()[-300:] for t in traces))

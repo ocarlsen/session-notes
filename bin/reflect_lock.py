@@ -99,17 +99,34 @@ def _tmux_name():
         return None
 
 
+def _agent():
+    try:
+        return notes_config.load()["agent"]["kind"]
+    except notes_config.ConfigError:
+        return (os.environ.get("SESSION_NOTES_AGENT") or "claude").strip()
+
+
 def my_identity():
     """(id, label, pid, pid_source) for this caller.
 
     `id` is what ownership is decided on and MUST be stable across the separate
     processes one logical run spans; `label` is what a human reads in a refusal.
     """
-    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    codex = _agent() == "codex"
+    if codex:
+        # Codex exports CODEX_THREAD_ID to every shell command of one thread. Checked
+        # FIRST and alone: a Codex launched from a Claude pane inherits that pane's
+        # CLAUDE_CODE_SESSION_ID, which would make it share the Claude session's identity.
+        sid = (os.environ.get("CODEX_THREAD_ID") or "").strip()
+    else:
+        sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
     name = _tmux_name()
     host = os.uname().nodename
 
-    if sid:
+    if sid and codex:
+        ident = f"codex-{sid}"
+        label = name or f"codex-{sid[:8]}@{host}"
+    elif sid:
         ident = f"sid-{sid}"
         label = name or f"sid-{sid[:8]}@{host}"
     elif name:
@@ -125,7 +142,9 @@ def my_identity():
         ident = f"pid-{os.getppid()}@{host}"
         label = ident
 
-    claude_pid = (os.environ.get("CLAUDE_PID") or "").strip()
+    # Codex exports no long-lived pid, and an inherited CLAUDE_PID names the parent
+    # Claude, not this holder, so codex mode never trusts it as a liveness hint.
+    claude_pid = "" if codex else (os.environ.get("CLAUDE_PID") or "").strip()
     if claude_pid.isdigit():
         return ident, label, int(claude_pid), "claude"
     return ident, label, os.getppid(), "shell"
@@ -354,6 +373,25 @@ def _selftest():
             check("fresh + shell pid: must NOT break", break_reason(*read_lock()), None)
             put({**base, "pid_source": "claude"})
             check("fresh + dead claude pid: breaks early", bool(break_reason(*read_lock())), True)
+
+            # Codex identity: CODEX_THREAD_ID decides it, and an inherited Claude
+            # session id / CLAUDE_PID (a Codex launched from a Claude pane) is ignored.
+            saved = {k: os.environ.get(k) for k in
+                     ("SESSION_NOTES_AGENT", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID")}
+            try:
+                os.environ.update(SESSION_NOTES_AGENT="codex", CODEX_THREAD_ID="thr-1",
+                                  CLAUDE_CODE_SESSION_ID="claude-parent", CLAUDE_PID=str(live))
+                cid, _, _, src = my_identity()
+                check("codex: id from CODEX_THREAD_ID", cid, "codex-thr-1")
+                check("codex: inherited CLAUDE_PID not trusted", src, "shell")
+                os.environ["SESSION_NOTES_AGENT"] = "claude"
+                check("claude: id from its own session", my_identity()[0], "sid-claude-parent")
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
             put({**base, "pid": os.getpid(), "pid_source": "claude"})
             check("fresh + live claude pid: must NOT break", break_reason(*read_lock()), None)
 

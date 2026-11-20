@@ -13,8 +13,8 @@ of, what the SKILL.md edit should say) stays with the model; this script never i
 or paraphrases text on its own.
 
 LEDGER. One JSONL file per skill, under the Claude home, never inside a skill's own
-folder: `<paths.claude_home>/skill-feedback/<skill>.jsonl` (resolved via
-notes_config.py; `--ledger PATH` overrides it, mainly for tests). The ledger is USER
+folder: `<paths.agent_home>/skill-feedback/<skill>.jsonl` (resolved via notes_config.py;
+agent_home is claude_home, or codex_home in codex mode; `--ledger PATH` overrides it, mainly for tests). The ledger is USER
 DATA, so it lives beside a user's other state, not inside a skill's directory: a skill
 folder (`<claude_home>/skills/<name>`) is routinely a symlink INTO a checkout
 (install.sh does exactly this), and writing private rows through a symlink would land
@@ -35,7 +35,7 @@ append-only and cited by 1-based line number (`<skill>.jsonl:3`); line order nev
 changes, only `applied` is ever set in place, by the `applied` command.
 
 SKILL EXISTENCE. `add` (only) refuses loudly (nonzero exit, message naming the path) if
-`<paths.claude_home>/skills/<skill>/SKILL.md` is missing, unless `--skill-dir PATH`
+`<paths.agent_home>/skills/<skill>/SKILL.md` is missing, unless `--skill-dir PATH`
 names where the skill actually lives: a typo'd skill name must not silently start a
 ledger for a skill that doesn't exist. `propose`/`applied`/`canary` never check this --
 the ledger is independent of the skill's directory, so they keep working even after a
@@ -97,7 +97,7 @@ def verify_skill_exists(skill, skill_dir=None, cfg=None):
         d = os.path.abspath(os.path.expanduser(skill_dir))
     else:
         cfg = cfg or notes_config.load()
-        d = os.path.join(cfg["paths"]["claude_home"], "skills", skill)
+        d = os.path.join(cfg["paths"]["agent_home"], "skills", skill)
     if not os.path.isdir(d):
         raise SkillFeedbackError("no such skill directory: %s" % d)
     if not os.path.isfile(os.path.join(d, "SKILL.md")):
@@ -105,14 +105,27 @@ def verify_skill_exists(skill, skill_dir=None, cfg=None):
     return d
 
 
+def _session_var():
+    """The env var holding the running agent's session id."""
+    try:
+        codex = notes_config.load()["agent"]["kind"] == "codex"
+    except notes_config.ConfigError:
+        codex = False
+    return "CODEX_THREAD_ID" if codex else "CLAUDE_CODE_SESSION_ID"
+
+
+def _env_session():
+    return (os.environ.get(_session_var()) or "").strip() or None
+
+
 def ledger_dir_for(cfg=None):
     cfg = cfg or notes_config.load()
-    return os.path.join(cfg["paths"]["claude_home"], LEDGER_DIR_NAME)
+    return os.path.join(cfg["paths"]["agent_home"], LEDGER_DIR_NAME)
 
 
 def ledger_path_for(skill, ledger=None, cfg=None):
     """The ledger file for `skill`: `ledger` if given (an explicit override, mainly for
-    tests), else <paths.claude_home>/skill-feedback/<skill>.jsonl. The directory is
+    tests), else <paths.agent_home>/skill-feedback/<skill>.jsonl. The directory is
     created lazily, on the first write (_append_row); a read-only command tolerates it
     being absent (read_rows() reports no rows for a path that doesn't exist yet)."""
     validate_skill_name(skill)
@@ -230,10 +243,10 @@ def cmd_add(args):
         raise SkillFeedbackError(
             "--after/--after-file is required: the user's literal replacement or rejection words")
 
-    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    session = args.session or _env_session()
     if not session:
         raise SkillFeedbackError(
-            "no session: pass --session or set CLAUDE_CODE_SESSION_ID "
+            "no session: pass --session or set %s " % _session_var() +
             "(a row with no session can never count toward propose's session threshold)")
 
     if args.date:
@@ -299,7 +312,7 @@ def _quoted_in_skill(rows, skill_md_text):
 
 def _skill_md_path(skill, skill_dir=None):
     d = (os.path.abspath(os.path.expanduser(skill_dir)) if skill_dir
-         else os.path.join(notes_config.load()["paths"]["claude_home"], "skills", skill))
+         else os.path.join(notes_config.load()["paths"]["agent_home"], "skills", skill))
     return os.path.join(d, "SKILL.md")
 
 
@@ -492,9 +505,13 @@ def _skill_names_from_transcript(path, skills_dir=None):
 
 def cmd_canary(args):
     cfg = notes_config.load()
-    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    # The canary parses Claude Code transcripts; Codex's transcript format is documented
+    # as unstable, so there is nothing safe to parse yet.
+    if notes_config.skip_in_codex("skill_feedback canary", "it reads Claude Code transcripts", cfg):
+        return 0
+    session = args.session or _env_session()
     if not session:
-        raise SkillFeedbackError("no session: pass --session or set CLAUDE_CODE_SESSION_ID")
+        raise SkillFeedbackError("no session: pass --session or set %s" % _session_var())
 
     if args.transcript:
         transcript = os.path.abspath(os.path.expanduser(args.transcript))
@@ -514,7 +531,7 @@ def cmd_canary(args):
             print("canary: %d transcripts match session %s; using the newest, %s"
                   % (len(matches), session, transcript), file=sys.stderr)
 
-    skills_dir = os.path.join(cfg["paths"]["claude_home"], "skills")
+    skills_dir = os.path.join(cfg["paths"]["agent_home"], "skills")
     names = _skill_names_from_transcript(transcript, skills_dir) - SELF_SKILLS
     n = len(names)
 
@@ -568,7 +585,7 @@ def build_parser():
     p.add_argument("--min-sessions", type=_positive_int, default=2)
     p.add_argument("--ledger", help="override the ledger file location (mainly for tests)")
     p.add_argument("--skill-dir", help="the skill's folder, for the supersede check "
-                   "(default <claude_home>/skills/<skill>)")
+                   "(default <agent_home>/skills/<skill>)")
     p.set_defaults(fn=cmd_propose)
 
     ad = sub.add_parser("applied", help="mark rows as applied by a commit")
@@ -580,7 +597,7 @@ def build_parser():
 
     cn = sub.add_parser("canary", help="print the derived skill-feedback canary line")
     cn.add_argument("--transcript", help="a transcript JSONL path (default: locate by --session)")
-    cn.add_argument("--session", help="default: $CLAUDE_CODE_SESSION_ID")
+    cn.add_argument("--session", help="default: $CLAUDE_CODE_SESSION_ID ($CODEX_THREAD_ID in codex mode)")
     cn.set_defaults(fn=cmd_canary)
 
     return ap
@@ -973,6 +990,28 @@ def selftest():
               rc == 0 and os.path.isfile(default_ledger))
         check("default-path row content matches what was logged",
               read_rows(default_ledger)[0][1]["habit"] == "default-path-test")
+
+        # -- codex mode: the ledger lives under codex_home, never the Claude home, and
+        #    the session comes from CODEX_THREAD_ID even when a Claude id is inherited.
+        saved = {k: os.environ.get(k) for k in
+                 ("SESSION_NOTES_AGENT", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")}
+        try:
+            os.environ.update(SESSION_NOTES_AGENT="codex", CODEX_THREAD_ID="thr-9",
+                              CLAUDE_CODE_SESSION_ID="claude-parent")
+            rc, _, err = run(["add", "a-skill", "--skill-dir", skill_dir, "--verdict", "edit",
+                               "--habit", "codex-path-test", "--before", "b", "--after", "a"])
+            codex_ledger = os.path.join(tmp, ".codex", "skill-feedback", "a-skill.jsonl")
+            check("codex mode: ledger under codex_home", rc == 0 and os.path.isfile(codex_ledger))
+            check("codex mode: session from CODEX_THREAD_ID",
+                  rc == 0 and read_rows(codex_ledger)[0][1]["session"] == "thr-9")
+            rc, out, _ = run(["canary", "--session", "x"])
+            check("codex mode: canary skips cleanly", rc == 0 and "skipped in codex mode" in out)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
         # -- canary: counts distinct Skill tool_use names across a transcript
         #    (excluding reflect/rnr and sidechain/subagent turns), plus the sum of
