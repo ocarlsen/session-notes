@@ -33,8 +33,10 @@ HOW WORKING AND IDLE ARE TOLD APART
     which is why they are the fallback and not the source.
 
 GUARDRAILS
-  - READ-ONLY. This tool runs only `tmux list-panes`, `tmux capture-pane` and
-    (for --tree/--me) `tmux list-sessions`.
+  - READ-ONLY toward other sessions. This tool runs only `tmux list-panes`,
+    `tmux capture-pane`, `ps` (a pane process's start time) and (for --tree/--me)
+    `tmux list-sessions`. The one thing it writes is its own check log: the fact
+    of each check, never what was on screen.
     It never types into a pane. Observing a sibling is safe; driving one
     would let a model manufacture input that looks like the human's.
   - Peek output is for the reading model's judgment in its own context. It
@@ -44,7 +46,8 @@ GUARDRAILS
 LIMITS
   - tmux-hosted sessions on this machine only. A session in a plain terminal
     window, or a headless job, is invisible.
-  - A peek is the visible screen, not the history.
+  - A plain peek is the visible screen; --scrollback adds tmux history and
+    --transcript the session's own record, which can lag the pane by a turn.
 
 USAGE
   session_peers.py                 roster of Claude sessions
@@ -54,13 +57,24 @@ USAGE
                                    %pane-id, a tmux session name, or a
                                    substring of the session's /rename name)
   session_peers.py --peek NAME --lines 20
+  session_peers.py --peek NAME --scrollback [N]
+                                   tmux history, not just the visible screen
+  session_peers.py --peek NAME --transcript [--grep PATTERN]
+                                   that session's on-disk transcript: every tool
+                                   call and result (Claude Code sessions only;
+                                   resolved through the pane registry, refused
+                                   rather than guessed)
+  session_peers.py --checks [N]    the last N logged peer checks (who looked at
+                                   whom, never what was on screen)
   session_peers.py --tree          Claude sessions as a parent/child tree
                                    (recorded at launch by handoff_session.py)
   session_peers.py --me            this session's parent and whether it is live
   session_peers.py --selftest
 """
 import argparse
+import glob
 import json
+import math
 import os
 import re
 import subprocess
@@ -117,6 +131,10 @@ def session_name(title):
 # ---------------------------------------------------------------- hook state
 PANE_STATE_DIR = "pane_state"
 HOOK_STATES = ("working", "idle")
+# An interrupted turn (Esc mid-generation) fires no Stop and no idle notification,
+# so a "working" record can be left behind forever. Past this age it is ignored
+# and the title decides. Long turns run over an hour, hence two.
+WORKING_MAX_S = 2 * 3600
 
 
 def pane_state_path(pane_id, cfg=None):
@@ -220,7 +238,9 @@ def apply_hook_state(panes, read=read_pane_state, parents=process_parents):
     pane's own process (launched as the pane command) or a direct child of
     it (claude typed at a shell). A stale record from an earlier claude in a
     reused pane fails that check and the title decides. A spinner in the
-    title still wins, so a turn the hooks missed is not shown as idle."""
+    title still wins, so a turn the hooks missed is not shown as idle. A
+    "working" record older than WORKING_MAX_S (or with an unreadable ts) is
+    treated as absent; an "idle" record has no age limit."""
     table = None
     for p in panes:
         if not p.get("is_claude") or p.get("state") == "working":
@@ -236,8 +256,24 @@ def apply_hook_state(panes, read=read_pane_state, parents=process_parents):
                 table = parents() or {}
             if table.get(pid) != p["pane_pid"]:
                 continue
+        if rec["state"] == "working":
+            age = record_age_s(rec)
+            if age is None or age > WORKING_MAX_S:
+                continue  # stuck or unverifiable: the title decides
         p["state"] = rec["state"]
     return panes
+
+
+def record_age_s(rec):
+    """Seconds since rec["ts"], or None when ts is missing, non-numeric or not
+    finite ("nan" and "inf" both parse as floats)."""
+    try:
+        ts = float(rec.get("ts"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts):
+        return None
+    return time.time() - ts
 
 
 def parse_pane_line(line, self_pane=None):
@@ -417,6 +453,259 @@ def peek_raw(pane):
     return r.stdout.splitlines()
 
 
+# ---------------------------------------------------------------- scrollback
+SCROLLBACK_DEFAULT = 200
+
+
+def scrollback_args(pane_id, n):
+    """capture-pane args for the last n lines of history (n <= 0 or None: all
+    of it). -N keeps trailing spaces, which capture-pane strips by default."""
+    start = "-" if not n or n <= 0 else "-%d" % n
+    return ["capture-pane", "-p", "-e", "-N", "-t", pane_id, "-S", start]
+
+
+def peek_scrollback(pane, n=SCROLLBACK_DEFAULT):
+    """The pane's tmux HISTORY (visible screen plus scrollback) as plain lines,
+    or None if tmux refused. Still only what this pane drew."""
+    try:
+        r = _tmux(scrollback_args(pane["pane_id"], n))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return [l for l in render_captured(r.stdout.splitlines()) if l.strip()]
+
+
+# ---------------------------------------------------------------- transcripts
+# A Claude session's own record: <claude_home>/projects/<encoded cwd>/<id>.jsonl.
+# Fuller than the screen (every tool call and result), but it can lag a turn.
+TRANSCRIPTS_ROOT = None  # None = <claude_home>/projects from the config; tests override
+
+
+def transcript_files(cwd, cfg=None):
+    """(dir, [*.jsonl newest first]) for a cwd, or (None, []) with no cwd.
+    The folder name is notes_config.encode_project_dir, Claude Code's rule."""
+    if not cwd:
+        return None, []
+    import notes_config
+    root = TRANSCRIPTS_ROOT or os.path.join(
+        (cfg or notes_config.load())["paths"]["claude_home"], "projects")
+    d = os.path.join(root, notes_config.encode_project_dir(cwd))
+    if not os.path.isdir(d):
+        return d, []
+    return d, sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)
+
+
+def proc_start_epoch(pid):
+    """Epoch seconds when pid started, or None if it cannot be read. None means
+    "cannot verify": callers fail closed on it."""
+    pid = str(pid or "").strip()
+    if not pid.isdigit():
+        return None
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", pid],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        # strptime's default format matches `ps -o lstart` on macOS and Linux
+        # in the C locale; any other locale raises, which reads as None.
+        return time.mktime(time.strptime(r.stdout.strip()))
+    except Exception:
+        return None
+
+
+def resolve_pane_transcript(pane, registry=None, files=None):
+    """(path, how, detail) for a pane's OWN transcript, never a guess.
+
+    Newest-file-in-the-cwd is wrong as soon as two sessions share a folder: it
+    returns whichever is writing, usually the one asking. So, in order:
+      1. the pane registry (the session recorded its own id at startup), trusted
+         only while the registered claude pid is still this pane's process,
+         since tmux reuses pane ids;
+      2. a single transcript in the folder that changed after this pane's
+         process started (an older one belongs to a dead session);
+      3. refusal: path and how are None and detail says why."""
+    dir_path, cands = (transcript_files(pane.get("cwd", "")) if files is None
+                       else (None, files))
+    if registry is None:
+        import session_lineage
+        registry = session_lineage.read_registry()
+    pid_now = str(pane.get("pane_pid") or "").strip()
+    ent = registry.get(pane.get("pane_id") or "")
+    if isinstance(ent, dict) and ent.get("session_id"):
+        reg_pid = str(ent.get("claude_pid") or "").strip()
+        if not reg_pid or not pid_now:
+            return (None, None, "pane %s has a registry entry that cannot be verified "
+                    "(registered pid %s, live pid %s); refusing rather than trusting it"
+                    % (pane.get("pane_id"), reg_pid or "missing", pid_now or "missing"))
+        if reg_pid != pid_now:
+            return (None, None, "pane %s is registered to pid %s but now runs pid %s: "
+                    "tmux reused the pane id, or claude is not the pane's own process; "
+                    "refusing" % (pane.get("pane_id"), reg_pid, pid_now))
+        want = ent["session_id"] + ".jsonl"
+        for f in cands:
+            if os.path.basename(f) == want:
+                return f, "registry", ent["session_id"]
+        return (None, None, "pane %s is registered to session %s, but no %s exists "
+                "under %s" % (pane.get("pane_id"), ent["session_id"], want,
+                               dir_path or "that cwd"))
+    if len(cands) == 1:
+        started = proc_start_epoch(pid_now)
+        if started is None:
+            return (None, None, "pane %s is unregistered, and the one transcript here "
+                    "cannot be tied to it (the pane process's start time is unreadable)"
+                    % pane.get("pane_id"))
+        try:
+            mtime = os.path.getmtime(cands[0])
+        except OSError:
+            mtime = None
+        if mtime is None or mtime < started:
+            return (None, None, "pane %s is unregistered, and the only transcript here "
+                    "(%s) last changed before this pane's process started: it belongs "
+                    "to an earlier session" % (pane.get("pane_id"),
+                                               os.path.basename(cands[0])))
+        return cands[0], "sole-candidate", os.path.basename(cands[0])
+    if not cands:
+        return (None, None, "no transcript found for cwd %r (looked in %s)"
+                % (pane.get("cwd"), dir_path))
+    return (None, None, "pane %s is not in the pane registry and %d transcripts share "
+            "its cwd, so it cannot be identified; use --scrollback, which reads tmux"
+            % (pane.get("pane_id"), len(cands)))
+
+
+def _tool_result_text(content):
+    """A tool_result's content is a string or a list of text blocks."""
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return content if isinstance(content, str) else str(content)
+
+
+def extract_transcript_events(path):
+    """[(line_no, role, kind, text)] for every user/assistant text, tool_use and
+    tool_result in one transcript, in order. Malformed lines are skipped: the
+    file is a live process's append target, so a torn last line is normal."""
+    events = []
+    try:
+        with open(path) as fh:
+            for i, line in enumerate(fh, 1):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict) or d.get("type") not in ("user", "assistant"):
+                    continue
+                msg = d.get("message") or {}
+                role = msg.get("role", d.get("type"))
+                content = msg.get("content")
+                if isinstance(content, str):
+                    if content.strip():
+                        events.append((i, role, "text", content))
+                    continue
+                for c in content if isinstance(content, list) else []:
+                    if not isinstance(c, dict):
+                        continue
+                    kind = c.get("type")
+                    if kind == "text" and c.get("text", "").strip():
+                        events.append((i, role, "text", c["text"]))
+                    elif kind == "tool_use":
+                        events.append((i, role, "tool_use:%s" % c.get("name", "?"),
+                                       json.dumps(c.get("input", {}), ensure_ascii=False)))
+                    elif kind == "tool_result":
+                        events.append((i, role, "tool_result",
+                                       _tool_result_text(c.get("content"))))
+    except OSError:
+        return []
+    return events
+
+
+def transcript_grep(path, pattern=None, limit=20):
+    """The last `limit` events, filtered to a case-insensitive literal match when
+    a pattern is given. Never the whole file: transcripts run to megabytes."""
+    events = extract_transcript_events(path)
+    if pattern:
+        rx = re.compile(re.escape(pattern), re.IGNORECASE)
+        events = [e for e in events if rx.search("%s %s" % (e[2], e[3]))]
+    return events[-limit:]
+
+
+def render_transcript_events(events, snippet_len=300):
+    if not events:
+        return "  (no matching events)"
+    out = []
+    for lineno, role, kind, text in events:
+        text = text.replace("\n", " ⏎ ")
+        if len(text) > snippet_len:
+            text = text[:snippet_len] + "…"
+        out.append("  L%-6s %-10s %-24s %s" % (lineno, role, kind, text))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- check log
+# The fact of each check (who looked, at which pane, how), never what was on
+# screen: peek content stays in the reading model's context. Under the shared
+# state dir, so a Codex session's checks land in the same log.
+LOG_NAME = "session_peers_log.jsonl"
+LOG_MAX = 1000   # trim past this many lines
+LOG_KEEP = 500   # lines kept after a trim
+
+
+def build_log_entry(panes, mode, peek_target=None, ts=None):
+    """Literal fields only. The caller is the self pane, or null: never a guess."""
+    me = next((p for p in panes if p.get("is_self")), None)
+    entry = {"ts": ts, "pane_id": me["pane_id"] if me else None,
+             "name": me["name"] if me else None, "mode": mode}
+    if peek_target is not None:
+        entry["peek_target"] = peek_target
+    return entry
+
+
+def trim_log_lines(lines, max_lines=LOG_MAX, keep=LOG_KEEP):
+    return lines if len(lines) <= max_lines else lines[-keep:]
+
+
+def log_path(cfg=None):
+    import notes_config
+    return notes_config.shared_state_path(LOG_NAME, cfg=cfg)
+
+
+def log_invocation(panes, mode, peek_target=None, path=None):
+    """Append this check to the log. Best effort: a failure never breaks a listing."""
+    try:
+        path = path or log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        entry = build_log_entry(panes, mode, peek_target,
+                                ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        with open(path, "a") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+        if len(lines) > LOG_MAX:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write("\n".join(trim_log_lines(lines)) + "\n")
+            os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def render_checks(lines, limit=20):
+    """Newest-first table of recent checks; malformed lines are dropped."""
+    entries = []
+    for l in lines:
+        try:
+            entries.append(json.loads(l))
+        except ValueError:
+            continue
+    if not entries:
+        return "no session_peers checks logged yet"
+    out = ["recent peer checks (newest first):"]
+    for e in reversed(entries[-limit:]):
+        tgt = " peek->%s" % e["peek_target"] if e.get("peek_target") else ""
+        out.append("  %s  %-6s %s  (%s%s)" % (e.get("ts") or "?", e.get("pane_id") or "?",
+                                             e.get("name") or "?", e.get("mode"), tgt))
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- harnesses
 # Agents other than Claude Code that run in tmux. Claude Code is recognized by the
 # version/model rule in parse_pane_line, and its empty-box test lives in
@@ -499,6 +788,15 @@ def session_sort_key(p):
     return (0, int(name), "") if name.isdigit() else (1, 0, name.lower())
 
 
+def display_name(p):
+    """The @display label when set, with the messaging name kept visible (you still
+    address the session by it), else just the name."""
+    label = p.get("label") or p["name"]
+    if label != p["name"]:
+        return "%s (msg: %s)" % (label, p["name"])
+    return p["name"] or "(unnamed)"
+
+
 def render_table(panes, show_all=False):
     rows = [p for p in panes if show_all or p["is_claude"]]
     if not rows:
@@ -511,7 +809,9 @@ def render_table(panes, show_all=False):
             p["tmux_session"] + ":" + p["window_index"],
             p["pane_id"],
             p["state"] or "-",
-            (p["name"] or "(unnamed)")[:30],
+            (display_name(p) if p["is_claude"] else
+             "%s [%s]" % (p["pane_current_command"], p["harness"]) if p.get("is_agent")
+             else p["pane_current_command"])[:30],
             cwd))
     return "\n".join(out)
 
@@ -634,9 +934,10 @@ def selftest():
     # ---- hook state over title state (no files: read and parents are stubbed)
     def hs(title, pane_id, pid):
         return parse_pane_line(_SEP.join(["4", "0", pane_id, title, "/w", pid, "2.1.281", "", "1", ""]))
-    recs = {"%1": {"state": "working", "claude_pid": "11"},   # claude is the pane process
-            "%2": {"state": "working", "claude_pid": "222"},  # claude is a child of the shell
-            "%3": {"state": "working", "claude_pid": "333"},  # an earlier claude, now gone
+    fresh = time.time()  # a "working" record needs a recent ts (see WORKING_MAX_S)
+    recs = {"%1": {"state": "working", "claude_pid": "11", "ts": fresh},   # the pane process
+            "%2": {"state": "working", "claude_pid": "222", "ts": fresh},  # child of the shell
+            "%3": {"state": "working", "claude_pid": "333", "ts": fresh},  # earlier claude, gone
             "%4": {"state": "idle", "claude_pid": "44"},
             "%5": {"state": "bogus", "claude_pid": "55"},
             "%6": {"state": "idle", "claude_pid": "66"}}
@@ -662,6 +963,168 @@ def selftest():
     check("hook: a non-claude pane is untouched",
           apply_hook_state([parse_pane_line(line("sh", "%1", cmd="zsh"))],
                            read=recs.get, parents=fake_parents)[0]["state"] == "")
+
+    # A "working" record can be stuck (an interrupted turn fires no Stop): age it out.
+    old = time.time() - (WORKING_MAX_S + 60)
+    age_recs = {"%10": {"state": "working", "claude_pid": "1010", "ts": old},
+                "%11": {"state": "working", "claude_pid": "1111", "ts": time.time()},
+                "%12": {"state": "working", "claude_pid": "1212", "ts": "garbage"},
+                "%13": {"state": "working", "claude_pid": "1313", "ts": "nan"},
+                "%14": {"state": "working", "claude_pid": "1414", "ts": "inf"},
+                "%15": {"state": "working", "claude_pid": "1515"},
+                "%16": {"state": "idle", "claude_pid": "1616", "ts": old}}
+    aged = apply_hook_state([hs(IDLE_GLYPH + " x", "%%%d" % n, str(n * 101))
+                             for n in range(10, 17)], read=age_recs.get, parents=dict)
+    ast = {p["pane_id"]: p["state"] for p in aged}
+    check("hook: an old working record reads idle (stuck interrupt)", ast["%10"] == "idle")
+    check("hook: a fresh working record reads working", ast["%11"] == "working")
+    check("hook: garbage, nan, inf or missing ts on a working record reads idle",
+          [ast[k] for k in ("%12", "%13", "%14", "%15")] == ["idle"] * 4)
+    check("hook: an old IDLE record still counts (no age limit)", ast["%16"] == "idle")
+
+    # ---- scrollback
+    check("scrollback args: last N lines",
+          scrollback_args("%3", 200) == ["capture-pane", "-p", "-e", "-N", "-t", "%3", "-S", "-200"])
+    check("scrollback args: 0, negative or None = full history",
+          [scrollback_args("%3", n)[-1] for n in (0, -5, None)] == ["-", "-", "-"])
+
+    # ---- check log
+    import tempfile
+    lpanes = [parse_pane_line(line(IDLE_GLYPH + " watcher", "%3"), self_pane="%3"),
+              parse_pane_line(line(IDLE_GLYPH + " other", "%1"), self_pane="%3")]
+    e = build_log_entry(lpanes, "list", ts="t")
+    check("log entry: caller is the self pane, no peek_target on a list",
+          e["pane_id"] == "%3" and e["name"] == "watcher" and "peek_target" not in e)
+    check("log entry: a peek records only the TARGET pane id",
+          build_log_entry(lpanes, "peek", peek_target="%1", ts="t")["peek_target"] == "%1")
+    e = build_log_entry(lpanes[1:], "list", ts="t")
+    check("log entry: no self pane -> null caller, never a guess",
+          e["pane_id"] is None and e["name"] is None)
+    check("log trim: past the threshold keeps the tail",
+          len(trim_log_lines(["x"] * (LOG_MAX + 1))) == LOG_KEEP
+          and len(trim_log_lines(["x"] * LOG_MAX)) == LOG_MAX)
+    with tempfile.TemporaryDirectory() as td:
+        lp = os.path.join(td, "sub", "log.jsonl")
+        log_invocation(lpanes, "list", path=lp)
+        log_invocation(lpanes, "peek", peek_target="%1", path=lp)
+        with open(lp) as fh:
+            logged = fh.read().splitlines()
+        check("log_invocation appends JSON lines (creating the dir)",
+              len(logged) == 2 and json.loads(logged[1])["peek_target"] == "%1")
+        shown = render_checks(logged + ["not json"])
+        check("render_checks shows caller and target, drops malformed lines",
+              "peek->%1" in shown and "watcher" in shown)
+    check("render_checks: empty log -> a note", render_checks([]).startswith("no session_peers"))
+    try:
+        log_invocation(lpanes, "list", path="/nonexistent-root-dir/x/log.jsonl")
+        check("log_invocation never raises", True)
+    except Exception:
+        check("log_invocation never raises", False)
+
+    # ---- display label in the roster
+    lab = parse_pane_line(_SEP.join(["4", "0", "%8", IDLE_GLYPH + " worker", "/w", "1",
+                                     "2.1.220", "", "1", "ticket 42"]))
+    check("display_name: label first, messaging name kept", display_name(lab)
+          == "ticket 42 (msg: worker)")
+    check("display_name: no label -> the name", display_name(lpanes[0]) == "watcher")
+
+    # ---- transcripts
+    global TRANSCRIPTS_ROOT, proc_start_epoch
+    check("transcript_files: no cwd -> (None, [])", transcript_files("") == (None, []))
+    with tempfile.TemporaryDirectory() as td:
+        saved_root, TRANSCRIPTS_ROOT = TRANSCRIPTS_ROOT, td
+        try:
+            import notes_config
+            fake_cwd = "/fake/peer/.cwd"
+            d = os.path.join(td, notes_config.encode_project_dir(fake_cwd))
+            check("transcript_files: missing dir -> no files", transcript_files(fake_cwd)[1] == [])
+            os.makedirs(d)
+            f1 = os.path.join(d, "s1.jsonl")
+            with open(f1, "w") as fh:
+                fh.write("{}\n")
+            check("transcript_files: cwd -> Claude Code's folder name ('.' too) -> files",
+                  transcript_files(fake_cwd) == (d, [f1]) and "--cwd" in d)
+        finally:
+            TRANSCRIPTS_ROOT = saved_root
+
+        jsonl = os.path.join(td, "sess.jsonl")
+        rows = [
+            {"type": "user", "message": {"role": "user", "content": "hi there"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "checking the RELEASE-7 notes"},
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "grep RELEASE-7 notes.md"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "no matches"}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "list-shaped result"}]}]}},
+            {"type": "queue-operation", "operation": "x"},
+        ]
+        with open(jsonl, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+            fh.write('{"type": "user", "message": {"role":')  # torn last write
+        ev = extract_transcript_events(jsonl)
+        check("transcript events: 5 real events; other types and a torn line skipped",
+              len(ev) == 5 and ev[0] == (1, "user", "text", "hi there"))
+        check("transcript events: tool_use carries its input",
+              ev[2][2] == "tool_use:Bash" and "grep RELEASE-7" in ev[2][3])
+        check("transcript events: string and list tool_result content",
+              ev[3] == (3, "user", "tool_result", "no matches") and ev[4][3] == "list-shaped result")
+        hits = transcript_grep(jsonl, "release-7")
+        check("transcript_grep: case-insensitive filter", len(hits) == 2)
+        check("transcript_grep: no pattern -> bounded tail",
+              transcript_grep(jsonl, None, limit=2) == ev[-2:])
+        check("render_transcript_events: truncates and notes empty",
+              "…" in render_transcript_events(ev, snippet_len=5)
+              and "no matching" in render_transcript_events([]))
+
+        # resolve_pane_transcript: registry first, refuse rather than guess.
+        fa, fb = os.path.join(td, "sa.jsonl"), os.path.join(td, "sb.jsonl")
+        pane_a = {"pane_id": "%10", "cwd": "/shared", "pane_pid": "500"}
+        reg = {"%10": {"session_id": "sa", "claude_pid": "500"}}
+        t, how, _ = resolve_pane_transcript(pane_a, registry=reg, files=[fb, fa])
+        check("resolve: the registry wins over newest-first order", t == fa and how == "registry")
+        t, how, d = resolve_pane_transcript(pane_a, registry={}, files=[fb, fa])
+        check("resolve: unregistered + 2 candidates -> refuse",
+              t is None and "cannot be identified" in d)
+        t, _, d = resolve_pane_transcript(pane_a, registry={"%10": {"session_id": "sa",
+                                                                   "claude_pid": ""}},
+                                          files=[fa])
+        check("resolve: a registry entry without a pid -> refuse", t is None and "cannot be verified" in d)
+        t, _, d = resolve_pane_transcript(dict(pane_a, pane_pid="999"), registry=reg, files=[fa])
+        check("resolve: pid mismatch (reused pane id) -> refuse", t is None and "reused" in d)
+        t, _, d = resolve_pane_transcript(pane_a, registry={"%10": {"session_id": "ghost",
+                                                                   "claude_pid": "500"}},
+                                          files=[fa])
+        check("resolve: registered session with no file -> refuse", t is None and "ghost.jsonl" in d)
+        t, _, d = resolve_pane_transcript(pane_a, registry={}, files=[])
+        check("resolve: no transcript at all -> refuse", t is None and "no transcript" in d)
+
+        saved_pse = proc_start_epoch
+        proc_start_epoch = lambda pid: (time.time() - 5 if str(pid) == "999999" else None)
+        try:
+            live = os.path.join(td, "live.jsonl")
+            with open(live, "w") as fh:
+                fh.write("{}\n")
+            pane_l = {"pane_id": "%11", "cwd": "/shared", "pane_pid": "999999"}
+            t, how, _ = resolve_pane_transcript(pane_l, registry={}, files=[live])
+            check("resolve: sole candidate written since the pane started -> resolve",
+                  t == live and how == "sole-candidate")
+            os.utime(live, (time.time() - 3600, time.time() - 3600))
+            t, _, d = resolve_pane_transcript(pane_l, registry={}, files=[live])
+            check("resolve: sole candidate older than the pane process -> refuse",
+                  t is None and "earlier session" in d)
+            t, _, d = resolve_pane_transcript(dict(pane_l, pane_pid=""), registry={}, files=[live])
+            check("resolve: sole candidate + unreadable pane start -> refuse",
+                  t is None and "unreadable" in d)
+        finally:
+            proc_start_epoch = saved_pse
+    check("proc_start_epoch: refuses a non-numeric pid", proc_start_epoch("abc") is None)
+    real = proc_start_epoch(os.getpid())
+    check("proc_start_epoch: our own pid started in the past (or ps is unavailable)",
+          real is None or real <= time.time() + 5)
 
     # ---- lineage: --tree and --me over synthetic registry data (no tmux, no files)
     import session_lineage as sl
@@ -833,6 +1296,16 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--peek", metavar="NAME")
     ap.add_argument("--lines", type=int, default=0, help="with --peek: last N lines")
+    ap.add_argument("--scrollback", nargs="?", const=SCROLLBACK_DEFAULT, type=int, metavar="N",
+                    help="with --peek: tmux history instead of the visible screen "
+                         "(default %d lines; 0 = all of it)" % SCROLLBACK_DEFAULT)
+    ap.add_argument("--transcript", action="store_true",
+                    help="with --peek: that session's on-disk transcript (every tool call "
+                         "and result; may lag the pane by a turn)")
+    ap.add_argument("--grep", metavar="PATTERN",
+                    help="with --peek --transcript: only events matching PATTERN")
+    ap.add_argument("--checks", nargs="?", const=20, type=int, metavar="N",
+                    help="the last N (default 20) logged peer checks, newest first")
     ap.add_argument("--tree", action="store_true",
                     help="Claude sessions as a parent/child tree (who launched whom)")
     ap.add_argument("--me", action="store_true",
@@ -841,6 +1314,14 @@ def main():
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.checks is not None:
+        try:
+            with open(log_path()) as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+        print(render_checks(lines, args.checks))
+        return 0
 
     panes = list_peers()
     if panes is None:
@@ -849,6 +1330,8 @@ def main():
     if args.tree or args.me:
         import session_lineage
         registry, live = session_lineage.read_registry(), session_lineage.live_sessions()
+        if args.tree:
+            log_invocation(panes, "tree")
         print(render_tree(panes, registry, live) if args.tree
               else render_me(panes, registry, live))
         return 0
@@ -859,13 +1342,39 @@ def main():
             print("session_peers: %r matched %s" % (
                 args.peek, "several: " + names if cands else "nothing"), file=sys.stderr)
             return 1
-        shot = peek(pane, args.lines)
+        head = "--- %s [%s] (%s, %s)" % (display_name(pane), pane["tmux_session"],
+                                         pane["pane_id"], pane["state"] or "-")
+        if args.transcript:
+            target, how, detail = resolve_pane_transcript(pane)
+            if target is None:
+                print("session_peers: cannot identify %s's transcript: %s"
+                      % (pane["pane_id"], detail), file=sys.stderr)
+                return 1
+            events = transcript_grep(target, args.grep, limit=40 if args.grep else 8)
+            log_invocation(panes, "peek", peek_target=pane["pane_id"])
+            print("%s transcript %s (%s)%s; may lag the pane by a turn; judgment-only, "
+                  "never persist ---" % (
+                head, os.path.basename(target), how,
+                ", grep %r" % args.grep if args.grep else ", last few events"))
+            print(render_transcript_events(events))
+            if not args.grep:
+                print("  (--grep PATTERN searches the whole transcript)")
+            return 0
+        if args.scrollback is not None:
+            shot = peek_scrollback(pane, args.scrollback)
+            what = ("all scrollback" if args.scrollback <= 0
+                    else "last %d lines of scrollback" % args.scrollback)
+        else:
+            shot = peek(pane, args.lines)
+            what = "visible screen"
         if shot is None:
             print("session_peers: capture-pane failed for %s" % pane["pane_id"], file=sys.stderr)
             return 1
-        print("--- %s (%s, %s) visible screen ---" % (pane["name"], pane["pane_id"], pane["state"]))
+        log_invocation(panes, "peek", peek_target=pane["pane_id"])
+        print("%s %s, instantly stale; judgment-only, never persist ---" % (head, what))
         print("\n".join(shot))
         return 0
+    log_invocation(panes, "json" if args.json else "list")
     if args.json:
         rows = [p for p in panes if args.all or p["is_claude"]]
         print(json.dumps(rows, indent=2))
