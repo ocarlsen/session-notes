@@ -12,7 +12,8 @@ the next $reflect, or run $reflect if the user asks for it now.
 
 ## Codex and other sessions
 - Never run `tmux send-keys` (or anything else that types) into another pane. If
-  `session_bus.py send` fails, tell the user what you wanted to send instead of finding
-  another way to reach that session.
+  `session_bus.py send` is refused, do what its message says (usually: run it again with
+  the user's approval to run outside the sandbox). If it still cannot send, tell the user
+  what you wanted to send instead of finding another way to reach that session.
 - Codex's sandbox refuses the tmux socket, so tmux commands (session_peers included) need
   to run outside it: ask for approval, or see docs/codex.md for allow rules.
