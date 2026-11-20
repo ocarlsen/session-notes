@@ -8,7 +8,8 @@ description: "End-of-session reflection for Codex: checks for uncommitted work, 
 ## First: find the checkout (do not trust the working folder)
 
 Run this once and use the path it prints, as a literal absolute path, everywhere this skill or the
-adapter says `$SESSION_NOTES`. Put `SESSION_NOTES_AGENT=codex` in front of every helper call.
+adapter says `$SESSION_NOTES`. Put `SESSION_NOTES_AGENT=codex` in front of every helper call
+except `codex_save.py commit`, which must run with exactly its own text.
 
 ```bash
 python3 -c "import os; p=os.path.realpath(os.path.expanduser(os.environ.get('CODEX_HOME','~/.codex')+'/skills/reflect')); print(p.rsplit('/skills/codex/',1)[0])"
@@ -27,8 +28,9 @@ Codex-specific points that matter most here:
 
 - Stores come from `python3 $SESSION_NOTES/bin/notes_config.py --stores` (Codex mode). Create
   the store directory on its first write; an empty or missing store is the normal start.
-- Take the reflect lock at its Step 5 (`python3 $SESSION_NOTES/bin/reflect_lock.py acquire`),
-  wait in foreground 60-second slices if it is held, and release it in Step 8, even when you
-  abort.
+- Steps 5 to 5b write through `codex_save.py` only (adapter, "Writing memory"): stage every
+  memory file, index line and RESUME change, then run `python3 $SESSION_NOTES/bin/codex_save.py
+  commit` once, as a command on its own with exactly that text. Commit takes and releases the
+  reflect lock itself, so skip the skill's own acquire (Step 5) and release (Step 8).
 - Nothing under `~/.claude` is read or written. If a step seems to need it, skip that step and
   say so in one line.

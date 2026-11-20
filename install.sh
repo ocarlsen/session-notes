@@ -158,6 +158,30 @@ TOML
   else
     echo "Add to $(tilde "$CT") by hand, merging into any table of the same name:"; echo "$CODEX_TOML"
   fi
+  # The desktop app ignores writable_roots, so each write to the store is an approval prompt.
+  # Saves go through one fixed command line; this rule approves exactly that line, nothing else.
+  RULES="$CODEX_DIR/rules/default.rules"
+  CODEX_RULES=$(cat <<RULE
+prefix_rule(pattern=["/bin/zsh", "-lc", "python3 $REPO/bin/codex_save.py commit"], decision="allow")
+prefix_rule(pattern=["python3", "$REPO/bin/codex_save.py", "commit"], decision="allow")
+RULE
+)
+  echo
+  if grep -qF "$REPO/bin/codex_save.py\", \"commit\"" "$RULES" 2>/dev/null; then
+    echo "$(tilde "$RULES") already approves codex_save.py commit."
+  elif [ "$ASK" = 1 ]; then
+    echo "Would add to $(tilde "$RULES") (approves only the exact save command, so the app stops asking):"
+    echo "$CODEX_RULES"
+    if ask "Add it?"; then
+      run mkdir -p "$CODEX_DIR/rules"
+      if [ -e "$RULES" ]; then cp "$RULES" "$RULES.bak-session-notes"; fi
+      printf '%s\n' "$CODEX_RULES" >> "$RULES"; echo "added to $(tilde "$RULES")"
+    else
+      echo "Skipped the rule; the app will ask once per save."
+    fi
+  else
+    echo "Add to $(tilde "$RULES") by hand:"; echo "$CODEX_RULES"
+  fi
   # Without this, a "remember X" turn makes Codex hand-write the store before any skill loads.
   AG="$CODEX_DIR/AGENTS.md"
   echo

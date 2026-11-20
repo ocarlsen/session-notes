@@ -7,7 +7,8 @@ every substitution below applied. Where a substitution says "skip", skip the ste
 `$SESSION_NOTES` below means the checkout path each Codex SKILL.md resolves first, from its own
 symlink. Do not rely on the environment variable alone: a session started from Codex's agent
 command center can run without it. Every helper call gets `SESSION_NOTES_AGENT=codex` in front,
-or the helpers resolve Claude's stores. Never run a `bin/` script from the current folder.
+or the helpers resolve Claude's stores. The one exception is `codex_save.py commit` (see Writing
+memory), which sets codex mode itself and must run with exactly its own text. Never run a `bin/` script from the current folder.
 
 ## Two memories, never one
 
@@ -19,9 +20,26 @@ the Claude home; do not work around that.
 ## Writing memory
 
 Only the reflect procedure writes the store. When the user says "remember this" outside
-`$reflect`, say it will be saved at the next `$reflect` (or run `$reflect` if they ask), and do
-not write store files by hand: a hand-written MEMORY.md line skips the index helper's checks.
-New index lines go through `append_memory_index.py`, never an editor or a heredoc.
+`$reflect`, say it will be saved at the next `$reflect` (or run `$reflect` if they ask).
+
+Every write to the store goes through `codex_save.py`, in two steps, and nothing else: no
+apply_patch, editor, heredoc or `append_memory_index.py` call into `~/.codex/session-notes`, and
+no `reflect_lock.py acquire`/`release` of your own. The split is what keeps the desktop app from
+asking for approval on every write.
+
+1. **Stage** each change (runs inside the sandbox; it only writes `/tmp`):
+   - a memory file: `SESSION_NOTES_AGENT=codex python3 $SESSION_NOTES/bin/codex_save.py stage --store global --file NAME.md` with the whole file on stdin (`<<'EOF'`)
+   - its index line: `SESSION_NOTES_AGENT=codex python3 $SESSION_NOTES/bin/codex_save.py stage --store global --index-line "- [Title](NAME.md) - hook"`
+   - RESUME.md: first `... codex_save.py hash --store project` (or `global`) when you READ it,
+     then `... codex_save.py stage --store project --resume --base <that hash>` with the whole new
+     file on stdin.
+   `--store project` is this folder's project store; `global` is the global one.
+2. **Commit**, as a command on its own, with exactly this text and nothing before or after it (no
+   `cd`, no env prefix, no `&&`), so the saved approval rule matches:
+   `python3 $SESSION_NOTES/bin/codex_save.py commit`
+   It waits for the reflect lock if another session holds it, applies the queue in order, and
+   releases the lock. A line starting `SKIPPED` means RESUME changed since you read it: re-read,
+   merge, stage again, commit again.
 
 ## Reporting a refresh
 
@@ -34,7 +52,8 @@ NEW to this session: report each item as new, never "no material changes".
 | In the shared skill | In Codex |
 |---|---|
 | the config's stores (`paths.global_store`, a scope's `store`) | `python3 $SESSION_NOTES/bin/notes_config.py --stores` prints this cwd's `global` and `project` stores. `project` is the configured scope holding cwd, else the cwd's git root, else null (global only). |
-| `--scope NAME` for append_memory_index.py | pass the index path instead: `append_memory_index.py <project or global store>/MEMORY.md "<line>"` |
+| `append_memory_index.py`, writing a memory file, editing RESUME.md | `codex_save.py stage` then `codex_save.py commit` (see Writing memory) |
+| `reflect_lock.py acquire` / `wait` / `release` | none: `codex_save.py commit` takes, waits for and releases the lock |
 | `<paths.claude_home>` | `<paths.agent_home>` (the Codex home, `~/.codex`) |
 | CLAUDE.md (global and project) | AGENTS.md: global `~/.codex/AGENTS.md`; project = the AGENTS.md files from the git root down to cwd. Codex caps their combined size at 32 KiB and has no `@import`. |
 | "loads via `@import` in CLAUDE.md"; "add the import or the store is an orphan" | the Codex SessionStart hook loads both stores' MEMORY.md and RESUME.md at startup, resume and after compaction. No import to add. A file over the hook's budget is named, not loaded, so keep MEMORY.md and RESUME.md short. |
@@ -47,7 +66,7 @@ NEW to this session: report each item as new, never "no material changes".
 |---|---|
 | Read / Edit / Write tools | read with the shell (`cat`, `sed -n`), edit with apply_patch |
 | invoke another skill via the Skill tool | do not chain: follow that skill's procedure inline, as the Codex rnr skill spells out |
-| a command run backgrounded (`run_in_background: true`) | run it in the foreground in short slices: `reflect_lock.py wait --timeout 60`, repeated up to 15 times while it exits 2, saying once whose lock you are waiting on. Still never ask "wait or go?". After 15 slices, report a stuck holder and ask. |
+| a command run backgrounded (`run_in_background: true`) | run it in the foreground. `codex_save.py commit` waits up to 15 minutes for the lock by itself; if it exits 2 (timeout), report the stuck holder and ask. Never ask "wait or go?". |
 | `session_peers.py`, `--peek`, ListAgents, SendMessage, the bus | skip: sibling peeks and messages are Claude Code and tmux only for now. Say nothing about siblings. |
 | "Skill tool calls" when listing skills used (reflect Step 2b) | skills the user invoked as `$name` this session |
 | `boot_budget.py`, `memory_hygiene_canary.py`, `skill_feedback.py canary` | skip them. In codex mode each prints a one-line skip and exits 0, so if one runs anyway, that line is not a finding. |
