@@ -6,9 +6,9 @@
 # [[pair]] or in repo_only; the drift check fails on an unmapped file so a new file is a
 # decision, not an omission.
 
-# bcast, bus_nudge, session_bus and the bus hook are canonical HERE: an upstream config
+# bcast, bus_nudge, session_bus, reflect_lock and the bus hook are canonical HERE: an upstream config
 # links to them instead of keeping its own copy, so there is nothing upstream to drift from.
-repo_only = ["bin/bcast.py", "bin/bus_nudge.py", "bin/codex_save.py", "bin/notes_config.py", "bin/session_bus.py", "bin/session_peers.py", "bin/setup_claude.py", "hooks/codex_session_start.py", "hooks/session_bus_hook.py", "skills/codex/reflect/SKILL.md", "skills/codex/refresh/SKILL.md", "skills/codex/rnr/SKILL.md"]
+repo_only = ["bin/bcast.py", "bin/bus_nudge.py", "bin/codex_save.py", "bin/notes_config.py", "bin/reflect_lock.py", "bin/session_bus.py", "bin/session_peers.py", "bin/setup_claude.py", "hooks/codex_session_start.py", "hooks/session_bus_hook.py", "skills/codex/reflect/SKILL.md", "skills/codex/refresh/SKILL.md", "skills/codex/rnr/SKILL.md"]
 
 [[pair]]
 repo = "bin/append_memory_index.py"
@@ -33,10 +33,6 @@ upstream = "bin/memory_index_lint.py"
 [[pair]]
 repo = "bin/skill_feedback.py"
 upstream = "bin/skill_feedback.py"
-
-[[pair]]
-repo = "bin/reflect_lock.py"
-upstream = "bin/reflect_lock.py"
 
 [[pair]]
 repo = "bin/session_lineage.py"
