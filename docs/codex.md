@@ -67,9 +67,16 @@ resumed session (`codex resume`) runs commands in a daemon with no `TMUX_PANE`.
 approval prompt, a running turn or typed text). A bare slash command such as `/refresh`
 goes to Claude panes only: Codex rejects one it does not know and leaves it typed in the box.
 
-Sending FROM Codex does not work yet: `session_bus.py send` needs to know which session
-is sending. A resumed session's commands run in a daemon with no `TMUX_PANE`, so it cannot
-tell, whether or not the command is sandboxed.
+Sending FROM Codex works when Codex is started with `codex --no-daemon`, and each send is
+approved to run outside the sandbox. `send` names the sender by asking tmux about its own
+pane, so it needs both:
+- **`--no-daemon`:** by default every Codex session runs its commands in one shared
+  background process (`codex app-server`) that may have started outside tmux, so a command
+  has no `TMUX_PANE` and cannot say which session is sending. With `--no-daemon`, commands
+  run from the pane and keep it.
+- **Approval outside the sandbox:** the sandbox refuses the tmux socket, so the lookup fails
+  inside it. Approve the send when Codex asks, or add an allow rule for
+  `<bin>/session_bus.py send` if you want Codex to send without asking.
 
 To let the read-only session tools run without an approval prompt each time, add rules
 like these to `~/.codex/rules/default.rules` (replace `<bin>` with the directory holding

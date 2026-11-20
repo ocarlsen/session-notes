@@ -546,13 +546,24 @@ def in_codex(env=None):
 
 
 def no_address_note(env=None):
-    """Why `send` refused, worded so the reading agent does the right thing next."""
+    """Why `send` refused, worded so the reading agent does the right thing next.
+    Two different causes: no $TMUX_PANE at all (the command is not running from a
+    pane), or a pane but no answer from tmux (in Codex, the sandbox refuses the
+    tmux socket, and the same command works once run outside the sandbox)."""
+    env = os.environ if env is None else env
+    never = " Do not type into another pane (tmux send-keys) to reach it."
+    if env.get("TMUX") and env.get("TMUX_PANE"):
+        if in_codex(env):
+            return ("session_bus: the sandbox blocked the tmux lookup that tells which "
+                    "session is sending. Run this same command again, asking the user to "
+                    "approve running it outside the sandbox." + never)
+        return ("session_bus: tmux did not answer for pane %s, so this session's "
+                "address is unknown; cannot send." % env["TMUX_PANE"])
     if in_codex(env):
-        return ("session_bus: Codex sessions can't send bus mail yet. Codex runs shell "
-                "commands outside the tmux pane, so this command cannot tell which "
-                "session is sending, and the sender name is what every reader trusts. "
-                "Tell the user what you wanted to send and to whom. Do not type into "
-                "another pane (tmux send-keys) to reach it.")
+        return ("session_bus: this Codex command does not know its tmux pane "
+                "($TMUX_PANE is unset), so it cannot say which session is sending. "
+                "Codex keeps the pane only when started with `codex --no-daemon`. Tell "
+                "the user what you wanted to send and to whom." + never)
     return ("session_bus: this command does not know its tmux pane ($TMUX_PANE is "
             "unset), so this session has no address; cannot send.")
 
@@ -1135,10 +1146,16 @@ def selftest():
         check("session_info refuses without TMUX_PANE (no current-client guess)",
               session_info({"TMUX": "/tmp/tmux-1/default,1,0"}) == (None, None))
         check("session_info refuses outside tmux", session_info({}) == (None, None))
-        check("send's refusal tells a Codex agent to ask the user, not send-keys",
-              "Tell the user" in no_address_note({"SESSION_NOTES_AGENT": "codex"})
-              and "send-keys" in no_address_note({"CODEX_THREAD_ID": "t1"}))
-        check("send's refusal outside Codex names the missing pane",
+        cx_pane = {"SESSION_NOTES_AGENT": "codex", "TMUX": "/t,1,0", "TMUX_PANE": "%9"}
+        check("Codex with a pane (sandbox blocked tmux): ask approval to run outside it",
+              "outside the sandbox" in no_address_note(cx_pane)
+              and "send-keys" in no_address_note(cx_pane))
+        check("Codex without a pane: names --no-daemon and says tell the user",
+              "--no-daemon" in no_address_note({"CODEX_THREAD_ID": "t1"})
+              and "Tell" in no_address_note({"CODEX_THREAD_ID": "t1"}))
+        check("outside Codex, a pane tmux did not answer for is named",
+              "%9" in no_address_note({"TMUX": "/t,1,0", "TMUX_PANE": "%9"}))
+        check("outside Codex, no pane: names the missing $TMUX_PANE",
               "TMUX_PANE" in no_address_note({}))
 
         # The pull names its mailbox; the address must be tmux-shaped only.
