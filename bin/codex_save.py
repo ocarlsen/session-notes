@@ -206,6 +206,10 @@ def commit(timeout=LOCK_TIMEOUT):
                 rc = 1
             print(report)
             os.unlink(p)
+        try:
+            os.rmdir(d)  # only succeeds when the queue is empty
+        except OSError:
+            pass
     finally:
         if took_it:
             try:
@@ -300,6 +304,7 @@ def selftest():
                   and "- [X](user_x.md) - hook" in open(os.path.join(g, "MEMORY.md")).read())
             check("commit releases the lock", reflect_lock.read_lock()[0] is None)
             check("queue cleared", run(["commit"])[1].strip() == "nothing staged for this thread")
+            check("empty queue folder removed", not os.path.exists(queue_dir()))
 
             rc, _, err = run(["stage", "--store", "global", "--file", "../evil.md"], "x")
             check("path traversal refused", rc == 2 and "plain NAME.md" in err)
