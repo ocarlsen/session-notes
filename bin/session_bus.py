@@ -177,17 +177,17 @@ STATE_MAX_AGE = 7 * 86400   # prune dead sessions' state files after a week
 # the server-restart case rather than ordinary churn.
 
 def session_info(env=None):
-    """(name, created_epoch) for THIS session; (None, None) outside tmux."""
+    """(name, created_epoch) for THIS session; (None, None) outside tmux, or
+    when the pane is unknown. Without TMUX_PANE there is no safe answer: a bare
+    `tmux display-message` resolves against the most recently used client,
+    which is whatever pane the user last typed in, so it would name ANOTHER
+    session (observed from a Codex shell). A sender label built on that guess
+    would be a forgery, so refuse instead."""
     env = os.environ if env is None else env
-    if not env.get("TMUX"):
-        return None, None
     pane = env.get("TMUX_PANE")
-    cmd = ["tmux", "display-message", "-p"]
-    if pane:
-        # Pin to OUR pane: a bare display-message resolves against the
-        # "current" client, which is whatever pane the user is looking at.
-        cmd += ["-t", pane]
-    cmd += ["#S\t#{session_created}"]
+    if not env.get("TMUX") or not pane:
+        return None, None
+    cmd = ["tmux", "display-message", "-p", "-t", pane, "#S\t#{session_created}"]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     except Exception:
@@ -538,6 +538,25 @@ def record_done(key, pane, seen_dir=None, turn_dir=None, path=None):
 
 # --- commands ---------------------------------------------------------------
 
+def in_codex(env=None):
+    """True in a shell command Codex runs: its config sets SESSION_NOTES_AGENT,
+    and Codex itself sets CODEX_THREAD_ID."""
+    env = os.environ if env is None else env
+    return env.get("SESSION_NOTES_AGENT") == "codex" or bool(env.get("CODEX_THREAD_ID"))
+
+
+def no_address_note(env=None):
+    """Why `send` refused, worded so the reading agent does the right thing next."""
+    if in_codex(env):
+        return ("session_bus: Codex sessions can't send bus mail yet. Codex runs shell "
+                "commands outside the tmux pane, so this command cannot tell which "
+                "session is sending, and the sender name is what every reader trusts. "
+                "Tell the user what you wanted to send and to whom. Do not type into "
+                "another pane (tmux send-keys) to reach it.")
+    return ("session_bus: this command does not know its tmux pane ($TMUX_PANE is "
+            "unset), so this session has no address; cannot send.")
+
+
 def cmd_send(args):
     if args.all and not args.broadcast_confirm:
         print("session_bus: --all reaches EVERY live session in EVERY project on "
@@ -556,8 +575,7 @@ def cmd_send(args):
         return 2
     me, me_created = session_info()
     if not me:
-        print("session_bus: not inside tmux, so this session has no address; "
-              "cannot send.", file=sys.stderr)
+        print(no_address_note(), file=sys.stderr)
         return 2
     # Flatten: the injection frame is line-structured, so a body that keeps its
     # newlines can forge a second "session N says" bullet. See TRUST MODEL.
@@ -666,7 +684,10 @@ def cmd_inbox(args):
     else:
         me, created = session_info()
     if not me:
-        print("session_bus: not inside tmux; no address, no inbox.", file=sys.stderr)
+        print("session_bus: this command does not know its tmux pane ($TMUX_PANE is "
+              "unset), so it has no address and no inbox. In a Codex pane, run the exact "
+              "`inbox --nudged --as <session>:<created>` command the bus-nudge line gives.",
+              file=sys.stderr)
         return 2
     if getattr(args, "nudged", False):
         pending = nudged_view(undelivered(me, created=created, deliveries=HOOKLESS_DELIVERIES))
@@ -1109,6 +1130,16 @@ def selftest():
                 os.environ.pop("SESSION_NOTES_AGENT", None)
             else:
                 os.environ["SESSION_NOTES_AGENT"] = saved_agent
+
+        # No pane, no identity: never guess the sender from tmux's "current" client.
+        check("session_info refuses without TMUX_PANE (no current-client guess)",
+              session_info({"TMUX": "/tmp/tmux-1/default,1,0"}) == (None, None))
+        check("session_info refuses outside tmux", session_info({}) == (None, None))
+        check("send's refusal tells a Codex agent to ask the user, not send-keys",
+              "Tell the user" in no_address_note({"SESSION_NOTES_AGENT": "codex"})
+              and "send-keys" in no_address_note({"CODEX_THREAD_ID": "t1"}))
+        check("send's refusal outside Codex names the missing pane",
+              "TMUX_PANE" in no_address_note({}))
 
         # The pull names its mailbox; the address must be tmux-shaped only.
         check("as_address/parse_address round-trip",
