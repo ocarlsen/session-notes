@@ -332,13 +332,29 @@ def _selftest():
             fails.append(name)
 
     # No pane, no tmux name: never the current client's session (would hand a plain
-    # shell another session's lock identity).
+    # shell another session's lock identity). tmux is stubbed to ANSWER, the way a
+    # real server does for a bare display-message, so this is red on code that asks
+    # without a pane.
     saved_env = {k: os.environ.get(k) for k in ("TMUX", "TMUX_PANE")}
+    saved_run, calls = subprocess.run, []
+
+    class _Out:
+        stdout = "other-session\n"
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        return _Out()
     try:
+        subprocess.run = fake_run
         os.environ["TMUX"] = "/tmp/tmux-selftest/default,1,0"
         os.environ.pop("TMUX_PANE", None)
-        check("tmux name without TMUX_PANE", _tmux_name(), None)
+        check("tmux name without TMUX_PANE (tmux would answer)", _tmux_name(), None)
+        check("no tmux call without a pane", calls, [])
+        os.environ["TMUX_PANE"] = "%7"
+        check("tmux name with a pane", _tmux_name(), "other-session")
+        check("the lookup is pinned to that pane", "-t" in calls[-1] and "%7" in calls[-1], True)
     finally:
+        subprocess.run = saved_run
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
