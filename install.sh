@@ -158,6 +158,22 @@ TOML
   else
     echo "Add to $(tilde "$CT") by hand, merging into any table of the same name:"; echo "$CODEX_TOML"
   fi
+  # Without this, a "remember X" turn makes Codex hand-write the store before any skill loads.
+  AG="$CODEX_DIR/AGENTS.md"
+  echo
+  if grep -q '^## session-notes memory' "$AG" 2>/dev/null; then
+    echo "$(tilde "$AG") already has the session-notes lines."
+  elif [ "$ASK" = 1 ]; then
+    echo "Would add to $(tilde "$AG") (read by Codex at every session start):"; cat "$REPO/AGENTS.snippet.md"
+    if ask "Add it (keeping a .bak-session-notes copy)?"; then
+      if [ -e "$AG" ]; then cp "$AG" "$AG.bak-session-notes"; printf '\n' >> "$AG"; fi
+      cat "$REPO/AGENTS.snippet.md" >> "$AG"; echo "added to $(tilde "$AG")"
+    else
+      echo "Skipped AGENTS.md."
+    fi
+  else
+    echo "Add to $(tilde "$AG") by hand:"; cat "$REPO/AGENTS.snippet.md"
+  fi
   cat <<TXT
 
 Then trust the hook: /hooks in the Codex CLI, or Settings > Hooks in the desktop app.

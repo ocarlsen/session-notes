@@ -44,6 +44,9 @@ It asks `[y/N]` before each step:
    `SESSION_NOTES_AGENT`. `sandbox_workspace_write.writable_roots` lets
    `$reflect` write `~/.codex/session-notes` from the default sandbox. If
    either table already exists, the text is printed instead.
+4. Add [`AGENTS.snippet.md`](../AGENTS.snippet.md) to `~/.codex/AGENTS.md`. It tells
+   Codex that only `$reflect` writes the store. Without it, a "remember this"
+   turn makes Codex write memory files by hand before any skill loads.
 
 Then trust the hook: `/hooks` in the CLI, or Settings > Hooks in the app. Codex
 trusts a hook by its hash, so an edited hook needs trusting again.
