@@ -404,8 +404,12 @@ def selftest():
     assert compose("/tmp/notes.txt is ready", marker="[m]") == "[m] /tmp/notes.txt is ready"
     assert compose("check the bus", marker="[m]") == "[m] check the bus"
     assert compose("check the bus") == "%s check the bus" % prefix()
-    assert prefix() == notes_config.DEFAULTS["bcast"]["prefix"]
-    assert "user" in prefix()
+    # The DEFAULT marker names no one. Checked against a config-less load, so this
+    # selftest also passes on a machine whose config sets its own prefix.
+    defaults = notes_config.load(path=os.path.join(os.path.dirname(BIN), ".no-such-config"),
+                                 env={})
+    assert prefix(defaults) == notes_config.DEFAULTS["bcast"]["prefix"]
+    assert "user" in prefix(defaults)
     assert compose("check the bus", no_prefix=True) == "check the bus"
     for bad, why in (("", "empty"), ("a\nb", "multiline")):
         try:
