@@ -94,11 +94,11 @@ working tree.
 | --- | --- |
 | `wt.py new <name>` | Fetch, then `git worktree add <path> -b <name> origin/<default>`; prints the path. On a repo's first use it installs the pre-commit hook (below). |
 | `wt.py pr [--title T] [--body B] [--dry-run]` | From a worktree on a non-default branch: refuses a dirty tree (exit 4) and a branch that already has a MERGED PR (exit 5), then pushes and opens the PR. `--dry-run` prints the push and create commands and runs nothing. wt never auto-commits. |
-| `wt.py merge [name] [--dry-run]` | Refuses a dirty or unpushed worktree (4), runs the verdict gate (6), then squash-merges, removes the worktree and its local branch, and fast-forwards the main checkout if it is on the default branch and clean. |
-| `wt.py list` | The repo's worktrees: dirty, commits ahead of origin, PR state (`?` offline). |
-| `wt.py rm <name> [--force]` | Removes a worktree and branch; refuses dirty or unpushed work without `--force`. |
-| `wt.py gc [--yes]` | Lists worktrees whose PR is merged or closed, or whose remote branch is gone. Skips, and says why, any that is dirty or holds commits on no remote branch. Asks y/N per item on a terminal; `--yes` removes all listed; without a terminal and without `--yes` it only lists. Run it by hand, never from a scheduled job. |
-| `wt.py install-hooks [repo]` | Installs the pre-commit (below). |
+| `wt.py merge [name] [--dry-run]` | Refuses a dirty or unpushed worktree (4), runs the verdict gate (6), then squash-merges (pinned to the gated head with `--match-head-commit`, so a later push cannot slip in), removes the worktree and its local branch (kept, with a note, if it gained work since the gate), and fast-forwards the main checkout if it is on the default branch and clean. |
+| `wt.py list` | The repo's worktrees: dirty, commits ahead of origin, PR state (`?` offline). A worktree whose directory was deleted by hand shows as its own `missing` row. |
+| `wt.py rm <name> [--force]` | Removes a worktree and branch; refuses dirty work, or commits reachable from HEAD that are on no remote branch (a detached HEAD included), without `--force`. |
+| `wt.py gc [--yes]` | Lists worktrees whose PR is merged or closed, or whose remote branch is gone. Skips, and says why, any that is dirty or holds commits on no remote branch. Asks y/N per item on a terminal; `--yes` removes all listed; without a terminal and without `--yes` it only lists. A worktree whose directory is gone is offered for `git worktree prune` under the same rule. Run it by hand, never from a scheduled job. |
+| `wt.py install-hooks [repo] [--dry-run]` | Installs or repairs the pre-commit (below); `--dry-run` writes nothing (`sh install.sh --dry-run --git-hooks <repo>` does the same). |
 
 Exit codes: 1 usage or fatal, 2 not in a worktree, 3 token command failed, 4 dirty or unpushed,
 5 branch already merged, 6 verdict gate refused.
@@ -126,16 +126,29 @@ considers only that login's comments, so a stranger commenting on a public repo 
 The newest verdict comment must be APPROVE and its sha must equal the PR's current head, so a
 push after the approval voids it. It refuses, saying which condition failed: no verdict, newest
 is CHANGES, approved sha differs from the head, or only other authors' verdicts exist.
+A verdict comment that was edited after posting (its `updated_at` differs from `created_at`)
+is not trusted: the gate refuses, and you post a fresh verdict comment and delete the edited one.
 `parse_verdict` and `verdict_line` in `wt.py` are the one definition of the format.
 
+**What the gate does and does not protect.** It stops other GitHub accounts from approving. It
+does not stop you: one login can author the code and post the APPROVE, and `$WT_GH` and
+`token_command` are trusted local configuration, so anyone who can change them can bypass it.
+
+**Ignored files go too.** `rm`, `gc` and `merge` remove the worktree directory, including
+gitignored files in it (a local `.env`, build output). Copy out anything you want to keep first.
+
 **The pre-commit** (`githooks/pre-commit`) checks only what is staged: API-key shapes (the
-pattern from `tests/leak_scan.py`) and PEM private-key headers; any file over `size_cap_kb`; and,
+pattern from `tests/leak_scan.py`) and PEM private-key headers, in every staged added, copied, modified, renamed or type-changed file; any file over `size_cap_kb`; and,
 only for repos listed in `public_repos`, the private terms in `leak_terms` (a missing terms file
-fails the commit). It prints each finding with its file and exits 1.
+fails the commit). A failed `git diff` or a staged blob that cannot be read fails the commit too. It prints each finding with its file and exits 1.
 `wt.py install-hooks` (or `sh install.sh --git-hooks <repo>`) writes a small shim to
 `<git-dir>/hooks/pre-commit`. An existing hook is never replaced: it is moved to
 `pre-commit.pre-session-notes` and the shim runs it after the checks pass (the install refuses
-if that name is already taken). Re-running changes nothing. If the repo sets `core.hooksPath`,
+if that name is already taken). The shim records the path of the checkout's `githooks/pre-commit`; if that file
+is gone it prints the missing path and the repair command and refuses the commit (it never skips
+the checks silently). Re-running `install-hooks` is idempotent when the recorded path is current,
+and rewrites the shim in place ("repaired") when the path changed or vanished, keeping the chain.
+A `pre-commit` that is a dangling symlink is refused with a message and left alone. If the repo sets `core.hooksPath`,
 nothing is written and the command says so; wt never sets or changes `core.hooksPath`.
 
 ## Skill feedback: skills that improve from being corrected

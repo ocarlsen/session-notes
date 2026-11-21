@@ -53,7 +53,11 @@ def main():
         print("session-notes pre-commit: bad config: %s" % exc)
         return 1
     api_key = dict(leak.PUBLIC)["api key"]
-    rc, out = _git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z")
+    rc, out = _git("diff", "--cached", "--name-only", "--diff-filter=ACMRT", "-z")
+    if rc != 0:
+        print("session-notes pre-commit: git diff --cached failed (exit %d); the commit is "
+              "refused because the staged files could not be listed" % rc)
+        return 1
     files = [f for f in out.decode("utf-8", "replace").split("\0") if f]
     rc, top = _git("rev-parse", "--show-toplevel")
     toplevel = os.path.realpath(top.decode().strip())
@@ -72,6 +76,7 @@ def main():
     for f in files:
         rc, blob = _git("show", ":" + f)
         if rc != 0:
+            findings.append("%s: staged content could not be read (git show :path failed)" % f)
             continue
         if len(blob) > cap:
             findings.append("%s: size %d KB is over wt.size_cap_kb=%d" % (f, len(blob) // 1024 + 1, cfg["size_cap_kb"]))

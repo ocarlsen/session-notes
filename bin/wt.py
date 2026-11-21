@@ -9,7 +9,7 @@ Works in any git repo (run it anywhere inside one, including inside a worktree).
     wt.py list                       this repo's worktrees: dirty, ahead, PR state
     wt.py rm <name> [--force]        remove a worktree and its branch
     wt.py gc [--yes]                 list (and on a yes, remove) merged/closed stragglers
-    wt.py install-hooks [repo]       install the session-notes pre-commit (githooks/pre-commit)
+    wt.py install-hooks [repo] [--dry-run]   install the session-notes pre-commit (githooks/pre-commit)
     wt.py --selftest
 
 WHERE a worktree goes, first rule that applies:
@@ -96,6 +96,10 @@ def check_gate(comments, login, head):
         if not v:
             continue
         if ((c.get("user") or {}).get("login") or "").lower() == login.lower():
+            if c.get("created_at") and c.get("updated_at") and c["updated_at"] != c["created_at"]:
+                return False, ("verdict comment %s was edited after it was posted; an edited "
+                               "comment is not trusted, post a fresh verdict comment (and delete "
+                               "the edited one)" % (c.get("id") or "?"))
             own.append(v)
         else:
             other += 1
@@ -244,6 +248,7 @@ def list_worktrees(main):
     for i, b in enumerate(blocks):
         br = b.get("branch", "")
         res.append({"path": b["worktree"], "head": b.get("HEAD", ""), "main": i == 0,
+                    "missing": "prunable" in b or not os.path.isdir(b["worktree"]),
                     "branch": br[len("refs/heads/"):] if br.startswith("refs/heads/") else ""})
     return res
 
@@ -318,8 +323,25 @@ def hook_script():
     return os.path.join(os.path.dirname(HERE), "githooks", "pre-commit")
 
 
-def install_hooks(repo=None, out=sys.stdout):
+def build_shim(script, repo):
+    repair = "python3 <session-notes>/bin/wt.py install-hooks %s" % shlex.quote(repo)
+    return ("#!/bin/sh\n%s\n"
+            "# script-path: %s\n"
+            "script=%s\n"
+            "if [ ! -f \"$script\" ]; then\n"
+            "  echo \"session-notes pre-commit: $script is missing (the session-notes checkout "
+            "moved or was deleted); the commit is refused. Repair: %s\" >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "python3 \"$script\" \"$@\" || exit $?\n"
+            "prev=\"$(dirname \"$0\")/pre-commit.pre-session-notes\"\n"
+            "if [ -x \"$prev\" ]; then exec \"$prev\" \"$@\"; fi\n"
+            "exit 0\n") % (HOOK_MARKER, script, shlex.quote(script), repair.replace('"', '\\"'))
+
+
+def install_hooks(repo=None, out=sys.stdout, dry_run=False):
     main, common = repo_main(repo)
+    say = (lambda m: print(("would: " if dry_run else "") + m, file=out))
     r = git(main, "config", "--get", "core.hooksPath", check=False)
     if r.returncode == 0 and r.stdout.strip():
         print("%s manages its own hooks via core.hooksPath=%s; the session-notes pre-commit was "
@@ -331,30 +353,46 @@ def install_hooks(repo=None, out=sys.stdout):
     hooks = os.path.join(common, "hooks")
     target = os.path.join(hooks, "pre-commit")
     prev = target + ".pre-session-notes"
-    os.makedirs(hooks, exist_ok=True)
-    chained = False
+    chained, repaired = False, False
     if os.path.lexists(target):
-        if HOOK_MARKER in open(target, errors="replace").read():
-            print("session-notes pre-commit already installed in %s (left as is)" % hooks, file=out)
-            return 0
-        if os.path.lexists(prev):
-            raise Die(1, "%s already exists; move it aside, then re-run (the existing "
-                         "pre-commit was not touched)" % prev)
-        os.rename(target, prev)
-        chained = True
+        if os.path.islink(target) and not os.path.exists(target):
+            raise Die(1, "%s is a dangling symlink; remove it or point it at a real hook, then "
+                         "re-run (nothing was changed)" % target)
+        text = open(target, errors="replace").read()
+        if HOOK_MARKER in text:
+            m = re.search(r"^# script-path: (.*)$", text, re.M)
+            rec = m.group(1) if m else None
+            if rec == script and os.path.isfile(rec):
+                print("session-notes pre-commit already installed in %s (left as is)" % hooks, file=out)
+                return 0
+            repaired = True
+        else:
+            if os.path.lexists(prev):
+                raise Die(1, "%s already exists; move it aside, then re-run (the existing "
+                             "pre-commit was not touched)" % prev)
+            chained = True
     elif os.path.lexists(prev):
         chained = True
-    shim = ("#!/bin/sh\n%s\n"
-            "python3 %s \"$@\" || exit $?\n"
-            "prev=\"$(dirname \"$0\")/pre-commit.pre-session-notes\"\n"
-            "if [ -x \"$prev\" ]; then exec \"$prev\" \"$@\"; fi\n"
-            "exit 0\n") % (HOOK_MARKER, shlex.quote(script))
-    with open(target, "w") as fh:
-        fh.write(shim)
-    os.chmod(target, 0o755)
-    print("installed the session-notes pre-commit in %s%s" % (
-        hooks, "; the previous hook moved to pre-commit.pre-session-notes and still runs"
-        if chained else ""), file=out)
+    if dry_run:
+        say("%s the session-notes pre-commit in %s%s" % (
+            "repair" if repaired else "install", hooks,
+            "; move the existing hook to pre-commit.pre-session-notes and chain to it" if chained
+            and os.path.lexists(target) else ""))
+        return 0
+    os.makedirs(hooks, exist_ok=True)
+    if chained and os.path.lexists(target):
+        os.rename(target, prev)
+    tmp = target + ".wt-tmp"
+    with open(tmp, "w") as fh:
+        fh.write(build_shim(script, main))
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    if repaired:
+        print("repaired the session-notes pre-commit in %s (now runs %s)" % (hooks, script), file=out)
+    else:
+        print("installed the session-notes pre-commit in %s%s" % (
+            hooks, "; the previous hook moved to pre-commit.pre-session-notes and still runs"
+            if chained else ""), file=out)
     return 0
 
 
@@ -384,7 +422,11 @@ def cmd_new(args, cfg):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     git(main, "worktree", "add", path, "-b", name, "origin/" + default)
     if not hook_present(common):
-        install_hooks(main, out=sys.stderr)
+        try:
+            install_hooks(main, out=sys.stderr)
+        except (Die, OSError) as exc:
+            print("warning: pre-commit hook not installed: %s" % getattr(exc, "msg", exc),
+                  file=sys.stderr)
     print("worktree %s on branch %s (from origin/%s)" % (path, name, default), file=sys.stderr)
     print(path)
     return 0
@@ -483,7 +525,7 @@ def cmd_merge(args, cfg):
         raise Die(6, "verdict gate refused PR #%s: %s" % (view["number"], msg))
     print("verdict gate passed: %s" % msg)
     merge = ["gh", "pr", "merge", str(view["number"]), "--squash", "--delete-branch",
-             "-R", "%s/%s" % (owner, repo)]
+             "--match-head-commit", head, "-R", "%s/%s" % (owner, repo)]
     if args.dry_run:
         print("dry run, would do:")
         print("  " + shlex.join(merge))
@@ -495,8 +537,14 @@ def cmd_merge(args, cfg):
         gh.run(merge[1:], main)
     except GhError as exc:
         raise Die(1, "gh pr merge failed: %s" % exc)
-    remove_worktree(main, path, branch)
-    print("merged PR #%s; removed %s and branch %s" % (view["number"], path, branch))
+    now = git(path, "rev-parse", "HEAD", check=False).stdout.strip()
+    if now != head or is_dirty(path):
+        print("merged PR #%s, but %s was NOT removed: it has new work since the gated head "
+              "(%s). Branch %s kept." % (view["number"], path,
+                                         "HEAD moved" if now != head else "uncommitted changes", branch))
+    else:
+        remove_worktree(main, path, branch)
+        print("merged PR #%s; removed %s and branch %s" % (view["number"], path, branch))
     print(ff_main(main, default))
     return 0
 
@@ -526,6 +574,11 @@ def cmd_list(args, cfg):
         if w["main"]:
             continue
         b = w["branch"]
+        if w["missing"]:
+            print("%-20s %-20s %s  missing, run git worktree prune" % (
+                os.path.basename(w["path"]), b or "(detached)", w["path"]))
+            rows += 1
+            continue
         prs = _pr_state(gh, main, b) if note is None and b else None
         if prs is None and b and note is None:
             note = "PR state unavailable (gh or token command failed)"
@@ -545,16 +598,21 @@ def cmd_rm(args, cfg):
     main, common = repo_main()
     w = find_worktree(main, args.name)
     branch, path = w["branch"], w["path"]
-    if not args.force:
+    if not args.force and not w["missing"]:
         if is_dirty(path):
             raise Die(4, "%s has uncommitted changes (--force to discard them)" % path)
-        if branch and unpushed(main, path, branch):
-            heads = merged_heads(Gh(cfg), main, branch) or []
+        if unpushed(main, path, branch):
+            heads = (merged_heads(Gh(cfg), main, branch) or []) if branch else []
             if gout(path, "rev-parse", "HEAD") not in heads:
-                raise Die(4, "branch %r has commits not pushed to origin/%s and no merged PR "
-                             "covers them (--force to discard)" % (branch, branch))
+                raise Die(4, "%s has commits on no remote branch (%s) and no merged PR "
+                             "covers them (--force to discard)" % (
+                                 path, "detached HEAD" if not branch else "branch %r" % branch))
+    if w["missing"]:
+        git(main, "worktree", "prune")
+        print("pruned the missing worktree record %s (branch %s kept)" % (path, branch or "-"))
+        return 0
     remove_worktree(main, path, branch, force=args.force)
-    print("removed %s and branch %s" % (path, branch))
+    print("removed %s and branch %s" % (path, branch or "(detached)"))
     return 0
 
 
@@ -564,8 +622,13 @@ def cmd_gc(args, cfg):
     git(main, "fetch", "--prune", "origin", check=False)
     remove, skipped = [], []
     for w in list_worktrees(main):
-        if w["main"] or not w["branch"]:
+        if w["main"]:
             continue
+        if w["missing"]:
+            remove.append((w["path"], w["branch"], "directory is missing (git worktree prune)"))
+            continue
+        if not w["branch"]:
+            continue  # detached: no PR or remote signal says it is finished
         b, path = w["branch"], w["path"]
         prs = _pr_state(gh, main, b) or []
         states = {p.get("state") for p in prs}
@@ -597,10 +660,14 @@ def cmd_gc(args, cfg):
         if args.yes:
             go = True
         elif tty:
-            go = input("remove %s and branch %s? [y/N] " % (path, b)).strip().lower() in ("y", "yes")
+            go = input("%s %s? [y/N] " % ("prune" if not os.path.isdir(path) else "remove", path)
+                       ).strip().lower() in ("y", "yes")
         else:
             go = False
-        if go:
+        if go and not os.path.isdir(path):
+            git(main, "worktree", "prune")
+            print("pruned   %s (branch %s kept)" % (path, b or "-"))
+        elif go:
             remove_worktree(main, path, b)
             print("removed  %s" % path)
     if not args.yes and not tty:
@@ -609,7 +676,7 @@ def cmd_gc(args, cfg):
 
 
 def cmd_install_hooks(args, cfg):
-    return install_hooks(args.repo)
+    return install_hooks(args.repo, dry_run=args.dry_run)
 
 
 # ------------------------------------------------------------------ cli
@@ -633,6 +700,7 @@ def build_parser():
     p.add_argument("--yes", action="store_true")
     p = sub.add_parser("install-hooks")
     p.add_argument("repo", nargs="?")
+    p.add_argument("--dry-run", action="store_true")
     return ap
 
 
@@ -689,6 +757,9 @@ if a[0] == "api" and a[-1].endswith("/comments"):
 if a[:2] == ["pr", "create"]:
     print("https://github.com/example/proj/pull/7"); sys.exit(0)
 if a[:2] == ["pr", "merge"]:
+    h = os.path.join(d, "merge_hook")
+    if os.path.exists(h):
+        os.system(open(h).read())
     sys.exit(0)
 sys.stderr.write("stub: unhandled %s\n" % a); sys.exit(1)
 '''
@@ -904,13 +975,13 @@ def selftest():
         setup_gate(ok_comments)
         rc, out, err = wt(P1, "merge", "--dry-run")
         check("merge --dry-run checks the gate and changes nothing",
-              rc == 0 and "gh pr merge 7 --squash --delete-branch -R example/proj" in out
+              rc == 0 and "gh pr merge 7 --squash --delete-branch --match-head-commit %s -R example/proj" % head in out
               and os.path.isdir(P1) and not any(e["argv"][:2] == ["pr", "merge"] for e in log()), (rc, out, err))
         rc, out, err = wt(R, "merge", "feat1")
         merge_calls = [e["argv"] for e in log() if e["argv"][:2] == ["pr", "merge"]]
         check("merge passes with a correct APPROVE, by name from the main checkout",
               rc == 0 and merge_calls == [["pr", "merge", "7", "--squash", "--delete-branch",
-                                           "-R", "example/proj"]], (rc, out, err, merge_calls))
+                                           "--match-head-commit", head, "-R", "example/proj"]], (rc, out, err, merge_calls))
         check("merge removed the worktree and the local branch",
               not os.path.exists(P1) and g(R, "branch", "--list", "feat1") == "")
         check("merge reports the main checkout fast-forward state",
@@ -979,6 +1050,59 @@ def selftest():
         check("rm --force removes it", rc == 0 and not os.path.exists(gu), (rc, err))
         rc, out, err = wt(R, "rm", "nope")
         check("rm unknown name fails (1)", rc == 1)
+
+        # B1: a push (new work) landing around the merge keeps the worktree
+        rw, rw_sha = pushed_wt("racewt")
+        setup_gate([cm("me", verdict_line(APPROVE, rw_sha), "2026-01-02T00:00:00Z", 2)],
+                   v=dict(view, headRefOid=rw_sha))
+        canned("merge_hook", "echo late > %s" % shlex.quote(os.path.join(rw, "late.txt")))
+        rc, out, err = wt(rw, "merge")
+        check("merge keeps a worktree that gained work during the merge, and says so",
+              rc == 0 and os.path.isdir(rw) and "NOT removed" in out
+              and g(R, "branch", "--list", "racewt") != "", (rc, out, err))
+        check("merge pins the gated head with --match-head-commit",
+              any(e["argv"][:2] == ["pr", "merge"] and e["argv"][e["argv"].index("--match-head-commit") + 1] == rw_sha
+                  for e in log()))
+        os.remove(os.path.join(stubdir, "merge_hook"))
+
+        # B2: detached HEAD with unpushed commits
+        dw, _ = pushed_wt("detwt")
+        commit(dw, "lost.txt", "l\n", "unpushed on a detached head")
+        g(dw, "checkout", "-q", "--detach")
+        rc, out, err = wt(R, "rm", "detwt")
+        check("rm refuses a detached worktree holding unpushed commits (4)",
+              rc == 4 and "detached" in err and os.path.isdir(dw), (rc, out, err))
+        rc, out, err = wt(R, "rm", "detwt", "--force")
+        check("rm --force removes the detached worktree", rc == 0 and not os.path.exists(dw), (rc, err))
+
+        # N2: a hand-deleted worktree directory
+        import shutil
+        gw, _ = pushed_wt("ghostwt")
+        shutil.rmtree(gw)
+        rc, out, err = wt(R, "list")
+        check("list shows a missing worktree as its own row and does not crash",
+              rc == 0 and "ghostwt" in out and "missing, run git worktree prune" in out, (rc, out, err))
+        rc, out, err = wt(R, "gc")
+        check("gc lists a missing worktree without crashing", rc == 0 and "directory is missing" in out, (rc, out, err))
+        rc, out, err = wt(R, "gc", "--yes")
+        check("gc --yes prunes it", rc == 0 and "pruned" in out and "ghostwt" not in g(R, "worktree", "list"), (rc, out, err))
+
+        # N3: hook install failing inside `new` is a warning, the path still prints
+        R13 = mkrepo("newwarn")
+        h13 = os.path.join(R13, ".git", "hooks", "pre-commit")
+        os.makedirs(os.path.dirname(h13), exist_ok=True)
+        os.symlink(os.path.join(T, "nowhere"), h13)
+        rc, out, err = wt(R13, "new", "w3")
+        check("new: a hook-install failure warns, still prints the path, exit 0",
+              rc == 0 and out.strip() == os.path.join(R13, ".worktrees", "w3") and "warning" in err, (rc, out, err))
+
+        # N4: an edited verdict comment is refused
+        edited = dict(cm("me", verdict_line(APPROVE, sha), "2026-01-01T00:00:00Z", 5),
+                      updated_at="2026-01-03T00:00:00Z")
+        ok_, msg_ = check_gate([edited], "me", sha)
+        check("gate refuses an edited verdict comment", not ok_ and "edited" in msg_, msg_)
+        ok_, msg_ = check_gate([dict(edited, updated_at=edited["created_at"])], "me", sha)
+        check("gate accepts an unedited one (updated_at == created_at)", ok_, msg_)
 
         # token command failure
         write_cfg()
@@ -1069,6 +1193,77 @@ def selftest():
         r = commit(R7, "t5.txt", "ok\n")
         check("public repo with a missing terms file fails loudly",
               r[0] != 0 and "does not exist" in r[1] + r[2], r)
+
+        # B3: the shim fails closed when its script is gone, and install repairs it
+        write_cfg()
+        R9 = mkrepo("moved", with_origin=False)
+        wt(T, "install-hooks", R9)
+        h9 = os.path.join(R9, ".git", "hooks", "pre-commit")
+        with open(h9, "w") as fh:
+            fh.write(build_shim("/nonexistent/session-notes/githooks/pre-commit", R9))
+        os.chmod(h9, 0o755)
+        r = commit(R9, "m.txt")
+        check("shim with a missing script refuses the commit, naming the path and the repair",
+              r[0] != 0 and "/nonexistent/session-notes/githooks/pre-commit is missing" in r[1] + r[2]
+              and "install-hooks" in r[1] + r[2], r)
+        rc, out, err = wt(T, "install-hooks", R9)
+        check("install-hooks repairs a shim whose recorded path is gone", rc == 0 and "repaired" in out, (rc, out, err))
+        r = commit(R9, "m.txt")
+        check("commit works again after the repair", r[0] == 0, r)
+        rc, out, err = wt(T, "install-hooks", R9)
+        check("repair is idempotent when the path matches", rc == 0 and "already installed" in out, (rc, out))
+        with open(h4, "w") as fh:
+            fh.write(build_shim("/nonexistent/x/pre-commit", R4))
+        rc, out, err = wt(T, "install-hooks", R4)
+        check("repair keeps the chain to pre-commit.pre-session-notes",
+              rc == 0 and "repaired" in out and os.path.exists(h4 + ".pre-session-notes")
+              and "pre-commit.pre-session-notes" in open(h4).read(), (rc, out, err))
+        R10 = mkrepo("dangling", with_origin=False)
+        h10 = os.path.join(R10, ".git", "hooks", "pre-commit")
+        os.makedirs(os.path.dirname(h10), exist_ok=True)
+        os.symlink(os.path.join(T, "nowhere"), h10)
+        rc, out, err = wt(T, "install-hooks", R10)
+        check("a dangling-symlink pre-commit is refused cleanly (no traceback), untouched",
+              rc == 1 and "dangling symlink" in err and "Traceback" not in err and os.path.islink(h10), (rc, err))
+
+        # B4: --dry-run writes nothing, through wt.py and through install.sh in either arg order
+        R11 = mkrepo("dry", with_origin=False)
+        h11 = os.path.join(R11, ".git", "hooks", "pre-commit")
+        rc, out, err = wt(T, "install-hooks", "--dry-run", R11)
+        check("install-hooks --dry-run writes nothing", rc == 0 and "would:" in out and not os.path.exists(h11), (rc, out, err))
+        inst = os.path.join(os.path.dirname(HERE), "install.sh")
+        for order in (["--dry-run", "--git-hooks", R11], ["--git-hooks", R11, "--dry-run"]):
+            rc, out, err = sh(["sh", inst] + order, T)[0:3]
+            check("install.sh %s writes nothing" % " ".join(order[:1] + order[2:]),
+                  rc == 0 and "would:" in out and not os.path.exists(h11), (rc, out, err))
+        rc, out, err = sh(["sh", inst, "--git-hooks", R11], T)
+        check("install.sh --git-hooks installs", rc == 0 and os.path.isfile(h11), (rc, out, err))
+
+        # B5: type change, failed diff, unreadable blob
+        R8 = mkrepo("typechg", with_origin=False)
+        wt(T, "install-hooks", R8)
+        os.symlink("README", os.path.join(R8, "lnk"))
+        g(R8, "add", "lnk")
+        r = sh(["git", "commit", "-q", "-m", "link"], R8)
+        os.remove(os.path.join(R8, "lnk"))
+        r = commit(R8, "lnk", "key = %s\n" % fake_key)
+        check("pre-commit catches a key in a symlink replaced by a file (type change)",
+              r[0] != 0 and "lnk:1" in r[1] + r[2], r)
+        nongit = os.path.join(T, "nongit")
+        os.makedirs(nongit)
+        rc, out, err = sh([sys.executable, hook_script()], nongit)
+        check("hook fails loudly when git diff fails", rc == 1 and "git diff --cached failed" in out, (rc, out, err))
+        R12 = mkrepo("blobless", with_origin=False)
+        wt(T, "install-hooks", R12)
+        open(os.path.join(R12, "f.txt"), "w").write("content to lose\n")
+        g(R12, "add", "f.txt")
+        oid = g(R12, "rev-parse", ":f.txt")
+        objp = os.path.join(R12, ".git", "objects", oid[:2], oid[2:])
+        os.chmod(objp, 0o644)
+        os.remove(objp)
+        r = sh(["git", "commit", "-q", "-m", "x"], R12)
+        check("an unreadable staged blob is a finding, not a skip",
+              r[0] != 0 and "could not be read" in r[1] + r[2], r)
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
