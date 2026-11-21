@@ -41,6 +41,12 @@ prefix = "[user via bcast]"
 # tmux session name suggested in the "bus_nudge is down" restart hint.
 nudge_session = "bus-nudge"
 
+[handoff]
+# A sentence handoff_session adds to the AUTO-START note for a session that builds
+# something, e.g. "It runs under the normal gates (worktree -> PR -> review)."
+# Empty = none. --no-build omits it.
+build_note = ""
+
 [budgets]
 # Boot-prefix budgets, checked by boot_budget.py. Measured in characters,
 # which is what the boot prefix counts.

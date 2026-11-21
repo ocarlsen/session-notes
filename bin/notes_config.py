@@ -95,6 +95,12 @@ DEFAULTS = {
         # hint in the restart line; detection is by process.
         "nudge_session": "bus-nudge",
     },
+    "handoff": {
+        # A sentence handoff_session adds to the AUTO-START note for a session that
+        # builds something, e.g. your own review routine. Empty = no sentence.
+        # `--no-build` omits it.
+        "build_note": "",
+    },
     "budgets": {
         # Boot-prefix budgets, in bytes, checked by boot_budget.py.
         "global_index_bytes": 45000,
@@ -323,6 +329,10 @@ def load(path=None, env=None):
             # fallback this module refuses; only the default location may be absent.
             raise ConfigError("SESSION_NOTES_CONFIG=%s: no such file" % path)
     path = path or config_path(env)
+    if os.path.islink(path) and not os.path.exists(path):
+        # A config kept in another repo and linked here: a dangling link means that repo
+        # moved or lost the file. Running on defaults would silently move the state dir.
+        raise ConfigError("%s: symlink to missing file %s" % (path, os.readlink(path)))
     base = None
     if os.path.exists(path):
         base = os.path.dirname(os.path.abspath(path))
@@ -462,6 +472,13 @@ store = "/tmp/beta-store"
             check("named missing config refused", False)
         except ConfigError as exc:
             check("named missing config refused", "typo.toml" in str(exc))
+        dangling = os.path.join(d, "dangling.toml")
+        os.symlink(os.path.join(d, "gone.toml"), dangling)
+        try:
+            load(dangling)
+            check("dangling config symlink refused", False)
+        except ConfigError as exc:
+            check("dangling config symlink refused", "gone.toml" in str(exc))
         with open(f, "w") as fh:
             fh.write("[time]\nstale_after_minutes = -5\n")
         try:

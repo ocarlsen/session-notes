@@ -157,6 +157,33 @@ def label_spec(spec):
             "authorizes; nothing here has run): " + spec)
 
 
+def build_label_cmd(name, display):
+    """The `tmux set-option` argv that stores a display-only label on the session, or
+    None. The messaging name stays --name (what `claude -n`, SendMessage and the bus
+    address); a --display label different from it is stored as the tmux SESSION option
+    @display, which session_peers and bcast show. The target is `=<name>:`: the `=`
+    asks for an exact match and the trailing `:` makes it a session target, without
+    which tmux answers "no such session"."""
+    if not display or display == name:
+        return None
+    return ["tmux", "set-option", "-t", "=" + name + ":", "@display", display]
+
+
+def spawn_note(no_build, cfg=None):
+    """The AUTO-START note, one source for the real spawn and --dry-run. A session that
+    builds something also gets the config's [handoff] build_note, if set."""
+    note = ("NOTE: it runs under your normal permission settings. If nothing shows up, "
+            "check the pane: it can stall invisibly on a permission prompt.")
+    if no_build:
+        return note
+    try:
+        import notes_config
+        extra = ((cfg or notes_config.load()).get("handoff") or {}).get("build_note", "")
+    except Exception:
+        extra = ""
+    return note + (" " + extra.strip() if extra and extra.strip() else "")
+
+
 def selftest():
     """Deterministic checks over argv construction + mode selection. No spawning."""
     fails = []
@@ -290,6 +317,32 @@ def selftest():
     finally:
         os.unlink(empty_path)
 
+    # --display: a separate, post-spawn set-option on the exact session target.
+    check("build_label_cmd: exact-match session target with the trailing ':'",
+          build_label_cmd("dr10", "release notes") ==
+          ["tmux", "set-option", "-t", "=dr10:", "@display", "release notes"])
+    check("build_label_cmd: no label, an empty one, or one equal to --name is a no-op",
+          [build_label_cmd("a", x) for x in (None, "", "a")] == [None, None, None])
+    c_l = build_spawn_cmd("dr10", "/tmp", "c", prompt="go.")
+    check("-n stays --name when a label is in play (the label never rides argv)",
+          c_l[c_l.index("-n") + 1] == "dr10" and "release notes" not in c_l)
+    # The build note: config text for a building session, none with --no-build.
+    cfg_n = {"handoff": {"build_note": "It runs under the normal gates."}}
+    check("spawn_note: a building session gets the config's build_note",
+          spawn_note(False, cfg_n).endswith("It runs under the normal gates."))
+    check("spawn_note: --no-build leaves it out",
+          "normal gates" not in spawn_note(True, cfg_n))
+    check("spawn_note: no build_note configured -> the plain note",
+          spawn_note(False, {"handoff": {"build_note": ""}}) == spawn_note(True))
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(["--name", "t", "--display", "L", "--prompt", "go.", "--cwd", "/tmp",
+                   "--dry-run", "--claude-bin", sys.executable])
+    check("--dry-run with --display shows the @display set-option",
+          rc == 0 and "'@display' 'L'" in buf.getvalue(), "rc=%r out=%r" % (rc, buf.getvalue()[-300:]))
+
     print("handoff_session selftest: %d checks, %d failed" % (ran[0], len(fails)))
     for f in fails:
         print("  FAIL %s" % f)
@@ -307,6 +360,12 @@ def main(argv=None):
     q = p.add_mutually_exclusive_group()
     q.add_argument("--prompt", help="AUTO-START mode: initial prompt as the session's argv (it starts working)")
     q.add_argument("--prompt-file", help="AUTO-START mode: read the initial prompt from this file")
+    p.add_argument("--display",
+                   help="display-only label, stored as the tmux session option @display and "
+                        "shown by session_peers and bcast; the messaging name stays --name")
+    p.add_argument("--no-build", action="store_true",
+                   help="AUTO-START: the session builds nothing, so leave the config's "
+                        "[handoff] build_note out of the spawn note")
     p.add_argument("--cwd", default=os.getcwd(), help="working dir for the new session (default: cwd)")
     p.add_argument("--bypass", action="store_true",
                    help="add --dangerously-skip-permissions (default OFF)")
@@ -431,11 +490,15 @@ def main(argv=None):
     parent_args = session_lineage.spawn_env_args()
     tmux_cmd = build_spawn_cmd(name, cwd, claude, bypass=a.bypass,
                                prompt=prompt, model=model, parent_args=parent_args)
+    label_cmd = build_label_cmd(name, a.display)
 
     if a.dry_run:
         print("[dry-run] would spawn: %s" % " ".join("%r" % c for c in tmux_cmd))
+        if label_cmd:
+            print("[dry-run] would run: %s" % " ".join("%r" % c for c in label_cmd))
         if prompt:
             print("[dry-run] AUTO-START: prompt is argv (%d chars); bus park SKIPPED" % len(prompt))
+            print("[dry-run] " + spawn_note(a.no_build))
         if spec:
             print("[dry-run] would park spec (%d chars) on the bus for %r" % (len(spec), name))
         print("[dry-run] attach: tmux attach -t %s" % name)
@@ -445,6 +508,13 @@ def main(argv=None):
     if r.returncode != 0:
         print("handoff_session: tmux new-session failed: %s" % (r.stderr or r.stdout).strip(), file=sys.stderr)
         return 6
+    # The label is display-only and set after the session is up. Its failure is a
+    # warning, never a spawn failure: the session is live and addressable by --name.
+    if label_cmd:
+        lr = _run(label_cmd)
+        if lr.returncode != 0:
+            print("handoff_session: warning: could not set the @display label: %s"
+                  % (lr.stderr or lr.stdout).strip(), file=sys.stderr)
     # NAME THE MODEL in the confirmation. The failure this flag fixes was invisible spend:
     # large-model handoffs nobody noticed until the usage numbers moved.
     print("spawned session %r (claude, model: %s%s) in %s"
@@ -467,8 +537,7 @@ def main(argv=None):
         print("AUTO-START: the session launched with its prompt (%d chars) and is working now."
               % len(prompt))
         print("attach: tmux attach -t %s   (from inside tmux: tmux switch-client -t %s)" % (name, name))
-        print("NOTE: it runs under your normal permission settings. If nothing shows up, "
-              "check the pane: it can stall invisibly on a permission prompt.")
+        print(spawn_note(a.no_build))
         return 0
 
     # Best-effort wait for the new session to register on the bus. The mail is file-durable,
