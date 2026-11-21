@@ -52,7 +52,13 @@ import sys
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 if BIN not in sys.path:
-    sys.path.insert(0, BIN)
+    # Run as a command: this repo's bin/ goes first. Imported by another program (a
+    # launcher in some other repo): add it LAST, so that program's own same-named
+    # modules still win its later imports.
+    if __name__ == "__main__":
+        sys.path.insert(0, BIN)
+    else:
+        sys.path.append(BIN)
 
 ENV_SESSION = "SESSION_NOTES_PARENT_SESSION"
 ENV_CREATED = "SESSION_NOTES_PARENT_CREATED"
