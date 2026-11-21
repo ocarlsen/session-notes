@@ -65,6 +65,20 @@ sweep_roots = ["~/Projects"]
 # path = "~/.claude/CLAUDE.md"
 # bytes = 8000
 
+[wt]
+# bin/wt.py: a worktree per change, and a PR lifecycle gated on a review verdict.
+# Shell command whose stdout is a GitHub token; wt exports it as GH_TOKEN for every gh call.
+# A failing or empty command is an error, never a silent fallback.
+token_command = "gh auth token"
+# Global worktree root. Empty = the default rule (see docs/tools.md).
+root = ""
+# Repo root paths that are public: the pre-commit then also scans for the private terms.
+public_repos = []
+# The pre-commit refuses a staged file larger than this many KB.
+size_cap_kb = 1024
+# Private terms for public repos, in the format tests/leak_scan.py documents.
+leak_terms = "~/.config/session-notes/leak-terms.txt"
+
 # One block per project folder that keeps its own memory store.
 # `store` is optional, and best left out: empty = the folder Claude Code
 # already keeps for that project, named after its full path, e.g.
@@ -78,3 +92,5 @@ sweep_roots = ["~/Projects"]
 # # Optional: a file that describes the scope (routing notes for /reflect). The
 # # canary treats it as part of the scope, not as a memory entry. Relative to root.
 # manifest = ""
+# # Optional: where wt.py puts this scope's worktrees (relative to root, or absolute).
+# worktree_root = ""

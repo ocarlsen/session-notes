@@ -112,6 +112,19 @@ DEFAULTS = {
         # Folders walked (depth 3) for CLAUDE.md files outside any scope.
         "sweep_roots": ["~/Projects"],
     },
+    # bin/wt.py: worktree + PR lifecycle for any git repo.
+    "wt": {
+        # Shell command whose stdout is the GitHub token wt exports as GH_TOKEN.
+        "token_command": "gh auth token",
+        # Global worktree root override; empty = the default location rule.
+        "root": "",
+        # Repo roots that are public: the pre-commit adds the private-term leak scan.
+        "public_repos": [],
+        # The pre-commit refuses a staged file above this many KB.
+        "size_cap_kb": 1024,
+        # Private terms file for public repos (format: tests/leak_scan.py docstring).
+        "leak_terms": "~/.config/session-notes/leak-terms.txt",
+    },
     # Each scope is a project folder with its own memory store. `store` may be
     # empty, meaning ~/.claude/projects/<encoded root>/memory.
     "scopes": [],
@@ -298,7 +311,7 @@ def _resolve(cfg, base=None, env=None):
     for i, s in enumerate(cfg["scopes"]):
         if not isinstance(s, dict) or not s.get("name") or not s.get("root"):
             raise ConfigError("scopes[%d] needs a name and a root" % i)
-        unknown = set(s) - {"name", "root", "store", "manifest"}
+        unknown = set(s) - {"name", "root", "store", "manifest", "worktree_root"}
         if unknown:
             raise ConfigError("scopes[%d]: unknown key(s) %s" % (i, sorted(unknown)))
         root = _abs(s["root"], base)
@@ -310,12 +323,24 @@ def _resolve(cfg, base=None, env=None):
         manifest = s.get("manifest", "")
         if not isinstance(manifest, str):
             raise ConfigError("scopes[%d] (%s): manifest must be a path string" % (i, s["name"]))
+        wtr = s.get("worktree_root", "")
+        if not isinstance(wtr, str):
+            raise ConfigError("scopes[%d] (%s): worktree_root must be a path string" % (i, s["name"]))
         # A relative manifest is relative to the scope ROOT, which both agents share.
         scopes.append({"name": s["name"], "root": root,
+                       "worktree_root": _abs(wtr, root) if wtr.strip() else "",
                        "store": _abs(store, base),
                        "store_derived": kind == "codex" or not s.get("store"),
                        "manifest": _abs(manifest, root) if manifest.strip() else ""})
     cfg["scopes"] = scopes
+    w = cfg["wt"]
+    if type(w["size_cap_kb"]) is not int or w["size_cap_kb"] <= 0:
+        raise ConfigError("wt.size_cap_kb must be a positive integer, got %r" % (w["size_cap_kb"],))
+    if not all(isinstance(x, str) and x.strip() for x in w["public_repos"]):
+        raise ConfigError("wt.public_repos must be a list of path strings")
+    w["root"] = _abs(w["root"], base) if w["root"].strip() else ""
+    w["public_repos"] = [_abs(x, base) for x in w["public_repos"]]
+    w["leak_terms"] = _abs(w["leak_terms"], base)
     files = []
     for i, b in enumerate(cfg["budget_file"]):
         if not isinstance(b, dict) or set(b) != {"path", "bytes"}:
@@ -630,6 +655,27 @@ store = "/tmp/beta-store"
                 os.environ.pop("SESSION_NOTES_AGENT", None)
         check("skip_in_codex in codex mode", skipped is True and "skipped in codex mode" in buf.getvalue())
         check("skip_in_codex in claude mode", skip_in_codex("t", "why", load(f, env={})) is False)
+    # [wt] defaults and the scope worktree_root key.
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "w.toml")
+        with open(f, "w") as fh:
+            fh.write('[wt]\nsize_cap_kb = 7\npublic_repos = ["~/pub", "rel"]\nroot = "wts"\n'
+                     '[[scopes]]\nname = "a"\nroot = "%s/a"\nworktree_root = "wt"\n'
+                     '[[scopes]]\nname = "b"\nroot = "%s/b"\nworktree_root = "/abs/wt"\n'
+                     '[[scopes]]\nname = "c"\nroot = "%s/c"\n' % (d, d, d))
+        c = load(f)
+        check("wt keys resolve", c["wt"]["size_cap_kb"] == 7 and c["wt"]["root"] == os.path.join(d, "wts")
+              and c["wt"]["public_repos"] == [os.path.expanduser("~/pub"), os.path.join(d, "rel")]
+              and c["wt"]["token_command"] == "gh auth token")
+        check("scope worktree_root: relative, absolute, unset",
+              [s["worktree_root"] for s in c["scopes"]] == [os.path.join(d, "a", "wt"), "/abs/wt", ""])
+        with open(f, "w") as fh:
+            fh.write("[wt]\nsize_cap_kb = 0\n")
+        try:
+            load(f)
+            check("wt.size_cap_kb 0 refused", False)
+        except ConfigError:
+            check("wt.size_cap_kb 0 refused", True)
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)

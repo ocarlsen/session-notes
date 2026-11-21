@@ -117,6 +117,8 @@ whether each one is working or idle, and deliver parked specs. `sh install.sh --
 toolkit (the `/find-session` skill, memory checks, the message
 bus for scripts, a clock hook and an example guard hook), described in
 [docs/tools.md](docs/tools.md).
+`bin/wt.py` gives any git repo a worktree per change and a PR that merges only on a recorded
+review verdict (also in docs/tools.md).
 
 ## Works with Codex
 

@@ -76,12 +76,67 @@ fixed line (never the message) into its empty input box.
 | Skill feedback | `bin/skill_feedback.py`; a ledger `<claude_home>/skill-feedback/<skill>.jsonl` per skill | Logs how the user corrects a skill's own output (edit / reject / approve, quoted verbatim), captured by `/reflect` (Step 2b). `propose` groups unresolved rows by habit and reports which have enough evidence (default: 3+ rows from 2+ sessions) to act on; it never edits a SKILL.md itself. `canary` prints the derived "N skills used, M rows logged" line. |
 | Session coordination | `bin/session_peers.py`, `session_lineage.py`, `handoff_session.py`, `bcast.py`; `hooks/session_pane_registry.py` | List and peek at sibling sessions, launch a worker session and record who launched it, show the lineage tree, broadcast a line you type to every session. |
 | Bus | `bin/session_bus.py`, `bus_nudge.py`; `hooks/session_bus_hook.py` | Staged specs and mail from scripts, addressed by tmux session name, delivered at least once; wake idle recipients. |
+| Worktrees | `bin/wt.py`, `githooks/pre-commit` | A worktree per change, a PR that merges only on a review verdict, and a staged-content pre-commit. See the `wt` section below. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
 | Example guard | `hooks/em_dash_guard.py` | A harmless PostToolUse hook showing the pattern: it flags em dashes in text the model just wrote and asks for a rewrite. |
 
 Every script has a `--selftest`; `make test` runs them all with `HOME`
 pointed at a temp dir, plus smoke tests that run each hook the way Claude
 Code does.
+
+## wt: a worktree per change, and a PR you cannot merge unreviewed
+
+`bin/wt.py` works in any git repo (run it anywhere inside one, a worktree included). One change
+gets its own branch and worktree off `origin/<default>`, so parallel sessions never share a
+working tree.
+
+| Command | What it does |
+| --- | --- |
+| `wt.py new <name>` | Fetch, then `git worktree add <path> -b <name> origin/<default>`; prints the path. On a repo's first use it installs the pre-commit hook (below). |
+| `wt.py pr [--title T] [--body B] [--dry-run]` | From a worktree on a non-default branch: refuses a dirty tree (exit 4) and a branch that already has a MERGED PR (exit 5), then pushes and opens the PR. `--dry-run` prints the push and create commands and runs nothing. wt never auto-commits. |
+| `wt.py merge [name] [--dry-run]` | Refuses a dirty or unpushed worktree (4), runs the verdict gate (6), then squash-merges, removes the worktree and its local branch, and fast-forwards the main checkout if it is on the default branch and clean. |
+| `wt.py list` | The repo's worktrees: dirty, commits ahead of origin, PR state (`?` offline). |
+| `wt.py rm <name> [--force]` | Removes a worktree and branch; refuses dirty or unpushed work without `--force`. |
+| `wt.py gc [--yes]` | Lists worktrees whose PR is merged or closed, or whose remote branch is gone. Skips, and says why, any that is dirty or holds commits on no remote branch. Asks y/N per item on a terminal; `--yes` removes all listed; without a terminal and without `--yes` it only lists. Run it by hand, never from a scheduled job. |
+| `wt.py install-hooks [repo]` | Installs the pre-commit (below). |
+
+Exit codes: 1 usage or fatal, 2 not in a worktree, 3 token command failed, 4 dirty or unpushed,
+5 branch already merged, 6 verdict gate refused.
+
+**Where a worktree goes**, first rule that applies: (1) the deepest `[[scopes]]` entry that
+contains the repo and sets `worktree_root` (relative to the scope root, or absolute):
+`<worktree_root>/<name>`; (2) `[wt].root`: `<root>/<repo name>/<name>`; (3) the repo tracks a
+`CLAUDE.md` at its root: a hidden sibling, `<parent>/.<repo name>-worktrees/<name>`, because a
+worktree nested inside the repo would also load the main checkout's `CLAUDE.md`; (4)
+`<repo>/.worktrees/<name>`, with `/.worktrees/` added once to `.git/info/exclude`.
+
+**Config** (`[wt]`, defaults in `config.example.toml`): `token_command` (shell command whose
+output is a GitHub token; exported as `GH_TOKEN` to every `gh` call; failing or empty is exit 3,
+never a silent fallback), `root`, `public_repos`, `size_cap_kb`, `leak_terms`. Every `gh` call
+runs the executable in `$WT_GH` (default `gh`).
+
+**The verdict gate.** A review is a PR comment whose first line is exactly
+
+```
+Review verdict: APPROVE <40-hex head sha>
+```
+
+or `Review verdict: CHANGES <sha>`. `merge` reads the PR's comments and the token's own login and
+considers only that login's comments, so a stranger commenting on a public repo cannot approve.
+The newest verdict comment must be APPROVE and its sha must equal the PR's current head, so a
+push after the approval voids it. It refuses, saying which condition failed: no verdict, newest
+is CHANGES, approved sha differs from the head, or only other authors' verdicts exist.
+`parse_verdict` and `verdict_line` in `wt.py` are the one definition of the format.
+
+**The pre-commit** (`githooks/pre-commit`) checks only what is staged: API-key shapes (the
+pattern from `tests/leak_scan.py`) and PEM private-key headers; any file over `size_cap_kb`; and,
+only for repos listed in `public_repos`, the private terms in `leak_terms` (a missing terms file
+fails the commit). It prints each finding with its file and exits 1.
+`wt.py install-hooks` (or `sh install.sh --git-hooks <repo>`) writes a small shim to
+`<git-dir>/hooks/pre-commit`. An existing hook is never replaced: it is moved to
+`pre-commit.pre-session-notes` and the shim runs it after the checks pass (the install refuses
+if that name is already taken). Re-running changes nothing. If the repo sets `core.hooksPath`,
+nothing is written and the command says so; wt never sets or changes `core.hooksPath`.
 
 ## Skill feedback: skills that improve from being corrected
 
