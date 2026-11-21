@@ -117,7 +117,7 @@ def lock_path():
     return notes_config.shared_state_path("bus_nudge.lock")
 
 
-def acquire_single_instance(path=None, out=None):
+def acquire_single_instance(path=None, out=None, wait=True):
     """Hold an exclusive lock for the life of the loop, so two loops (a tmux one and a
     launchd one, say) never both type nudges. A second loop waits here until the first
     exits, then takes over. Returns the open lock file; keep it referenced."""
@@ -130,6 +130,10 @@ def acquire_single_instance(path=None, out=None):
     except OSError:
         fh.seek(0)
         holder = fh.read().strip() or "unknown"
+        if not wait:
+            out.write("bus_nudge: another loop is running (pid %s); not nudging\n" % holder)
+            fh.close()
+            return None
         out.write("bus_nudge: another loop is running (pid %s); waiting to take over\n" % holder)
         out.flush()
         fcntl.flock(fh, fcntl.LOCK_EX)
@@ -147,13 +151,13 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
     # None = tmux could not be asked (not on PATH, or no server yet). Say so once per
     # outage, so a loop that cannot see any session is never silent about it.
     if panes is None:
-        if "_tmux_unreachable" not in errored:
-            errored.add("_tmux_unreachable")
+        if "tmux:unreachable" not in errored:
+            errored.add("tmux:unreachable")
             print("bus_nudge: cannot reach tmux (not on PATH, or no server running); "
                   "nudging nothing until it answers", flush=True)
         return
-    if "_tmux_unreachable" in errored:
-        errored.discard("_tmux_unreachable")
+    if "tmux:unreachable" in errored:
+        errored.discard("tmux:unreachable")
         print("bus_nudge: tmux answers again", flush=True)
     by_session = {}
     for p in panes:
@@ -349,6 +353,10 @@ def selftest():
     with tf.TemporaryDirectory() as d:
         lp = os.path.join(d, "bus_nudge.lock")
         held = acquire_single_instance(lp, out=io.StringIO())
+        nb_out = io.StringIO()
+        check("a non-waiting acquire (--once) refuses while a loop holds the lock",
+              acquire_single_instance(lp, out=nb_out, wait=False) is None
+              and "not nudging" in nb_out.getvalue())
         child = sp.Popen([sys.executable, "-c",
                           "import sys; sys.path.insert(0, %r); import bus_nudge as b; "
                           "f = b.acquire_single_instance(%r); print('GOT', flush=True)"
@@ -384,7 +392,16 @@ def main():
     if args.selftest:
         return selftest()
 
-    lock = None if (args.dry_run or args.once) else acquire_single_instance()
+    if args.dry_run:
+        lock = None  # types nothing, so it may run beside a loop
+    elif args.once:
+        # One typing pass: refuse rather than nudge twice beside a running loop
+        # (waiting would hang for as long as that loop lives).
+        lock = acquire_single_instance(wait=False)
+        if lock is None:
+            return 1
+    else:
+        lock = acquire_single_instance()
     history, capped, errored = {}, set(), set()
     print("bus_nudge: every %ds, cap %d/session/hour%s. Ctrl-C to stop."
           % (args.interval, args.cap, " (dry run)" if args.dry_run else ""), flush=True)

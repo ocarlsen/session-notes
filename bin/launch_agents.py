@@ -79,6 +79,9 @@ def job_spec(job, python, home=None, which=shutil.which):
     else:
         spec["RunAtLoad"] = True
         spec["KeepAlive"] = True
+        # A loop that crashes at start (a bad config, say) is restarted at most once a
+        # minute, so its traceback cannot flood the unrotated .err log.
+        spec["ThrottleInterval"] = 60
         # The loop prints one line per state change; unbuffered so the log is live.
         spec["EnvironmentVariables"]["PYTHONUNBUFFERED"] = "1"
     return spec
@@ -187,6 +190,7 @@ def selftest():
         bn = job_spec("bus-nudge", "/usr/bin/python3", home, which)
         check("bus-nudge: KeepAlive + RunAtLoad, no calendar",
               bn["KeepAlive"] is True and bn["RunAtLoad"] is True and "StartCalendarInterval" not in bn)
+        check("bus-nudge restarts at most once a minute", bn["ThrottleInterval"] == 60)
         check("job PATH starts with the dir tmux lives in",
               bn["EnvironmentVariables"]["PATH"].split(":")[0] == "/opt/tools/bin")
         check("bus-nudge runs the linked bus_nudge.py",
