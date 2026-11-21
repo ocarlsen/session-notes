@@ -12,6 +12,7 @@
 #     (it shows what it would add and keeps a .bak-session-notes copy first);
 #     not in a terminal, or with --dry-run, it prints both for you to paste
 #   - with --all: every skill in skills/, every tool, and the optional hooks
+#   - offers to run the memory checks nightly, for every installed agent
 #
 # What it never does: change settings.json or a CLAUDE.md without a yes, touch
 # your memory files, or overwrite anything that is not already a symlink it created.
@@ -42,7 +43,7 @@ while [ $# -gt 0 ]; do
     --all) ALL=1; shift ;;
     --yes|-y) YES=1; shift ;;
     --codex) CODEX=1; shift ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -75,7 +76,7 @@ if [ "$ALL" = 1 ]; then
   # skills/codex/ holds the Codex variants (install.sh --codex), not a Claude skill.
   SKILLS=$(for d in "$REPO"/skills/*/; do n=$(basename "$d"); [ "$n" = codex ] || echo "$n"; done)
   TOOLS="$TOOLS session_bus bus_nudge reflect_lock append_memory_index memory_index_lint \
-         boot_budget memory_hygiene_canary notes_config"
+         boot_budget memory_hygiene_canary nightly_check notes_config"
 fi
 
 # In a terminal (or with --yes) every step asks first; otherwise links are made as before and
@@ -88,6 +89,21 @@ ask() {  # ask QUESTION: 0 on a yes. --yes answers yes; no answer means no.
   printf '%s [y/N] ' "$1"
   read -r answer || answer=""
   case "$answer" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# The memory checks for every installed agent, nightly (bin/nightly_check.py). On macOS a
+# yes writes a LaunchAgent; elsewhere it prints the crontab line.
+offer_schedule() {
+  echo
+  if [ "$DRY" = 1 ]; then
+    python3 "$REPO/bin/nightly_check.py" schedule --dry-run
+  elif [ "$ASK" = 1 ]; then
+    if ask "Run the memory checks every night (bin/nightly_check.py, every installed agent)?"; then
+      python3 "$REPO/bin/nightly_check.py" schedule --yes
+    fi
+  else
+    echo "To run the memory checks every night: python3 $SHOWN/bin/nightly_check.py schedule"
+  fi
 }
 
 if [ "$CODEX" = 1 ]; then
@@ -203,6 +219,7 @@ RULE
 Then trust the hook: /hooks in the Codex CLI, or Settings > Hooks in the desktop app.
 Codex trusts a hook by its hash, so re-trust it after any edit. Details: docs/codex.md
 TXT
+  offer_schedule
   exit 0
 fi
 
@@ -279,6 +296,7 @@ if [ "$ASK" = 1 ]; then
 
 Check, inside tmux: $CHECK
 EOF
+  offer_schedule
   exit 0
 fi
 
@@ -295,3 +313,4 @@ $(cat "$REPO/CLAUDE.snippet.md")
 
 Optional: config.example.toml lists project scopes. Check, inside tmux: python3 $SHOWN/bin/session_peers.py
 EOF
+offer_schedule

@@ -183,6 +183,9 @@ def budget_table():
         table[os.path.join(s["root"], "CLAUDE.md")] = claude_md
         table[os.path.join(s["store"], "MEMORY.md")] = _budget_setting("scope_index_bytes")
         table[os.path.join(s["store"], "RESUME.md")] = resume
+    # Per-file [[budget_file]] entries win over the per-kind defaults above.
+    for b in _cfg().get("budget_file", []):
+        table[b["path"]] = b["bytes"]
     table.update(BUDGETS)
     return table
 
@@ -689,6 +692,25 @@ def selftest():
             BUDGETS[str(global_resume)] = 7
             check(budget_for(str(global_resume)) == 7, "a BUDGETS override wins over the config-derived entry")
             del BUDGETS[str(global_resume)]
+            bf_file = Path(d) / "config-bf.toml"
+            _write(bf_file, cfg_file.read_text() + (
+                "[[budget_file]]\n"
+                f'path = "{global_mem}"\n'
+                "bytes = 555\n"
+                "[[budget_file]]\n"
+                f'path = "{Path(d) / "extra.md"}"\n'
+                "bytes = 66\n"))
+            os.environ["SESSION_NOTES_CONFIG"] = str(bf_file)
+            reload_config()
+            table = budget_table()
+            check(table.get(str(global_mem)) == 555, "a [[budget_file]] entry wins over the per-kind default")
+            check(table.get(str(Path(d) / "extra.md")) == 66, "a [[budget_file]] entry can budget a file no kind covers")
+            check(table.get(str(scope_mem)) == 100, "files without a [[budget_file]] entry keep the per-kind default")
+            BUDGETS[str(global_mem)] = 9
+            check(budget_for(str(global_mem)) == 9, "a BUDGETS override still wins over [[budget_file]]")
+            del BUDGETS[str(global_mem)]
+            os.environ["SESSION_NOTES_CONFIG"] = str(cfg_file)
+            reload_config()
 
             # --- resolve_imports: basic + recursive ---
             order = resolve_imports(str(global_claude))
