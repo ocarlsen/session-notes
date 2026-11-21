@@ -26,7 +26,7 @@ looks for the cruft and drift that accumulate as /reflect writes to a store:
      imported              entry point. It must never be: the whole point of the cold
                            tier is that it does not pay boot-prefix rent.
  10. Orphan STORE        -- a whole store (`<claude_home>/projects/<slug>/memory/`) that
-                           is non-empty per _non_empty_stores() (real memory files, or a
+                           is non-empty per non_empty_stores() (real memory files, or a
                            real RESUME.md narrative) but whose MEMORY.md no CLAUDE.md
                            entry point @imports. Everything it holds loads NOWHERE: the
                            store-level version of check 1's per-file orphan. Spans every
@@ -113,6 +113,17 @@ INDEX_LINK_RE = re.compile(r"\]\(([^)]+\.md)\)")
 
 
 # --- Config ---------------------------------------------------------------------
+def manifest_paths(cfg):
+    """Realpaths of every scope's declared `manifest`. A manifest is structural: it
+    describes the scope, it is not a memory entry, so it is never an orphan."""
+    return frozenset(os.path.realpath(s["manifest"])
+                     for s in cfg.get("scopes", []) if s.get("manifest"))
+
+
+def agent_kind(cfg):
+    return cfg.get("agent", {}).get("kind", "claude")
+
+
 def configured_stores(cfg):
     """[(label, store_path, threshold)] for the global store and every scope store,
     deduped by realpath (a scope may point its store at the global one)."""
@@ -120,13 +131,19 @@ def configured_stores(cfg):
     g_thr = budgets.get("global_index_bytes", DEFAULT_GLOBAL_INDEX_THRESHOLD)
     s_thr = budgets.get("scope_index_bytes", DEFAULT_SCOPE_INDEX_THRESHOLD)
     out, seen = [], set()
-    entries = [("global", cfg["paths"]["global_store"], g_thr)]
-    entries += [(s["name"], s["store"], s_thr) for s in cfg.get("scopes", [])]
-    for label, store, thr in entries:
+    entries = [("global", cfg["paths"]["global_store"], g_thr,
+                cfg["paths"].get("global_store_derived", False))]
+    entries += [(s["name"], s["store"], s_thr, s.get("store_derived", False))
+                for s in cfg.get("scopes", [])]
+    for label, store, thr, derived in entries:
         rp = os.path.realpath(store)
         if rp in seen:
             continue
         seen.add(rp)
+        # A derived store appears on the agent's first save to it; until then there
+        # is nothing to check, and its absence is not a finding.
+        if derived and not os.path.exists(store):
+            continue
         out.append((label, Path(store), thr))
     return out
 
@@ -273,18 +290,20 @@ def _empty_findings():
     return {k: [] for k, _ in _CATEGORY_TITLES}
 
 
-def run_checks(store_path, threshold=DEFAULT_GLOBAL_INDEX_THRESHOLD):
+def run_checks(store_path, threshold=DEFAULT_GLOBAL_INDEX_THRESHOLD, skip=frozenset()):
     """Run all per-store checks against one store dir. Returns (findings, summary).
 
     findings: dict category -> list[str]
     summary:  dict of derived counts for the report header.
     threshold: MEMORY.md size (chars) above which check 7 fires.
+    skip: realpaths of structural files beyond NON_MEMORY (the scopes' manifests).
     """
     store_path = Path(store_path)
     findings = _empty_findings()
 
     disk_files = sorted(
-        p.name for p in store_path.glob("*.md") if p.name not in NON_MEMORY
+        p.name for p in store_path.glob("*.md")
+        if p.name not in NON_MEMORY and os.path.realpath(str(p)) not in skip
     )
     disk_set = set(disk_files)
 
@@ -419,7 +438,7 @@ def reference_imported_findings(cfg, reached=None):
 
 
 # --- Check 10: orphan STORE, a whole store nothing @imports -----------------------
-def _non_empty_stores(cfg):
+def non_empty_stores(cfg):
     """Yield (store_dir, md_files, content_files) for every
     `<claude_home>/projects/*/memory` dir on disk, plus every configured store, that is
     NOT the anti-population (a bare MEMORY.md stub, or a content-free scratch dir).
@@ -443,7 +462,9 @@ def _non_empty_stores(cfg):
             continue
         seen.add(rp)
         md_files = sorted(store_dir.glob("*.md"))
-        content_files = [p for p in md_files if p.name not in STRUCTURAL]
+        skip = manifest_paths(cfg)
+        content_files = [p for p in md_files if p.name not in STRUCTURAL
+                         and os.path.realpath(str(p)) not in skip]
         if content_files:
             yield store_dir, md_files, content_files
             continue
@@ -517,7 +538,7 @@ def orphan_store_findings(cfg, reached=None):
     reached = reached_files(cfg) if reached is None else reached
     known = {os.path.realpath(str(s)) for _, s, _ in configured_stores(cfg)}
     findings = []
-    for store_dir, md_files, content_files in _non_empty_stores(cfg):
+    for store_dir, md_files, content_files in non_empty_stores(cfg):
         memory_md = store_dir / "MEMORY.md"
         check_files = [memory_md] if memory_md.is_file() else md_files
         if any(os.path.realpath(str(p)) in reached for p in check_files):
@@ -568,10 +589,10 @@ _CATEGORY_TITLES = [
 ]
 
 
-def build_report(results):
+def build_report(results, kind="claude"):
     """results: list of (label, store_path, findings, summary)."""
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    out = ["# Memory-hygiene canary, %s (UTC)" % stamp, ""]
+    out = ["# Memory-hygiene canary (%s), %s (UTC)" % (kind, stamp), ""]
     for label, store_path, findings, summary in results:
         out.append("## Store: %s  (%s)" % (label, store_path))
         header = (
@@ -607,6 +628,17 @@ def report_mode(cfg, out=None):
     out = sys.stdout if out is None else out
     results = []
     any_found = False
+    skip = manifest_paths(cfg)
+    kind = agent_kind(cfg)
+    # A scope whose ROOT is gone is a moved or mistyped config entry: its derived
+    # store would otherwise drop out of the report silently (configured_stores skips
+    # a derived store that does not exist yet, which is normal only for a real root).
+    for s in cfg.get("scopes", []):
+        if not os.path.isdir(s["root"]):
+            findings = _empty_findings()
+            findings["frontmatter_drift"] = ["SCOPE ROOT MISSING: %s (scope %r)" % (s["root"], s["name"])]
+            results.append((s["name"], Path(s["store"]), findings, dict(_EMPTY_SUMMARY)))
+            any_found = True
     for label, store_path, threshold in configured_stores(cfg):
         if not store_path.exists():
             # A configured store that does not exist is itself worth surfacing.
@@ -617,14 +649,18 @@ def report_mode(cfg, out=None):
             results.append((label, store_path, findings, dict(_EMPTY_SUMMARY)))
             any_found = True
             continue
-        findings, summary = run_checks(store_path, threshold)
+        findings, summary = run_checks(store_path, threshold, skip)
         if has_findings(findings):
             any_found = True
         results.append((label, store_path, findings, summary))
 
-    reached = reached_files(cfg)
-    ref_imported = reference_imported_findings(cfg, reached)
-    orphan_stores = orphan_store_findings(cfg, reached)
+    # Claude Code only: @import reachability and its per-project store layout. In
+    # codex mode the store checks above still run, on Codex's own stores.
+    ref_imported, orphan_stores = [], []
+    if kind == "claude":
+        reached = reached_files(cfg)
+        ref_imported = reference_imported_findings(cfg, reached)
+        orphan_stores = orphan_store_findings(cfg, reached)
     if ref_imported or orphan_stores:
         any_found = True
 
@@ -632,7 +668,7 @@ def report_mode(cfg, out=None):
         return 0  # silent when clean
 
     # Clean stores stay in the report for context.
-    report = build_report(results)
+    report = build_report(results, kind)
     if ref_imported:
         report += "\n## REFERENCE.md imported into a boot set\n\n"
         report += "\n".join("- " + f for f in ref_imported) + "\n"
@@ -1040,6 +1076,65 @@ def selftest():
         check(report_mode(cfg2, cap) == EXIT_FINDINGS and "STORE MISSING" in cap.text(),
               "report_mode(): a configured but missing store is reported")
 
+    # --- a declared scope manifest is structural; the same file undeclared is not ---
+    with tempfile.TemporaryDirectory() as d:
+        scope_root = os.path.join(d, "alpha")
+        scope_store = os.path.join(d, "alpha-store")
+        _write(Path(scope_store) / "reference_y.md", _mem_file("y"))
+        _write(Path(scope_store) / "MEMORY.md", "# Memory Index\n\n- [Y](reference_y.md) -- hook\n")
+        _write(Path(scope_store) / "scope-manifest.md", "Routing for alpha.\nkey: value\n")
+        undeclared = _test_cfg(d, [{"name": "alpha", "root": scope_root, "store": scope_store}])
+        f, _ = run_checks(scope_store, 300, manifest_paths(undeclared))
+        check(any("scope-manifest.md" in x for x in f["orphan_files"]),
+              "an undeclared non-memory file is still an orphan (anti-population)")
+        declared = _test_cfg(d, [{"name": "alpha", "root": scope_root, "store": scope_store,
+                                  "manifest": os.path.join(scope_store, "scope-manifest.md")}])
+        f, _ = run_checks(scope_store, 300, manifest_paths(declared))
+        check(not has_findings(f), "a declared manifest is neither an orphan nor frontmatter drift")
+        check(not any(c.name == "scope-manifest.md" for _, _, c in non_empty_stores(declared)
+                      for c in c),
+              "a declared manifest does not count as store content")
+
+    # --- a derived store that does not exist yet is skipped; a named one is reported ---
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "fresh"))
+        cfg = _test_cfg(d, [{"name": "fresh", "root": os.path.join(d, "fresh"),
+                             "store": os.path.join(d, "never-saved"), "store_derived": True}])
+        cfg["paths"]["global_store_derived"] = True
+        cap = _Capture()
+        check(report_mode(cfg, cap) == 0 and cap.text() == "",
+              "fresh install: derived stores not created yet are silent, exit 0")
+        cfg["scopes"][0]["store_derived"] = False
+        cap = _Capture()
+        check(report_mode(cfg, cap) == EXIT_FINDINGS and "STORE MISSING" in cap.text()
+              and "never-saved" in cap.text(),
+              "a NAMED store that is missing is still reported")
+        cfg["scopes"][0]["store_derived"] = True
+        cfg["scopes"][0]["root"] = os.path.join(d, "frsh")  # a typo in the root
+        cap = _Capture()
+        check(report_mode(cfg, cap) == EXIT_FINDINGS and "SCOPE ROOT MISSING" in cap.text()
+              and "frsh" in cap.text(),
+              "a scope whose root does not exist is reported, even with a derived store")
+
+    # --- codex mode: store checks run on the selected stores, Claude-only checks do not ---
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _test_cfg(d)
+        cfg["agent"] = {"kind": "codex"}
+        g_store = Path(cfg["paths"]["global_store"])
+        _write(g_store / "MEMORY.md", "# Memory Index\n\n- [Gone](reference_gone.md) -- hook\n")
+        saved = reached_files
+        called = []
+        globals()["reached_files"] = lambda c: called.append(1) or {}
+        try:
+            cap = _Capture()
+            rc = report_mode(cfg, cap)
+        finally:
+            globals()["reached_files"] = saved
+        check(rc == EXIT_FINDINGS and "reference_gone.md" in cap.text(),
+              "codex mode: the store checks run and report a dangling entry")
+        check(not called, "codex mode: the Claude-only @import checks are skipped")
+        check("(codex)" in cap.text(), "the report names the agent kind")
+
     print("\nSELFTEST:", "PASS" if ok[0] else "FAIL")
     return 0 if ok[0] else 1
 
@@ -1060,9 +1155,6 @@ def main():
         cfg = notes_config.load()
     except notes_config.ConfigError as exc:
         sys.exit("memory_hygiene_canary: bad config: %s" % exc)
-    if notes_config.skip_in_codex("memory_hygiene_canary", "its checks include Claude Code's own "
-                                  "per-project stores", cfg):
-        return 0
     return report_mode(cfg)
 
 

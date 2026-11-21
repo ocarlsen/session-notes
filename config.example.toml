@@ -59,6 +59,12 @@ unlisted_claude_md_bytes = 40000
 # Folders walked (depth 3) for CLAUDE.md files outside any scope.
 sweep_roots = ["~/Projects"]
 
+# A per-file budget that wins over the per-kind ones above. One block per file.
+#
+# [[budget_file]]
+# path = "~/.claude/CLAUDE.md"
+# bytes = 8000
+
 # One block per project folder that keeps its own memory store.
 # `store` is optional, and best left out: empty = the folder Claude Code
 # already keeps for that project, named after its full path, e.g.
@@ -69,3 +75,6 @@ sweep_roots = ["~/Projects"]
 # name = "recipes-app"
 # root = "~/code/recipes-app"
 # store = ""
+# # Optional: a file that describes the scope (routing notes for /reflect). The
+# # canary treats it as part of the scope, not as a memory entry. Relative to root.
+# manifest = ""

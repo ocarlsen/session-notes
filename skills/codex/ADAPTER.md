@@ -69,5 +69,6 @@ NEW to this session: report each item as new, never "no material changes".
 | a command run backgrounded (`run_in_background: true`) | run it in the foreground. `codex_save.py commit` waits up to 15 minutes for the lock by itself; if it exits 2 (timeout), report the stuck holder and ask. Never ask "wait or go?". |
 | `session_peers.py`, `--peek`, ListAgents, SendMessage, the bus | skip: sibling peeks and messages are Claude Code and tmux only for now. Say nothing about siblings. |
 | "Skill tool calls" when listing skills used (reflect Step 2b) | skills the user invoked as `$name` this session |
-| `boot_budget.py`, `memory_hygiene_canary.py`, `skill_feedback.py canary` | skip them. In codex mode each prints a one-line skip and exits 0, so if one runs anyway, that line is not a finding. |
+| `boot_budget.py`, `skill_feedback.py canary` | skip them. In codex mode each prints a one-line skip and exits 0, so if one runs anyway, that line is not a finding. |
+| `memory_hygiene_canary.py` | run it as written: in codex mode it checks Codex's own stores. |
 | `/reflect`, `/refresh`, `/rnr` in prose and replies | `$reflect`, `$refresh`, `$rnr` |

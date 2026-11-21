@@ -115,6 +115,9 @@ DEFAULTS = {
     # Each scope is a project folder with its own memory store. `store` may be
     # empty, meaning ~/.claude/projects/<encoded root>/memory.
     "scopes": [],
+    # Per-file boot budgets that win over the per-kind ones in [budgets]: one
+    # [[budget_file]] block per file, with `path` and `bytes`.
+    "budget_file": [],
 }
 
 
@@ -278,6 +281,9 @@ def _resolve(cfg, base=None, env=None):
     # state_dir, NOT moved by codex mode. It holds no memory, so the
     # no-piggyback rule below does not apply to it.
     p["shared_state_dir"] = p["state_dir"]
+    # A derived store (not named in the config) is created on the first save, so
+    # "missing" is normal for it until then; a named one that is missing is a typo.
+    p["global_store_derived"] = kind == "codex" or not p["global_store"]
     if kind == "codex":
         notes = os.path.join(a["codex_home"], "session-notes")
         p["state_dir"] = os.path.join(notes, "state")
@@ -292,7 +298,7 @@ def _resolve(cfg, base=None, env=None):
     for i, s in enumerate(cfg["scopes"]):
         if not isinstance(s, dict) or not s.get("name") or not s.get("root"):
             raise ConfigError("scopes[%d] needs a name and a root" % i)
-        unknown = set(s) - {"name", "root", "store"}
+        unknown = set(s) - {"name", "root", "store", "manifest"}
         if unknown:
             raise ConfigError("scopes[%d]: unknown key(s) %s" % (i, sorted(unknown)))
         root = _abs(s["root"], base)
@@ -301,9 +307,26 @@ def _resolve(cfg, base=None, env=None):
         else:
             store = s.get("store") or os.path.join(
                 p["claude_home"], "projects", encode_project_dir(root), "memory")
+        manifest = s.get("manifest", "")
+        if not isinstance(manifest, str):
+            raise ConfigError("scopes[%d] (%s): manifest must be a path string" % (i, s["name"]))
+        # A relative manifest is relative to the scope ROOT, which both agents share.
         scopes.append({"name": s["name"], "root": root,
-                       "store": _abs(store, base)})
+                       "store": _abs(store, base),
+                       "store_derived": kind == "codex" or not s.get("store"),
+                       "manifest": _abs(manifest, root) if manifest.strip() else ""})
     cfg["scopes"] = scopes
+    files = []
+    for i, b in enumerate(cfg["budget_file"]):
+        if not isinstance(b, dict) or set(b) != {"path", "bytes"}:
+            raise ConfigError("budget_file[%d] needs exactly `path` and `bytes`, got %r" % (i, b))
+        if not isinstance(b["path"], str) or not b["path"].strip():
+            raise ConfigError("budget_file[%d]: path must be a non-empty string" % i)
+        if type(b["bytes"]) is not int or b["bytes"] <= 0:
+            raise ConfigError("budget_file[%d] (%s): bytes must be a positive integer, got %r"
+                              % (i, b["path"], b["bytes"]))
+        files.append({"path": _abs(b["path"], base), "bytes": b["bytes"]})
+    cfg["budget_file"] = files
     if kind == "codex":
         # The no-piggyback rule as a mechanism: a codex_home inside claude_home
         # (or a symlink into it) would make "separate memories" false.
@@ -472,6 +495,62 @@ store = "/tmp/beta-store"
             check("named missing config refused", False)
         except ConfigError as exc:
             check("named missing config refused", "typo.toml" in str(exc))
+        with open(f, "w") as fh:
+            fh.write('[[budget_file]]\npath = "~/x/CLAUDE.md"\nbytes = 8000\n'
+                     '[[budget_file]]\npath = "rel/MEMORY.md"\nbytes = 58000\n')
+        bf = load(f)["budget_file"]
+        check("budget_file parsed", [b["bytes"] for b in bf] == [8000, 58000]
+              and bf[0]["path"] == os.path.expanduser("~/x/CLAUDE.md")
+              and bf[1]["path"].endswith(os.path.join("rel", "MEMORY.md")) and os.path.isabs(bf[1]["path"]))
+        global _tomllib
+        saved, _tomllib = _tomllib, None
+        try:
+            bf3 = load(f)["budget_file"]
+        finally:
+            _tomllib = saved
+        check("budget_file parsed by the 3.9 fallback parser too", bf3 == bf)
+        for bad in ('[[budget_file]]\npath = "a"\n',
+                    '[[budget_file]]\npath = "a"\nbytes = 0\n',
+                    '[[budget_file]]\npath = "a"\nbytes = "8000"\n',
+                    '[[budget_file]]\npath = ""\nbytes = 10\n',
+                    '[[budget_file]]\npath = "a"\nbytes = 10\nextra = 1\n'):
+            with open(f, "w") as fh:
+                fh.write(bad)
+            try:
+                load(f)
+                check("bad budget_file %r refused" % bad, False)
+            except ConfigError as exc:
+                check("bad budget_file %r refused" % bad, "budget_file[0]" in str(exc))
+        with open(f, "w") as fh:
+            fh.write('[[scopes]]\nname = "m1"\nroot = "%s/m1"\nmanifest = "notes/scope.md"\n'
+                     '[[scopes]]\nname = "m2"\nroot = "%s/m2"\nmanifest = "~/abs/scope.md"\n'
+                     '[[scopes]]\nname = "m3"\nroot = "%s/m3"\n' % (d, d, d))
+        ms = [s["manifest"] for s in load(f)["scopes"]]
+        check("scope stores without `store` are derived",
+              all(s["store_derived"] for s in load(f)["scopes"]))
+        with open(f, "w") as fh:
+            fh.write('[paths]\nglobal_store = "/x/g"\n[[scopes]]\nname = "n"\nroot = "/x/n"\n'
+                     'store = "/x/s"\n')
+        named = load(f)
+        check("a named store is not derived (claude mode)",
+              not named["paths"]["global_store_derived"] and not named["scopes"][0]["store_derived"])
+        cx = load(f, env={"SESSION_NOTES_AGENT": "codex"})
+        check("every codex store is derived", cx["paths"]["global_store_derived"]
+              and cx["scopes"][0]["store_derived"])
+        with open(f, "w") as fh:
+            fh.write('[[scopes]]\nname = "m1"\nroot = "%s/m1"\nmanifest = "notes/scope.md"\n'
+                     '[[scopes]]\nname = "m2"\nroot = "%s/m2"\nmanifest = "~/abs/scope.md"\n'
+                     '[[scopes]]\nname = "m3"\nroot = "%s/m3"\n' % (d, d, d))
+        check("manifest relative to the scope root, ~ expanded, absent = empty",
+              ms == [os.path.join(d, "m1", "notes", "scope.md"),
+                     os.path.expanduser("~/abs/scope.md"), ""])
+        with open(f, "w") as fh:
+            fh.write('[[scopes]]\nname = "m1"\nroot = "/x"\nmanifest = 3\n')
+        try:
+            load(f)
+            check("non-string manifest refused", False)
+        except ConfigError as exc:
+            check("non-string manifest refused", "manifest" in str(exc))
         dangling = os.path.join(d, "dangling.toml")
         os.symlink(os.path.join(d, "gone.toml"), dangling)
         try:

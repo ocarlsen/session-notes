@@ -38,6 +38,9 @@ The README covers the default install: three skills and three commands. This pag
 - **Budgets.** Everything imported at boot competes for the same prefix.
   `boot_budget.py` keeps each file under a ceiling, and
   `memory_hygiene_canary.py` checks that index and files agree.
+  `nightly_check.py` runs both for every installed agent (Claude, Codex or
+  both, each against its own stores); `nightly_check.py schedule` offers to run
+  it every night.
 
 ## Talking between sessions: native first, the bus for two jobs
 
