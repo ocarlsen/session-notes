@@ -144,8 +144,8 @@ match the rule and falls back to an approval prompt.
   its own output instead, and Codex has no budget check yet) and
   `skill_feedback.py canary` (Codex documents its transcript format as unstable).
 - `nightly_check.py` runs the canary once per installed agent, each against its
-  own stores, plus `boot_budget.py check` for Claude. `nightly_check.py schedule`
-  offers to run it every night.
+  own stores, plus `boot_budget.py check` for Claude. On macOS,
+  `launch_agents.py install nightly-check` runs it every night.
 - Without the rule from install step 5, the desktop app asks once per save,
   for `codex_save.py commit`. "Allow similar commands" on that prompt saves
   the same rule.

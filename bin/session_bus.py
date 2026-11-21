@@ -664,7 +664,18 @@ def nudge_session_name(cfg=None):
 LAUNCH_BIN = os.path.dirname(os.path.abspath(__file__))
 
 
-def nudge_restart_line(cfg=None):
+def nudge_restart_line(cfg=None, agent_installed=None):
+    """How the user restarts the loop: through launchd when its LaunchAgent is
+    installed (launch_agents.py install bus-nudge), else in its own tmux session."""
+    if agent_installed is None:
+        try:
+            import launch_agents
+            agent_installed = launch_agents.installed("bus-nudge")
+        except Exception:
+            agent_installed = False
+    if agent_installed:
+        import launch_agents
+        return launch_agents.kickstart_line("bus-nudge")
     return "tmux new-session -d -s %s 'python3 %s'" % (
         nudge_session_name(cfg),
         os.path.join(LAUNCH_BIN, "bus_nudge.py").replace(os.path.expanduser("~"), "~", 1))
@@ -1115,12 +1126,24 @@ def selftest():
               nudge_session_name({"paths": {}}) == DEFAULT_NUDGE_SESSION)
         check("nudge session is configurable",
               nudge_session_name({"bus": {"nudge_session": "nb"}}) == "nb")
-        line = nudge_restart_line({"bus": {"nudge_session": "nb"}})
+        line = nudge_restart_line({"bus": {"nudge_session": "nb"}}, agent_installed=False)
         cmd_path = os.path.expanduser(line.rsplit(" ", 1)[1].rstrip("'"))
         check("restart line starts bus_nudge.py by this file's launch path",
               cmd_path == os.path.join(LAUNCH_BIN, "bus_nudge.py"))
         check("... which resolves to this repo's bus_nudge.py",
               os.path.realpath(cmd_path) == os.path.join(BIN, "bus_nudge.py"))
+        check("with the LaunchAgent installed, the restart line kicks it through launchd",
+              nudge_restart_line({}, agent_installed=True)
+              == "launchctl kickstart -k gui/%d/com.session-notes.bus-nudge" % os.getuid())
+        real_home = os.environ.get("HOME")
+        with tempfile.TemporaryDirectory() as fake_home:
+            os.environ["HOME"] = fake_home
+            try:
+                default_line = nudge_restart_line({"bus": {"nudge_session": "nb"}})
+            finally:
+                os.environ["HOME"] = real_home
+        check("by default the restart line is the tmux one when no LaunchAgent is installed",
+              default_line.startswith("tmux new-session -d -s nb "))
 
         # The bus lives in the tmux-wide state dir: a Codex-mode process (every Codex
         # shell command has SESSION_NOTES_AGENT=codex) must open the same bus.jsonl.

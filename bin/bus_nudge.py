@@ -6,10 +6,13 @@ idle session hears nothing until the user types in it. This loop types that
 prompt for them, but only into a session that has mail it has never been
 offered.
 
-The user runs it in its own tmux session, for example:
+The user starts it, one of two ways:
+    python3 /path/to/session-notes/bin/launch_agents.py install bus-nudge   # macOS:
+        a LaunchAgent; launchd starts it at login and restarts it if it exits
     tmux new-session -d -s bus-nudge 'python3 /path/to/session-notes/bin/bus_nudge.py'
-(session_bus.py prints that exact line, with the real path and the configured
-[bus] nudge_session name, when it notices the loop is down.)
+(session_bus.py prints the matching restart line, with the real path, when it
+notices the loop is down.) Only one loop runs at a time: a second one waits on a
+lock in the shared state dir until the first exits.
 
 HOW THIS SQUARES WITH bcast's "USER'S HANDS" RULE
 -------------------------------------------------
@@ -50,6 +53,7 @@ GUARDS
 """
 
 import argparse
+import fcntl
 import os
 import sys
 import time
@@ -61,6 +65,7 @@ if BIN not in sys.path:
 import bcast          # noqa: E402
 import session_bus    # noqa: E402
 import session_peers  # noqa: E402
+import notes_config   # noqa: E402
 
 NUDGE = ("[bus-nudge] You have session-bus mail in this turn's context. "
          "Act on it if it needs action. No need to reply with thanks or acks: reply "
@@ -108,10 +113,52 @@ def is_ready(p):
     return p["state"] != "working" and bcast.input_box_empty(session_peers.peek(p) or [])
 
 
+def lock_path():
+    return notes_config.shared_state_path("bus_nudge.lock")
+
+
+def acquire_single_instance(path=None, out=None, wait=True):
+    """Hold an exclusive lock for the life of the loop, so two loops (a tmux one and a
+    launchd one, say) never both type nudges. A second loop waits here until the first
+    exits, then takes over. Returns the open lock file; keep it referenced."""
+    out = out or sys.stdout
+    path = path or lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0)
+        holder = fh.read().strip() or "unknown"
+        if not wait:
+            out.write("bus_nudge: another loop is running (pid %s); not nudging\n" % holder)
+            fh.close()
+            return None
+        out.write("bus_nudge: another loop is running (pid %s); waiting to take over\n" % holder)
+        out.flush()
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
 def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=None):
     now = now or time.time()
     errored = errored if errored is not None else set()
-    panes = session_peers.list_peers() or []
+    panes = session_peers.list_peers()
+    # None = tmux could not be asked (not on PATH, or no server yet). Say so once per
+    # outage, so a loop that cannot see any session is never silent about it.
+    if panes is None:
+        if "tmux:unreachable" not in errored:
+            errored.add("tmux:unreachable")
+            print("bus_nudge: cannot reach tmux (not on PATH, or no server running); "
+                  "nudging nothing until it answers", flush=True)
+        return
+    if "tmux:unreachable" in errored:
+        errored.discard("tmux:unreachable")
+        print("bus_nudge: tmux answers again", flush=True)
     by_session = {}
     for p in panes:
         # is_agent: any harness in session_peers' table.
@@ -278,6 +325,55 @@ def selftest():
          session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
          session_peers.peek) = saved
 
+    # --- tmux unreachable: said once per outage, and the recovery is said too ---
+    import io
+    saved_lp, saved_out = session_peers.list_peers, sys.stdout
+    answers = [None, None, [], None]
+    session_peers.list_peers = lambda: answers.pop(0)
+    saved_ls = session_bus.live_sessions
+    session_bus.live_sessions = lambda: {}
+    buf = io.StringIO()
+    sys.stdout = buf
+    try:
+        err = set()
+        for _ in range(4):
+            tick({}, set(), errored=err)
+    finally:
+        sys.stdout = saved_out
+        session_peers.list_peers, session_bus.live_sessions = saved_lp, saved_ls
+    lines = buf.getvalue().splitlines()
+    check("tmux unreachable: one line per outage, plus one on recovery",
+          [l.split(" (")[0] for l in lines] == [
+              "bus_nudge: cannot reach tmux", "bus_nudge: tmux answers again",
+              "bus_nudge: cannot reach tmux"])
+
+    # --- single instance: a second loop waits for the first, then takes over ---
+    import subprocess as sp
+    import tempfile as tf
+    with tf.TemporaryDirectory() as d:
+        lp = os.path.join(d, "bus_nudge.lock")
+        held = acquire_single_instance(lp, out=io.StringIO())
+        nb_out = io.StringIO()
+        check("a non-waiting acquire (--once) refuses while a loop holds the lock",
+              acquire_single_instance(lp, out=nb_out, wait=False) is None
+              and "not nudging" in nb_out.getvalue())
+        child = sp.Popen([sys.executable, "-c",
+                          "import sys; sys.path.insert(0, %r); import bus_nudge as b; "
+                          "f = b.acquire_single_instance(%r); print('GOT', flush=True)"
+                          % (BIN, lp)], stdout=sp.PIPE, text=True)
+        time.sleep(1.0)
+        waiting = child.poll() is None
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+        try:
+            out, _ = child.communicate(timeout=10)
+        except sp.TimeoutExpired:
+            child.kill()
+            out = ""
+        check("a second loop blocks while the first holds the lock", waiting)
+        check("it says it is waiting, then takes over when the first exits",
+              "another loop is running (pid %d)" % os.getpid() in out and "GOT" in out)
+
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
@@ -296,6 +392,16 @@ def main():
     if args.selftest:
         return selftest()
 
+    if args.dry_run:
+        lock = None  # types nothing, so it may run beside a loop
+    elif args.once:
+        # One typing pass: refuse rather than nudge twice beside a running loop
+        # (waiting would hang for as long as that loop lives).
+        lock = acquire_single_instance(wait=False)
+        if lock is None:
+            return 1
+    else:
+        lock = acquire_single_instance()
     history, capped, errored = {}, set(), set()
     print("bus_nudge: every %ds, cap %d/session/hour%s. Ctrl-C to stop."
           % (args.interval, args.cap, " (dry run)" if args.dry_run else ""), flush=True)
