@@ -80,10 +80,15 @@ def run_all(env=None, run=None, out=None):
             text = (r.stdout or "") + (r.stderr or "")
             if r.returncode == 0:
                 continue
-            # boot_budget check exits 1 on a finding; the canary exits 3. Anything
-            # else, or a traceback, is a crash and outranks findings.
-            crashed = "Traceback" in text or r.returncode not in (
-                (1, EXIT_FINDINGS) if name == "boot_budget" else (EXIT_FINDINGS,))
+            # boot_budget check exits 1 on a finding (each a FILE/SCOPE line); the canary
+            # exits 3. Anything else, a traceback, or a boot_budget 1 with no finding line
+            # (a bad config, say) is a crash and outranks findings.
+            if name == "boot_budget":
+                crashed = r.returncode != 1 or not any(
+                    ln.startswith(("FILE ", "SCOPE ")) for ln in text.splitlines())
+            else:
+                crashed = r.returncode != EXIT_FINDINGS
+            crashed = crashed or "Traceback" in text
             out.write("== %s: %s (%s) ==\n%s\n" % (
                 kind, name, "CRASHED rc=%d" % r.returncode if crashed else "findings",
                 text.rstrip()))
@@ -214,6 +219,8 @@ def selftest():
         run, _ = fake({("claude", "boot_budget.py"): R(1, "FILE x: over budget"),
                        ("codex", "memory_hygiene_canary.py"): R(3, "x")})
         check("boot_budget's exit 1 is a finding, not a crash", run_all(env, run, _Buf()) == 3)
+        run, _ = fake({("claude", "boot_budget.py"): R(1, "boot_budget: bad config: x")})
+        check("boot_budget's exit 1 with no FILE/SCOPE line is a crash", run_all(env, run, _Buf()) == 1)
 
         run, _ = fake({("claude", "memory_hygiene_canary.py"): R(1, "Traceback (most recent")})
         buf = _Buf()

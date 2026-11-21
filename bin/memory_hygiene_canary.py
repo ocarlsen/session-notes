@@ -26,7 +26,7 @@ looks for the cruft and drift that accumulate as /reflect writes to a store:
      imported              entry point. It must never be: the whole point of the cold
                            tier is that it does not pay boot-prefix rent.
  10. Orphan STORE        -- a whole store (`<claude_home>/projects/<slug>/memory/`) that
-                           is non-empty per _non_empty_stores() (real memory files, or a
+                           is non-empty per non_empty_stores() (real memory files, or a
                            real RESUME.md narrative) but whose MEMORY.md no CLAUDE.md
                            entry point @imports. Everything it holds loads NOWHERE: the
                            store-level version of check 1's per-file orphan. Spans every
@@ -438,7 +438,7 @@ def reference_imported_findings(cfg, reached=None):
 
 
 # --- Check 10: orphan STORE, a whole store nothing @imports -----------------------
-def _non_empty_stores(cfg):
+def non_empty_stores(cfg):
     """Yield (store_dir, md_files, content_files) for every
     `<claude_home>/projects/*/memory` dir on disk, plus every configured store, that is
     NOT the anti-population (a bare MEMORY.md stub, or a content-free scratch dir).
@@ -538,7 +538,7 @@ def orphan_store_findings(cfg, reached=None):
     reached = reached_files(cfg) if reached is None else reached
     known = {os.path.realpath(str(s)) for _, s, _ in configured_stores(cfg)}
     findings = []
-    for store_dir, md_files, content_files in _non_empty_stores(cfg):
+    for store_dir, md_files, content_files in non_empty_stores(cfg):
         memory_md = store_dir / "MEMORY.md"
         check_files = [memory_md] if memory_md.is_file() else md_files
         if any(os.path.realpath(str(p)) in reached for p in check_files):
@@ -630,6 +630,15 @@ def report_mode(cfg, out=None):
     any_found = False
     skip = manifest_paths(cfg)
     kind = agent_kind(cfg)
+    # A scope whose ROOT is gone is a moved or mistyped config entry: its derived
+    # store would otherwise drop out of the report silently (configured_stores skips
+    # a derived store that does not exist yet, which is normal only for a real root).
+    for s in cfg.get("scopes", []):
+        if not os.path.isdir(s["root"]):
+            findings = _empty_findings()
+            findings["frontmatter_drift"] = ["SCOPE ROOT MISSING: %s (scope %r)" % (s["root"], s["name"])]
+            results.append((s["name"], Path(s["store"]), findings, dict(_EMPTY_SUMMARY)))
+            any_found = True
     for label, store_path, threshold in configured_stores(cfg):
         if not store_path.exists():
             # A configured store that does not exist is itself worth surfacing.
@@ -1082,12 +1091,13 @@ def selftest():
                                   "manifest": os.path.join(scope_store, "scope-manifest.md")}])
         f, _ = run_checks(scope_store, 300, manifest_paths(declared))
         check(not has_findings(f), "a declared manifest is neither an orphan nor frontmatter drift")
-        check(not any(c.name == "scope-manifest.md" for _, _, c in _non_empty_stores(declared)
+        check(not any(c.name == "scope-manifest.md" for _, _, c in non_empty_stores(declared)
                       for c in c),
               "a declared manifest does not count as store content")
 
     # --- a derived store that does not exist yet is skipped; a named one is reported ---
     with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "fresh"))
         cfg = _test_cfg(d, [{"name": "fresh", "root": os.path.join(d, "fresh"),
                              "store": os.path.join(d, "never-saved"), "store_derived": True}])
         cfg["paths"]["global_store_derived"] = True
@@ -1099,6 +1109,12 @@ def selftest():
         check(report_mode(cfg, cap) == EXIT_FINDINGS and "STORE MISSING" in cap.text()
               and "never-saved" in cap.text(),
               "a NAMED store that is missing is still reported")
+        cfg["scopes"][0]["store_derived"] = True
+        cfg["scopes"][0]["root"] = os.path.join(d, "frsh")  # a typo in the root
+        cap = _Capture()
+        check(report_mode(cfg, cap) == EXIT_FINDINGS and "SCOPE ROOT MISSING" in cap.text()
+              and "frsh" in cap.text(),
+              "a scope whose root does not exist is reported, even with a derived store")
 
     # --- codex mode: store checks run on the selected stores, Claude-only checks do not ---
     with tempfile.TemporaryDirectory() as d:
