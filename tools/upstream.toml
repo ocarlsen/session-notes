@@ -8,7 +8,7 @@
 
 # bcast, bus_nudge, session_bus, reflect_lock and the bus hook are canonical HERE: an upstream config
 # links to them instead of keeping its own copy, so there is nothing upstream to drift from.
-repo_only = ["bin/append_memory_index.py", "bin/bcast.py", "bin/boot_budget.py", "bin/bus_nudge.py", "bin/codex_save.py", "bin/handoff_session.py", "bin/memory_hygiene_canary.py", "bin/memory_index_lint.py", "bin/nightly_check.py", "bin/notes_config.py", "bin/reflect_lock.py", "bin/session_bus.py", "bin/session_lineage.py", "bin/session_peers.py", "bin/setup_claude.py", "hooks/codex_session_start.py", "hooks/session_bus_hook.py", "hooks/session_pane_registry.py", "skills/codex/reflect/SKILL.md", "skills/codex/refresh/SKILL.md", "skills/codex/rnr/SKILL.md"]
+repo_only = ["bin/append_memory_index.py", "bin/bcast.py", "bin/boot_budget.py", "bin/bus_nudge.py", "bin/codex_save.py", "bin/handoff_session.py", "bin/launch_agents.py", "bin/memory_hygiene_canary.py", "bin/memory_index_lint.py", "bin/nightly_check.py", "bin/notes_config.py", "bin/reflect_lock.py", "bin/session_bus.py", "bin/session_lineage.py", "bin/session_peers.py", "bin/setup_claude.py", "hooks/codex_session_start.py", "hooks/session_bus_hook.py", "hooks/session_pane_registry.py", "skills/codex/reflect/SKILL.md", "skills/codex/refresh/SKILL.md", "skills/codex/rnr/SKILL.md"]
 
 [[pair]]
 repo = "bin/skill_feedback.py"

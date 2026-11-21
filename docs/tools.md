@@ -39,8 +39,8 @@ The README covers the default install: three skills and three commands. This pag
   `boot_budget.py` keeps each file under a ceiling, and
   `memory_hygiene_canary.py` checks that index and files agree.
   `nightly_check.py` runs both for every installed agent (Claude, Codex or
-  both, each against its own stores); `nightly_check.py schedule` offers to run
-  it every night.
+  both, each against its own stores); on macOS,
+  `launch_agents.py install nightly-check` runs it every night.
 
 ## Talking between sessions: native first, the bus for two jobs
 
@@ -171,8 +171,9 @@ python3 bin/bcast.py -n "check the bus"      # dry run: targets and exact keystr
 
 `handoff_session.py` starts `worker` idle with the spec parked on the bus;
 it shows up in `worker`'s context when someone types there. To have idle
-recipients of bus mail woken instead, run `python3 bin/bus_nudge.py` in its
-own tmux session. A session launched with `handoff_session.py` records its parent at
+recipients of bus mail woken instead, keep `bin/bus_nudge.py` running: on macOS
+`python3 bin/launch_agents.py install bus-nudge` starts it at login and restarts it
+if it exits; or run it in its own tmux session. Only one loop runs at a time. A session launched with `handoff_session.py` records its parent at
 startup (tmux `-e` env read by the pane-registry hook), which is what `--tree`
 and `--me` read; a session started any other way shows as a root. Recording needs
 tmux 3.2 or later (`new-session -e`); on an older tmux the launch still works, without a parent.
