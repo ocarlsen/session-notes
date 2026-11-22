@@ -14,6 +14,8 @@ How it is read (bin/environment_render.py):
     holds only empty subheadings goes too). A last line like `# note` with nothing after it
     counts as an empty heading and is dropped, so put a note before your facts. An untouched
     copy of this file therefore renders to nothing, and `apply` refuses to write nothing.
+  - An entry may not contain the HTML comment closer (two hyphens and a greater-than sign):
+    it would end a comment early, and a stray one is an error. Reword the line.
   - Claude Code gets the entries as autoMode.environment (a list of strings). Codex gets
     them inside the Environment Profile section of its reviewer policy.
 

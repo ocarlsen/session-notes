@@ -38,6 +38,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+from environment_render import CODEX_END  # noqa: E402  (one source for the marker)
+
 BEGIN = "<!-- session-notes:begin (install.sh rewrites this block; edit outside it) -->"
 END = "<!-- session-notes:end -->"
 ADDENDUM_HEADING = "## Local addendum (private rules)"
@@ -219,13 +221,14 @@ def backup_path(path):
 KEEP_BACKUPS = 3
 
 
-def prune_backups(path, keep):
+def prune_backups(path, keep, bak=BAK):
     """Keep the newest KEEP_BACKUPS of this tool's own timestamped backups of PATH, newest by
     file mtime (ties by name), and always the one just written (`keep`). Only names of exactly
-    that pattern are touched; install.sh's PATH.bak-session-notes never is."""
+    that pattern are touched; install.sh's PATH.bak-session-notes never is. `bak` is the
+    backup-name prefix (environment_render passes its own)."""
     d, base = os.path.split(path)
     d = d or "."
-    pat = re.compile(r"^%s%s-\d{8}-\d{6}(?:-\d+)?$" % (re.escape(base), re.escape(BAK)))
+    pat = re.compile(r"^%s%s-\d{8}-\d{6}(?:-\d+)?$" % (re.escape(base), re.escape(bak)))
     found = sorted(((os.stat(os.path.join(d, n)).st_mtime, n) for n in os.listdir(d)
                     if pat.match(n)), reverse=True)
     for _, name in found[KEEP_BACKUPS:]:
@@ -431,12 +434,16 @@ def codex_defaults(old):
     # A comment block right above the first table belongs to that table: go above it.
     at = first
     # Only lines the scanner saw at depth 0 outside a string may be stepped over.
-    while at > 0 and clean[at - 1] and (
+    # Never past the end marker of environment_render's block: that block sits right above
+    # the first table, and the next `environment_render.py apply` rewrites what is inside.
+    while at > 0 and clean[at - 1] and lines[at - 1].strip() != CODEX_END and (
             not lines[at - 1].strip() or lines[at - 1].lstrip().startswith("#")):
         at -= 1
     before, after = lines[:at], lines[at:]
     if before and not before[-1].endswith("\n"):
         before[-1] += "\n"
+    if before and clean[at - 1] and before[-1].strip() == CODEX_END:
+        before.append("\n")
     new = before + ["# session-notes defaults (change freely)\n"] + add
     if after and after[0].strip():
         new.append("\n")
@@ -777,6 +784,55 @@ def selftest():
         none = os.path.join(tmp, "sub", "config.toml")
         quiet(lambda: cmd_codex_defaults(none, False))
         check("defaults create a missing config", 'model = "%s"' % DEFAULT_MODEL in open(none).read())
+
+        # F1: defaults never land inside environment_render's block (it is rewritten on apply)
+        import environment_render as er
+        ed = os.path.join(tmp, "envloop")
+        os.makedirs(os.path.join(ed, "claude"))
+        os.makedirs(os.path.join(ed, "codex"))
+        esrc = os.path.join(ed, "environment.md")
+        open(esrc, "w").write("- Organization: Example Co\n")
+        ectx = er.Ctx(esrc, os.path.join(ed, "claude"), os.path.join(ed, "codex"),
+                      bin_dirs=[os.path.join(ed, "bin")])
+        for label, start in (("a comment above the table", '# about tui\n[tui]\nx = 1\n'),
+                             ("no comment", '[tui]\nx = 1\n'),
+                             ("approval key above", 'approval_policy_note = 1\n\n[tui]\nx = 1\n')):
+            open(ectx.config_toml, "w").write(start)
+            quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+            quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+            t1 = open(ectx.config_toml).read()
+            end_at = t1.index(er.CODEX_END)
+            check("env block + defaults (%s): defaults land after the block's end marker" % label,
+                  'model = "%s"' % DEFAULT_MODEL in t1 and t1.index("model =") > end_at
+                  and t1.count("model =") == 1 and t1.index("[tui]") > t1.index("model_reasoning_effort"))
+            rc, out = quiet(lambda: er.cmd_diff(ectx, "codex"))
+            check("env block + defaults (%s): environment_render diff is clean" % label, rc == 0 and out == "")
+            quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+            check("env block + defaults (%s): re-apply keeps the defaults (no loop)" % label,
+                  open(ectx.config_toml).read() == t1)
+            rc, out = quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+            check("env block + defaults (%s): defaults second run unchanged" % label,
+                  "unchanged" in out and open(ectx.config_toml).read() == t1)
+            try:
+                import tomllib
+            except ImportError:
+                tomllib = None
+            if tomllib:
+                d1 = tomllib.loads(t1)
+                check("env block + defaults (%s): parses, model and sandbox_mode top-level" % label,
+                      d1["model"] == DEFAULT_MODEL and d1["sandbox_mode"] == "workspace-write"
+                      and d1["tui"] == {"x": 1})
+        # the reverse order: defaults first, then the block: the block goes above the defaults' neighbours
+        open(ectx.config_toml, "w").write('# about tui\n[tui]\nx = 1\n')
+        quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+        quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+        t2 = open(ectx.config_toml).read()
+        quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+        check("defaults first, then the block: both survive, diff clean, defaults still top-level",
+              open(ectx.config_toml).read() == t2 and t2.count("model =") == 1
+              and t2.index("model =") < t2.index("[tui]") and t2.count(er.CODEX_BEGIN) == 1
+              and quiet(lambda: er.cmd_diff(ectx, "codex"))[0] == 0
+              and not (t2.index(er.CODEX_BEGIN) < t2.index("model =") < t2.index(er.CODEX_END)))
 
         # B2: the scanner
         def defaults_of(text):

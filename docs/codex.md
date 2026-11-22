@@ -196,6 +196,11 @@ entries of your environment file added at the end of its `## Environment Profile
   "<bin>/session_bus.py", "send"], decision="allow")` for this repo's `bin` (and
   `<claude_home>/bin` when it resolves to the same file). Lines outside the blocks are never
   touched. Every write takes a `.bak-environment-<timestamp>` copy first.
+- **Worktrees:** `apply --target codex` refuses when this repo's `bin` is in a linked git
+  worktree, because the allow rules would name a directory that is deleted when its branch
+  merges; apply from the main checkout. `--allow-worktree` overrides that, for testing a branch.
+  `diff` and `check` always run. Only the newest three `.bak-environment-*` copies of each file
+  are kept.
 - **Day to day:** `environment_render.py diff` shows what would change (silent when equal),
   `apply` asks and writes. `nightly_check.py` runs the same comparison for each installed
   target and reports drift.
