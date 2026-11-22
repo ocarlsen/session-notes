@@ -68,6 +68,7 @@ BAK = ".bak-environment-"
 FETCH = None          # fn(url) -> str; None = urllib
 VERSION_FN = None     # fn() -> "0.171.0"; None = run `codex --version`
 INPUT = input
+FALLBACK_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")   # where codex may live off PATH
 
 
 class EnvError(Exception):
@@ -129,14 +130,23 @@ def parse_entries(text):
         raise EnvError("the environment file has an unterminated or stray HTML comment marker")
     lines = [ln.rstrip() for ln in stripped.split("\n")]
     lines = [ln for ln in lines if ln.strip() and PLACEHOLDER not in ln]
-    kept = []
-    for i, ln in enumerate(lines):
-        if re.match(r"#{1,6}\s", ln):
-            nxt = lines[i + 1] if i + 1 < len(lines) else None
-            if nxt is None or re.match(r"#{1,6}\s", nxt):
-                continue
-        kept.append(ln)
-    return kept
+    # Drop a heading whose section is empty: the next entry is a heading of the same or a
+    # shallower level, or there is none. Repeat, so a parent left holding only empty
+    # subheadings goes too. (A final "# note" line with nothing after it is dropped as an
+    # empty heading; that is the one ambiguity, and it is documented in the template.)
+    def level(ln):
+        m = re.match(r"(#{1,6})\s", ln)
+        return len(m.group(1)) if m else 0
+    changed = True
+    while changed:
+        changed = False
+        for i, ln in enumerate(lines):
+            lv = level(ln)
+            if lv and (i + 1 == len(lines) or 0 < level(lines[i + 1]) <= lv):
+                del lines[i]
+                changed = True
+                break
+    return lines
 
 
 def load_entries(ctx):
@@ -249,17 +259,100 @@ def split_block(lines, begin, end, where):
     return lines[:bs[0]], lines[bs[0] + 1:es[0]], lines[es[0] + 1:]
 
 
-_HEADER_RE = re.compile(r"^\s*\[\[?\s*[A-Za-z0-9_.\"' /:@-]+\s*\]\]?\s*(#.*)?$")
-_KEY_RE = re.compile(r"^\s*(sandbox_mode|approval_policy|approvals_reviewer)\s*=")
-_AR_KEY_RE = re.compile(r"^\s*auto_review\s*[.=]")
-_AR_TABLE_RE = re.compile(r"^\s*\[\[?\s*auto_review\s*[\].]")
+def scan_toml(lines, where="config"):
+    """(header line indexes, clean flags) for TOML lines. A line is `clean` when it starts
+    outside any multi-line string or multi-line array/inline table; only a clean line whose
+    first non-space character is `[` is a table header. Refuses (EnvError) when a string or
+    array is still open at the end, since then nothing about placement can be trusted."""
+    headers, clean = [], []
+    in_str = None
+    depth = 0
+    for no, ln in enumerate(lines):
+        is_clean = in_str is None and depth == 0
+        clean.append(is_clean)
+        if is_clean and ln.lstrip().startswith("["):
+            headers.append(no)
+            continue
+        i, n = 0, len(ln)
+        while i < n:
+            if in_str:
+                if in_str == '"""' and ln[i] == "\\":
+                    i += 2
+                elif ln.startswith(in_str, i):
+                    in_str = None
+                    i += 3
+                else:
+                    i += 1
+                continue
+            c = ln[i]
+            if c == "#":
+                break
+            if ln.startswith('"""', i) or ln.startswith("'''", i):
+                in_str = ln[i:i + 3]
+                i += 3
+            elif c in "\"'":
+                j = i + 1
+                while j < n and ln[j] != c:
+                    j += 2 if (c == '"' and ln[j] == "\\") else 1
+                i = j + 1
+            else:
+                if c in "[{":
+                    depth += 1
+                elif c in "]}":
+                    depth = max(0, depth - 1)
+                i += 1
+    if in_str is not None or depth > 0:
+        raise EnvError("%s: cannot tell where its tables start (an unterminated multi-line "
+                       "string or array); fix the file by hand" % where)
+    return headers, clean
 
 
-def first_header(lines):
-    for i, ln in enumerate(lines):
-        if _HEADER_RE.match(ln):
-            return i
-    return len(lines)
+def key_path(s):
+    """The dotted key at the start of s (bare, "basic" or 'literal' segments), as a list,
+    and the rest of s after it; ([], s) when s does not start with a key."""
+    segs, i, n = [], 0, len(s)
+    while True:
+        while i < n and s[i] in " \t":
+            i += 1
+        if i < n and s[i] in "\"'":
+            q = s[i]
+            j = i + 1
+            while j < n and s[j] != q:
+                j += 2 if (q == '"' and s[j] == "\\") else 1
+            seg = s[i + 1:j]
+            if q == '"':
+                seg = seg.replace('\\"', '"').replace("\\\\", "\\")
+            segs.append(seg)
+            i = j + 1
+        else:
+            m = re.match(r"[A-Za-z0-9_-]+", s[i:])
+            if not m:
+                return [], s
+            segs.append(m.group(0))
+            i += m.end()
+        while i < n and s[i] in " \t":
+            i += 1
+        if i < n and s[i] == ".":
+            i += 1
+            continue
+        return segs, s[i:]
+
+
+def _line_key(ln):
+    """Key path of a `key = value` line, else []."""
+    segs, rest = key_path(ln)
+    return segs if segs and rest.startswith("=") else []
+
+
+def _header_path(ln):
+    t = ln.lstrip()
+    t = t[2:] if t.startswith("[[") else t[1:]
+    return key_path(t)[0]
+
+
+def first_header(lines, where="config"):
+    headers, _ = scan_toml(lines, where)
+    return headers[0] if headers else len(lines)
 
 
 def codex_block_lines(policy):
@@ -278,18 +371,23 @@ def place_codex_block(text, policy, where):
     before, inner, after = split_block(lines, CODEX_BEGIN, CODEX_END, where)
     block_len = 0 if inner is None else len(inner) + 2
     outside = before + after
-    h = first_header(outside)
+    headers, clean = scan_toml(outside, where)
+    h = headers[0] if headers else len(outside)
 
     def orig_no(k):
         return k + 1 + (block_len if inner is not None and k >= len(before) else 0)
+    guarded = set(k for k, _ in CODEX_SETTINGS) | {"auto_review"}
     for k, ln in enumerate(outside):
-        if k < h and (_KEY_RE.match(ln) or _AR_KEY_RE.match(ln)):
-            raise EnvError("%s line %d sets %r outside the session-notes block; resolve it by "
-                           "hand (remove it, or move it out of the way) and apply again"
-                           % (where, orig_no(k), ln.strip()))
-        if _AR_TABLE_RE.match(ln):
-            raise EnvError("%s line %d has an [auto_review] table outside the session-notes "
-                           "block; resolve it by hand and apply again" % (where, orig_no(k)))
+        if k in headers:
+            if _header_path(ln)[:1] == ["auto_review"]:
+                raise EnvError("%s line %d has an [auto_review] table outside the session-notes "
+                               "block; resolve it by hand and apply again" % (where, orig_no(k)))
+        elif k < h and clean[k]:
+            path = _line_key(ln)
+            if path and path[0] in guarded:
+                raise EnvError("%s line %d sets %r outside the session-notes block; resolve it "
+                               "by hand (remove it, or move it out of the way) and apply again"
+                               % (where, orig_no(k), ln.strip()))
     new = codex_block_lines(policy)
     if inner is not None and h >= len(before):
         res = before + new + after                      # replace in place
@@ -309,11 +407,15 @@ def place_codex_block(text, policy, where):
 
 
 def read_codex_block(text, where):
-    """(settings dict, policy or None, raw inner lines) from the block, or None."""
+    """(settings dict, policy or None, raw inner lines, the table header the block sits
+    under or None) from the block, or None."""
     lines = text.split("\n")
     _, inner, _ = split_block(lines, CODEX_BEGIN, CODEX_END, where)
     if inner is None:
         return None
+    before = split_block(lines, CODEX_BEGIN, CODEX_END, where)[0]
+    hs, _ = scan_toml(before, where)
+    inside = before[hs[0]].strip() if hs else None
     settings = {}
     for ln in inner:
         m = re.match(r'^(sandbox_mode|approval_policy|approvals_reviewer) = "(.*)"$', ln)
@@ -327,7 +429,7 @@ def read_codex_block(text, where):
             policy, _ = toml_ml_decode(body, k + len("auto_review.policy = "))
         except ValueError:
             policy = None
-    return settings, policy, inner
+    return settings, policy, inner, inside
 
 
 def rules_inner(ctx):
@@ -431,30 +533,23 @@ def claude_installed(ctx):
     return env
 
 
-def codex_doc(settings, policy):
-    lines = ["# settings"]
-    lines += ['%s = "%s"' % (k, settings[k]) for k, _ in CODEX_SETTINGS if k in settings]
-    lines.append("# auto_review.policy")
-    if policy is None:
-        lines.append("<missing or unreadable>")
-    else:
-        lines += policy.split("\n")
-    return lines
-
-
 def codex_diff(ctx, entries):
-    """(differs, text) for config.toml + rules."""
+    """(differs, text) for config.toml + rules. The whole marked block is compared, so a
+    foreign line inside it shows as a removal."""
     policy = insert_environment(load_policy(ctx.policy_path, ctx.policy_sha), entries)
-    want_cfg = codex_doc(dict(CODEX_SETTINGS), policy)
+    want_cfg = codex_block_lines(policy)
     cfg_text = read_text(ctx.config_toml)
     blk = read_codex_block(cfg_text, ctx.config_toml) if cfg_text is not None else None
-    have_cfg = codex_doc(blk[0], blk[1]) if blk else []
+    have_cfg = [CODEX_BEGIN] + blk[2] + [CODEX_END] if blk else []
     want_rules = rules_inner(ctx)
     rt = read_text(ctx.rules)
     have_rules = (read_rules_block(rt, ctx.rules) if rt is not None else None) or []
     out = []
     if blk is None:
         out.append("codex: no session-notes block in %s" % ctx.config_toml)
+    elif blk[3]:
+        out.append("codex: the session-notes block in %s is inside table %s; Codex does not "
+                   "read it as top-level (run apply to move it)" % (ctx.config_toml, blk[3]))
     if have_cfg != want_cfg:
         out.append(udiff(have_cfg, want_cfg, "installed " + ctx.config_toml,
                          "rendered " + ctx.config_toml))
@@ -568,10 +663,25 @@ def cmd_apply(ctx, target, yes):
 
 
 # --------------------------------------------------------------- upstream
+def find_codex():
+    """codex on PATH, else the usual install dirs (a LaunchAgent's PATH is minimal)."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    for d in (os.path.join(home, ".local", "bin"),) + FALLBACK_DIRS:
+        cand = os.path.join(d, "codex")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    raise FileNotFoundError("codex not found on PATH or in ~/.local/bin, /opt/homebrew/bin, "
+                            "/usr/local/bin")
+
+
 def codex_version():
     if VERSION_FN:
         return VERSION_FN()
-    out = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=30)
+    exe = find_codex()
+    out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30)
     m = re.search(r"(\d+\.\d+\.\d+(?:[-+.][0-9A-Za-z.-]+)?)", out.stdout + out.stderr)
     if not m:
         raise ValueError("no version in %r" % out.stdout.strip())
@@ -637,11 +747,14 @@ def check(env=None):
             out.append("codex: the session-notes block in %s (or %s) differs from %s; run "
                        "`environment_render.py diff` then `apply --target codex`\n%s"
                        % (ctx.config_toml, ctx.rules, ctx.source, text))
+    note = ""
     if codex_on:
         rc, text = upstream_check()
         if rc:
             out.append(text)
-    return True, (3 if out else 0), "".join(out)
+        else:
+            note = text      # a could-not-check note: shown, never a finding
+    return True, (3 if out else 0), "".join(out) + note
 
 
 # -------------------------------------------------------------------- CLI
@@ -748,8 +861,8 @@ def selftest():
     body = "\n".join(FIXTURE_WANT)
     k = ins.index(body)
     check("insertion lands inside Environment Profile", a < k < ins.index("## Risk Taxonomy"))
-    check("only the inserted text differs", ins == policy[:b].rstrip("\n") + "\n\n" + body
-          + "\n\n" + policy[b + 1:] or ins.replace("\n\n" + body + "\n", "", 1) == policy)
+    ri = policy.index("## Risk Taxonomy")
+    check("only the inserted text differs (exact)", ins == policy[:ri] + body + "\n\n" + policy[ri:])
     check("bundled bullets precede the entries and the rest is byte-identical",
           ins.startswith(policy[:policy.index("\n\n## Risk Taxonomy")] + "\n\n" + body + "\n\n## Risk Taxonomy")
           and ins.endswith(policy[policy.index("## Risk Taxonomy"):]))
@@ -812,6 +925,51 @@ def selftest():
     check("a block stranded after a table header is moved ahead of it",
           moved.index(CODEX_BEGIN) < moved.index("[a]") and moved.count(CODEX_BEGIN) == 1)
     check("a broken block is refused", raises(place_codex_block, CODEX_BEGIN + "\nx\n", "P", "c") is not None)
+
+    # ---- nested headings (B3)
+    nested = "## Org\n### Cloud\n- Provider: x\n### Other\n## Next\n- a\n"
+    check("nested headings are kept; empty ones drop", parse_entries(nested) ==
+          ["## Org", "### Cloud", "- Provider: x", "## Next", "- a"])
+    check("a parent holding only empty subheadings drops with them",
+          parse_entries("## Org\n### A\n### B\n") == [] and parse_entries("## A\n### B\n#### C\n") == [])
+    check("a final heading with nothing after it is dropped", parse_entries("- a\n# note\n") == ["- a"])
+
+    # ---- table headers and strings (B1, N1, N2)
+    def tomlcheck(text):
+        try:
+            import tomllib
+        except ImportError:
+            return True
+        tomllib.loads(text)
+        return True
+    for name, src in (
+            ("odd header chars", '[projects."/srv/data/Sync Folder/cloud~store/proj"]\ntrust = "x"\n'),
+            ("parens and plus", '[a."x(y)+z,w"]\nk = 1\n'),
+            ("non-ascii header", '[projects."/h/caf\u00e9"]\nk = 1\n'),
+            ("array of arrays", 'x = [\n  ["a", "b"],\n  ["c"]\n]\n[a]\nk = 1\n'),
+            ("multi-line string with [note]", 'instructions = """\nsee\n[note]\nbye\n"""\n[a]\nk = 1\n'),
+            ("literal ml string", "t = \'\'\'\n[inner]\n\'\'\'\n[a]\nk = 1\n")):
+        o = place_codex_block(src, "P\n", "c.toml")
+        tail = o[o.index(CODEX_END):]
+        check("block lands before the first real table: " + name,
+              o.index(CODEX_BEGIN) < o.index("[a" if "[a" in src else "[projects") and src.split("\n")[0] in o
+              and read_codex_block(o, "c")[3] is None and read_codex_block(o, "c")[1] == "P\n" and tomlcheck(o))
+    check("unterminated multi-line string refuses",
+          "cannot tell" in (raises(place_codex_block, 'x = """\nnever closed\n', "P\n", "c") or ""))
+    check("unterminated array refuses",
+          "cannot tell" in (raises(place_codex_block, 'x = [\n 1,\n', "P\n", "c") or ""))
+    for bad_src in ('"sandbox_mode" = "read-only"\n', "'approval_policy' = 'never'\n",
+                    '"approvals_reviewer"="user"\n', '["auto_review"]\nx=1\n', '"auto_review".policy = "x"\n',
+                    "[ 'auto_review' . x ]\n", '[[auto_review]]\n', '[a]\nk=1\n["auto_review"]\n'):
+        check("refuses a quoted-key conflict: %r" % bad_src.split("\n")[0],
+              raises(place_codex_block, bad_src, "P\n", "c.toml") is not None)
+    check("a key mentioned inside a multi-line string is not a conflict",
+          raises(place_codex_block, 'x = """\nsandbox_mode = 1\n"""\n', "P\n", "c") is None)
+
+    # ---- block inside a table is drift (B2)
+    stray = '[a]\nk = 1\n' + "\n".join(codex_block_lines("P\n")) + "\n"
+    blk = read_codex_block(stray, "c")
+    check("read reports the table a block sits under", blk[3] == "[a]")
 
     # ---- rules block
     r1 = place_rules_block("# mine\nprefix_rule(pattern=[\"x\"], decision=\"allow\")\n", ["R1"], "r")
@@ -918,6 +1076,29 @@ def selftest():
         with open(ctx.config_toml, "w") as fh:
             fh.write(cfg)
 
+        # block inside a table, foreign line inside the block
+        good = open(ctx.config_toml).read()
+        with open(ctx.config_toml, "w") as fh:
+            fh.write("[t]\nk = 1\n" + good[good.index(CODEX_BEGIN):good.index(CODEX_END) + len(CODEX_END)] + "\n")
+        rc, out = run(cmd_diff, ctx, "codex")
+        check("diff: a block under a table header is drift with a clear message",
+              rc == 1 and "inside table [t]" in out and "not read it as top-level" in out)
+        with open(ctx.config_toml, "w") as fh:
+            fh.write(good)
+        with open(srcf, "w") as fh:
+            fh.write(FIXTURE)
+        run(cmd_apply, ctx, "codex", True)
+        good = open(ctx.config_toml).read()
+        with_extra = good.replace(CODEX_END, "model = 'foreign'\n" + CODEX_END)
+        with open(ctx.config_toml, "w") as fh:
+            fh.write(with_extra)
+        rc, out = run(cmd_diff, ctx, "codex")
+        check("diff: a foreign line inside the block shows as a removal",
+              rc == 1 and "-model = 'foreign'" in out)
+        rc, out = run(cmd_apply, ctx, "codex", True)
+        check("apply shows it and removes it", "-model = 'foreign'" in out
+              and "model = 'foreign'" not in open(ctx.config_toml).read())
+
         # nightly check + upstream, injected
         with open(srcf, "w") as fh:
             fh.write(FIXTURE)
@@ -952,6 +1133,34 @@ def selftest():
             VERSION_FN = nover
             rc, text = upstream_check()
             check("upstream: missing codex is a note, rc 0", rc == 0 and text.startswith("could not check"))
+            fakehome = os.path.join(d, "fh")
+            os.makedirs(os.path.join(fakehome, ".local", "bin"))
+            exe = os.path.join(fakehome, ".local", "bin", "codex")
+            with open(exe, "w") as fh:
+                fh.write("#!/bin/sh\necho codex-cli 9.8.7\n")
+            os.chmod(exe, 0o755)
+            oldenv = dict(os.environ)
+            os.environ["PATH"] = "/nonexistent"
+            os.environ["HOME"] = fakehome
+            try:
+                VERSION_FN = None
+                check("codex is found under ~/.local/bin when PATH lacks it",
+                      find_codex() == exe and codex_version() == "9.8.7")
+                os.environ["HOME"] = os.path.join(d, "nohome")
+                global FALLBACK_DIRS
+                saved_dirs, FALLBACK_DIRS = FALLBACK_DIRS, ()
+                try:
+                    check("codex missing everywhere raises FileNotFoundError", _missing(find_codex))
+                finally:
+                    FALLBACK_DIRS = saved_dirs
+            finally:
+                os.environ.clear()
+                os.environ.update(oldenv)
+            VERSION_FN = nover
+            run(cmd_apply, ctx, "all", True)
+            ran, rc, text = check_env(ctx)
+            check("check prints the could-not-check note but it is not a finding",
+                  rc == 0 and text.startswith("could not check") and ran)
             VERSION_FN = lambda: "0.171.0"
             FETCH = lambda url: policy
 
@@ -985,10 +1194,23 @@ def selftest():
         finally:
             FETCH = VERSION_FN = None
 
-    check("every doc and template is em dash free", all(
-        "\u2014" not in open(p, encoding="utf-8").read() for p in (TEMPLATE_PATH,)))
+    dash = chr(0x2014)
+    import glob
+    covered = [os.path.join(REPO, f) for f in ("README.md", "NOTICE", "install.sh", "config.example.toml",
+                                                "docs/codex.md", "docs/tools.md", "bin/environment_render.py")]
+    covered += [f for f in glob.glob(os.path.join(REPO, "templates", "*.md")) if f != POLICY_PATH]
+    check("every file this feature touches is em dash free (%d files)" % len(covered),
+          len(covered) >= 9 and all(dash not in open(f, encoding="utf-8").read() for f in covered))
     print("%d failed" % len(fails) if fails else "all passed")
     return 1 if fails else 0
+
+
+def _missing(fn):
+    try:
+        fn()
+    except FileNotFoundError:
+        return True
+    return False
 
 
 def check_env(ctx):

@@ -9,8 +9,11 @@ How it is read (bin/environment_render.py):
     (### ...) are entries too. Nothing is parsed as Markdown, and wrapped lines are not
     joined, so write each fact as one line.
   - Scaffolding you have not filled in is dropped: any line that still contains the
-    placeholder text, and any heading with nothing under it. An untouched copy of this
-    file therefore renders to nothing, and `apply` refuses to write nothing.
+    placeholder text, and any heading with nothing under it (a heading whose next entry
+    is a heading of the same or a shallower level, or the end of the file; a parent that
+    holds only empty subheadings goes too). A last line like `# note` with nothing after it
+    counts as an empty heading and is dropped, so put a note before your facts. An untouched
+    copy of this file therefore renders to nothing, and `apply` refuses to write nothing.
   - Claude Code gets the entries as autoMode.environment (a list of strings). Codex gets
     them inside the Environment Profile section of its reviewer policy.
 
