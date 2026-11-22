@@ -41,6 +41,13 @@ The README covers the default install: three skills and three commands. This pag
   `nightly_check.py` runs both for every installed agent (Claude, Codex or
   both, each against its own stores); on macOS,
   `launch_agents.py install nightly-check` runs it every night.
+  A check that finds a file it cannot read (a macOS privacy block under
+  launchd, malformed settings JSON) reports `BLIND` and withholds the verdict
+  that depended on it, instead of guessing. In Codex mode the canary also warns
+  when the files the SessionStart hook loads reach 90% of
+  `agent.codex_boot_bytes`. Each run records itself in `paths.last_check`;
+  `nightly_check.py status [--max-age-days 8]` prints one line from that record
+  (nothing when clean and fresh; loud when crashed, stale or never run).
 
 ## Talking between sessions: native first, the bus for two jobs
 

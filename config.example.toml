@@ -26,6 +26,10 @@ state_dir = "~/.claude/session-notes/state"
 # The global memory store. Empty = ~/.claude/projects/<your encoded home>/memory,
 # the folder Claude Code already uses for sessions started in your home dir.
 global_store = ""
+# Where nightly_check.py records its last run (read by `nightly_check.py status`).
+# Empty = <state_dir>/last-check.json, which stays put in codex mode so every agent
+# reads the same file.
+last_check = ""
 
 [time]
 # IANA zone for the clock anchor, e.g. "Europe/Berlin". Empty = system local.

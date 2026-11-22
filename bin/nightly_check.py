@@ -11,16 +11,26 @@ An agent counts as installed when its home directory exists: paths.claude_home
 for Claude, agent.codex_home for Codex.
 
     python3 nightly_check.py               # silent + exit 0 when every check is clean
+    python3 nightly_check.py status        # one line (or nothing) from the last run's record
     python3 launch_agents.py install nightly-check   # run it every night (macOS)
     python3 nightly_check.py --selftest
 
-Exit codes: 0 clean, 3 findings (the report is on stdout), 1 a check crashed.
+Every run records itself in paths.last_check (default <state_dir>/last-check.json):
+when it ran, the exit code, each check's outcome and the report. `status` reads that
+file and prints at most one line, so a brief or prompt can show it: nothing when the
+last run is clean and fresh; a findings summary, or a loud line when the last run
+crashed, never ran, left an unreadable record, or is older than --max-age-days.
+
+Exit codes: 0 clean, 3 findings (the report is on stdout), 1 a check crashed or the
+record could not be written. `status` always exits 0.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 if BIN not in sys.path:
@@ -29,6 +39,9 @@ if BIN not in sys.path:
 import notes_config  # noqa: E402
 
 EXIT_FINDINGS = 3
+STATUS_VERSION = 1
+REPORT_MAX_CHARS = 20000
+DEFAULT_MAX_AGE_DAYS = 8
 
 
 def installed_kinds(cfg_for):
@@ -50,12 +63,73 @@ def checks_for(kind):
     return out
 
 
-def run_all(env=None, run=None, out=None):
-    """Run every check for every installed agent. Returns the exit code."""
-    env = dict(os.environ if env is None else env)
-    run = run or subprocess.run
-    out = out or sys.stdout
+def count_findings(name, text):
+    """How many finding lines one check printed: the canary's "- " bullets, boot_budget's
+    FILE / SCOPE / BLIND lines."""
+    lines = text.splitlines()
+    if name == "boot_budget":
+        return sum(1 for ln in lines if ln.startswith(("FILE ", "SCOPE ", "BLIND ")))
+    return sum(1 for ln in lines if ln.startswith("- "))
 
+
+def last_check_path(env):
+    """paths.last_check from the config, or None when no config can be loaded."""
+    try:
+        return notes_config.load(env=dict(env))["paths"]["last_check"]
+    except notes_config.ConfigError:
+        return None
+
+
+def write_status(path, rc, checks, report, now):
+    """Write the record atomically (temp file beside it, then os.replace)."""
+    doc = {"version": STATUS_VERSION, "timestamp": now.isoformat(), "rc": rc,
+           "checks": checks, "report": report[:REPORT_MAX_CHARS]}
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".last-check.", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run_all(env=None, run=None, out=None, now=None):
+    """Run every check for every installed agent, record the run, return the exit code."""
+    env = dict(os.environ if env is None else env)
+    out = out or sys.stdout
+    now = now or (lambda: datetime.now(timezone.utc))
+    log = _Tee(out)
+    checks = []
+    rc = _run_checks(env, run or subprocess.run, log, checks)
+    path = last_check_path(env)
+    if path:
+        try:
+            write_status(path, rc, checks, log.text, now())
+        except (OSError, ValueError) as exc:
+            out.write("nightly_check: cannot write the status file %s (%s: %s)\n"
+                      % (path, type(exc).__name__, getattr(exc, "strerror", None) or exc))
+            rc = 1
+    return rc
+
+
+class _Tee(object):
+    """Writes through to `out` and keeps a copy for the status record."""
+
+    def __init__(self, out):
+        self.out, self.text = out, ""
+
+    def write(self, s):
+        self.text += s
+        self.out.write(s)
+
+
+def _run_checks(env, run, out, checks):
     def cfg_for(kind):
         return notes_config.load(env=dict(env, SESSION_NOTES_AGENT=kind))
 
@@ -74,16 +148,20 @@ def run_all(env=None, run=None, out=None):
                     capture_output=True, text=True, timeout=600)
             text = (r.stdout or "") + (r.stderr or "")
             if r.returncode == 0:
+                checks.append({"agent": kind, "check": name, "status": "clean", "findings": 0})
                 continue
-            # boot_budget check exits 1 on a finding (each a FILE/SCOPE line); the canary
-            # exits 3. Anything else, a traceback, or a boot_budget 1 with no finding line
-            # (a bad config, say) is a crash and outranks findings.
+            # boot_budget check exits 1 on a finding (each a FILE/SCOPE/BLIND line); the
+            # canary exits 3. Anything else, a traceback, or a boot_budget 1 with no finding
+            # line (a bad config, say) is a crash and outranks findings.
             if name == "boot_budget":
                 crashed = r.returncode != 1 or not any(
-                    ln.startswith(("FILE ", "SCOPE ")) for ln in text.splitlines())
+                    ln.startswith(("FILE ", "SCOPE ", "BLIND ")) for ln in text.splitlines())
             else:
                 crashed = r.returncode != EXIT_FINDINGS
             crashed = crashed or "Traceback" in text
+            checks.append({"agent": kind, "check": name,
+                           "status": "crashed" if crashed else "findings",
+                           "findings": 0 if crashed else count_findings(name, text)})
             out.write("== %s: %s (%s) ==\n%s\n" % (
                 kind, name, "CRASHED rc=%d" % r.returncode if crashed else "findings",
                 text.rstrip()))
@@ -92,6 +170,39 @@ def run_all(env=None, run=None, out=None):
             elif worst != 1:
                 worst = EXIT_FINDINGS
     return worst
+
+
+def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
+    """The one line `status` prints, or "" when the last run is clean and fresh."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return "MEMORY CHECKS NEVER RAN: no record at %s" % path
+    except (OSError, ValueError) as exc:
+        return "MEMORY CHECKS STATUS UNREADABLE: %s (%s)" % (path, type(exc).__name__)
+    try:
+        ran = datetime.fromisoformat(doc["timestamp"])
+        if ran.tzinfo is None:
+            raise ValueError("no UTC offset")
+        rc, checks = doc["rc"], doc["checks"]
+        rows = [(c["agent"], c["check"], c["status"], int(c["findings"])) for c in checks]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return "MEMORY CHECKS STATUS UNREADABLE: %s (malformed record)" % path
+    day = ran.astimezone().strftime("%Y-%m-%d")
+    age = (now - ran).total_seconds() / 86400.0
+    if age > max_age_days:
+        return "MEMORY CHECKS STALE: last run %s, %d days ago" % (day, int(age))
+    if rc == 1:
+        bad = ", ".join("%s %s" % (a, n) for a, n, st, _ in rows if st == "crashed")
+        return "MEMORY CHECKS CRASHED (%s): %s" % (day, bad or "see nightly_check.py")
+    found = [(a, n, f) for a, n, st, f in rows if st == "findings"]
+    if rc == 0 and not found:
+        return ""
+    total = sum(f for _, _, f in found)
+    return ("Memory checks (%s): %d findings (%s); run nightly_check.py for the report"
+            % (day, total, ", ".join("%s %s %d" % x for x in found)))
 
 
 # ---------------------------------------------------------------- selftest
@@ -112,8 +223,8 @@ def selftest():
         codex_home = os.path.join(d, "codex")
         conf = os.path.join(d, "config.toml")
         with open(conf, "w") as fh:
-            fh.write('[paths]\nclaude_home = "%s"\n[agent]\ncodex_home = "%s"\n'
-                     % (claude_home, codex_home))
+            fh.write('[paths]\nclaude_home = "%s"\nstate_dir = "%s"\n[agent]\ncodex_home = "%s"\n'
+                     % (claude_home, os.path.join(d, "state"), codex_home))
         env = {"SESSION_NOTES_CONFIG": conf, "HOME": d}
 
         def fake(results):
@@ -162,6 +273,119 @@ def selftest():
                        ("codex", "memory_hygiene_canary.py"): R(3, "x")})
         check("a later finding does not mask an earlier crash", run_all(env, run, _Buf()) == 1)
 
+        run, _ = fake({("claude", "boot_budget.py"): R(
+            1, "BLIND ~/p/.claude/settings.json: cannot read (PermissionError: Operation not "
+               "permitted); the check is blind for scope /p")})
+        buf = _Buf()
+        check("a boot_budget BLIND line is a finding, not a crash",
+              run_all(env, run, buf) == 3 and "(findings)" in buf.text)
+
+        # --- the status record ---
+        status_file = os.path.join(d, "state", "last-check.json")
+        t0 = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
+        run, _ = fake({("claude", "memory_hygiene_canary.py"): R(3, "# r\n- a\n- b\n"),
+                       ("claude", "boot_budget.py"): R(1, "FILE x: 9 chars over budget 1\n"
+                                                       "SCOPE y: total\nBLIND z: cannot read\n")})
+        buf = _Buf()
+        rc = run_all(env, run, buf, now=lambda: t0)
+        with open(status_file) as fh:
+            doc = json.load(fh)
+        check("run_all writes the status file at the derived default path", doc["rc"] == rc == 3)
+        check("record: version, UTC timestamp with offset",
+              doc["version"] == 1 and doc["timestamp"] == "2026-01-10T12:00:00+00:00")
+        check("record: per-check outcome and finding counts",
+              {(c["agent"], c["check"]): (c["status"], c["findings"]) for c in doc["checks"]}
+              == {("codex", "memory_hygiene_canary"): ("clean", 0),("claude", "memory_hygiene_canary"): ("findings", 2),
+                  ("claude", "boot_budget"): ("findings", 3)})
+        check("record: report is the stdout text", doc["report"] == buf.text)
+        run, _ = fake({("claude", "memory_hygiene_canary.py"): R(1, "Traceback x")})
+        run_all(env, run, _Buf(), now=lambda: t0)
+        with open(status_file) as fh:
+            doc = json.load(fh)
+        check("a crash is recorded: rc 1, status crashed",
+              doc["rc"] == 1 and doc["checks"][0]["status"] == "crashed")
+        run, _ = fake({("claude", "memory_hygiene_canary.py"): R(3, "x" * 30000)})
+        run_all(env, run, _Buf(), now=lambda: t0)
+        with open(status_file) as fh:
+            check("the report is truncated to 20000 chars", len(json.load(fh)["report"]) == 20000)
+        run, _ = fake({})
+        run_all(env, run, _Buf(), now=lambda: t0)
+        with open(status_file) as fh:
+            doc = json.load(fh)
+        check("a clean run is recorded too (rc 0, all clean)",
+              doc["rc"] == 0 and all(c["status"] == "clean" for c in doc["checks"]))
+        check("no temp file is left beside the record",
+              os.listdir(os.path.dirname(status_file)) == ["last-check.json"])
+
+        # a failure to write the record is loud and rc 1
+        blocker = os.path.join(d, "blocker")
+        with open(blocker, "w") as fh:
+            fh.write("a file where a directory is needed")
+        bad_conf = os.path.join(d, "bad.toml")
+        with open(bad_conf, "w") as fh:
+            fh.write('[paths]\nclaude_home = "%s"\nlast_check = "%s"\n'
+                     % (claude_home, os.path.join(blocker, "sub", "x.json")))
+        buf = _Buf()
+        rc = run_all({"SESSION_NOTES_CONFIG": bad_conf, "HOME": d}, run, buf, now=lambda: t0)
+        check("a status file that cannot be written: reported on stdout, rc 1",
+              rc == 1 and "cannot write the status file" in buf.text)
+
+        # no agent home: still recorded
+        empty = os.path.join(d, "empty.toml")
+        with open(empty, "w") as fh:
+            fh.write('[paths]\nclaude_home = "%s"\nstate_dir = "%s"\n[agent]\ncodex_home = "%s"\n'
+                     % (os.path.join(d, "nohome1"), os.path.join(d, "state2"), os.path.join(d, "nohome2")))
+        rc = run_all({"SESSION_NOTES_CONFIG": empty, "HOME": d}, run, _Buf(), now=lambda: t0)
+        with open(os.path.join(d, "state2", "last-check.json")) as fh:
+            check("no agent home: rc 1 and the record says so",
+                  rc == 1 and json.load(fh)["rc"] == 1)
+
+        # --- status ---
+        def rec(rc, checks, when=t0, name="rec.json"):
+            p = os.path.join(d, name)
+            with open(p, "w") as fh:
+                json.dump({"version": 1, "timestamp": when.isoformat(), "rc": rc,
+                           "checks": checks, "report": ""}, fh)
+            return p
+        later = t0 + timedelta(days=1)
+        clean = [{"agent": "claude", "check": "boot_budget", "status": "clean", "findings": 0}]
+        check("status: clean and fresh prints nothing",
+              status_line(rec(0, clean), 8, later) == "")
+        line = status_line(rec(3, [
+            {"agent": "claude", "check": "memory_hygiene_canary", "status": "findings", "findings": 2},
+            {"agent": "codex", "check": "memory_hygiene_canary", "status": "findings", "findings": 1}]),
+            8, later)
+        check("status: findings are summarised on one line",
+              line.startswith("Memory checks (2026-01-") and "3 findings" in line
+              and "claude memory_hygiene_canary 2" in line and "codex memory_hygiene_canary 1" in line
+              and "\n" not in line and line.endswith("run nightly_check.py for the report"))
+        line = status_line(rec(1, [{"agent": "claude", "check": "boot_budget",
+                                    "status": "crashed", "findings": 0}]), 8, later)
+        check("status: a crash is loud and names the check",
+              line.startswith("MEMORY CHECKS CRASHED (") and "claude boot_budget" in line)
+        check("status: no record = NEVER RAN",
+              status_line(os.path.join(d, "absent.json"), 8, later).startswith("MEMORY CHECKS NEVER RAN"))
+        garbage = os.path.join(d, "garbage.json")
+        with open(garbage, "w") as fh:
+            fh.write("{not json")
+        check("status: a malformed record is UNREADABLE, with the path",
+              status_line(garbage, 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE")
+              and garbage in status_line(garbage, 8, later))
+        wrong = os.path.join(d, "wrong.json")
+        with open(wrong, "w") as fh:
+            fh.write('{"rc": 0}')
+        check("status: a record missing fields is UNREADABLE",
+              status_line(wrong, 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
+        old = t0 + timedelta(days=9)
+        check("status: older than max age = STALE, even when clean",
+              status_line(rec(0, clean), 8, old).startswith("MEMORY CHECKS STALE: last run 2026-01-")
+              and "9 days ago" in status_line(rec(0, clean), 8, old))
+        check("status: stale outranks findings",
+              status_line(rec(3, [{"agent": "claude", "check": "x", "status": "findings",
+                                   "findings": 1}]), 8, old).startswith("MEMORY CHECKS STALE"))
+        check("status: --max-age-days is honoured",
+              status_line(rec(0, clean), 20, old) == "")
+
 
     print("all ok" if not fails else "%d FAILED" % len(fails))
     return 0 if not fails else 1
@@ -178,9 +402,22 @@ class _Buf(object):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--selftest", action="store_true")
+    sub = ap.add_subparsers(dest="cmd")
+    st = sub.add_parser("status", help="one line from the last run's record; silent when clean")
+    st.add_argument("--max-age-days", type=float, default=DEFAULT_MAX_AGE_DAYS)
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.cmd == "status":
+        try:
+            path = notes_config.load()["paths"]["last_check"]
+        except notes_config.ConfigError as exc:
+            print("MEMORY CHECKS STATUS UNREADABLE: bad config (%s)" % exc)
+            return 0
+        line = status_line(path, a.max_age_days)
+        if line:
+            print(line)
+        return 0
     return run_all()
 
 
