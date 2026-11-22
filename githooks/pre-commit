@@ -74,6 +74,9 @@ def main():
     cap = cfg["size_cap_kb"] * 1024
     findings = []
     rc, lsout = _git("ls-files", "-s", "-z")
+    if rc != 0:
+        print("session-notes pre-commit: git ls-files -s failed; commit refused")
+        return 1
     modes = {}
     for ent in lsout.decode("utf-8", "replace").split("\0"):
         meta, _, path = ent.partition("\t")

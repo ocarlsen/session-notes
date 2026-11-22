@@ -326,20 +326,22 @@ def hook_script():
 def build_shim(script, repo):
     # Generated text (paths) only ever goes into single-quoted assignments; the message is
     # static text plus variable expansions, so a path is never re-evaluated by the shell.
+    # repo_q holds the repo path already shell-quoted, so the printed repair line can be
+    # pasted as is even when the path has spaces.
     return ("#!/bin/sh\n%s\n"
             "# script-path: %s\n"
             "script=%s\n"
-            "repo=%s\n"
+            "repo_q=%s\n"
             "if [ ! -f \"$script\" ]; then\n"
             "  printf '%%s\\n' \"session-notes pre-commit: $script is missing (the session-notes "
             "checkout moved or was deleted); the commit is refused. Repair: "
-            "python3 <session-notes>/bin/wt.py install-hooks $repo\" >&2\n"
+            "python3 <session-notes>/bin/wt.py install-hooks $repo_q\" >&2\n"
             "  exit 1\n"
             "fi\n"
             "python3 \"$script\" \"$@\" || exit $?\n"
             "prev=\"$(dirname \"$0\")/pre-commit.pre-session-notes\"\n"
             "if [ -x \"$prev\" ]; then exec \"$prev\" \"$@\"; fi\n"
-            "exit 0\n") % (HOOK_MARKER, script, shlex.quote(script), shlex.quote(repo))
+            "exit 0\n") % (HOOK_MARKER, script, shlex.quote(script), shlex.quote(shlex.quote(repo)))
 
 
 def install_hooks(repo=None, out=sys.stdout, dry_run=False):
@@ -613,10 +615,15 @@ def cmd_rm(args, cfg):
                                  path, "detached HEAD" if not branch else "branch %r" % branch))
     if w["missing"]:
         if not args.force:
-            raise Die(4, "the directory of worktree %s is missing (an unmounted volume?); its "
+            raise Die(4, "the directory of worktree %s is missing or no longer a worktree (an "
+                         "unmounted volume?); its "
                          "record may hold a staged index. If it is really gone, re-run with "
                          "--force to remove just this record" % path)
-        git(main, "worktree", "remove", "--force", path)
+        r = git(main, "worktree", "remove", "--force", path, check=False)
+        if r.returncode != 0:
+            raise Die(1, "git worktree remove --force %s failed: %s. If something else now sits at "
+                         "that path, the record is stale: check it, then run git worktree prune "
+                         "(which removes EVERY stale record)" % (path, (r.stderr or r.stdout).strip()))
         print("removed the record of missing worktree %s (branch %s kept)" % (path, branch or "-"))
         return 0
     remove_worktree(main, path, branch, force=args.force)
@@ -1221,6 +1228,15 @@ def selftest():
         check("shim with a missing script refuses the commit, naming the path and the repair",
               r[0] != 0 and "/nonexistent/session-notes/githooks/pre-commit is missing" in r[1] + r[2]
               and "install-hooks" in r[1] + r[2], r)
+        Rsp = mkrepo("with space", with_origin=False)
+        wt(T, "install-hooks", Rsp)
+        hsp = os.path.join(Rsp, ".git", "hooks", "pre-commit")
+        with open(hsp, "w") as fh:
+            fh.write(build_shim("/nonexistent/session-notes/githooks/pre-commit", Rsp))
+        os.chmod(hsp, 0o755)
+        r = commit(Rsp, "s.txt")
+        check("repair line quotes a repo path with a space",
+              r[0] != 0 and ("install-hooks " + shlex.quote(Rsp)) in r[1] + r[2], r)
         rc, out, err = wt(T, "install-hooks", R9)
         check("install-hooks repairs a shim whose recorded path is gone", rc == 0 and "repaired" in out, (rc, out, err))
         r = commit(R9, "m.txt")
