@@ -46,6 +46,7 @@ equal, and a char count is what Claude Code's own warning measures.)
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -157,6 +158,8 @@ def reload_config():
 # here; `check` prints one BLIND line each and the canary refuses to judge from them.
 # A file that is simply absent (FileNotFoundError / NotADirectoryError) stays silent.
 _ABSENT = (FileNotFoundError, NotADirectoryError)
+# A path the OS cannot even look up (an over-long or malformed "@token") names nothing.
+_NOT_A_PATH = (errno.ENAMETOOLONG, errno.EINVAL)
 _BLIND = {}
 
 
@@ -187,7 +190,8 @@ def read_bytes_or_blind(path, scope):
     except _ABSENT:
         return None
     except OSError as exc:
-        record_blind(path, exc, scope)
+        if exc.errno not in _NOT_A_PATH:
+            record_blind(path, exc, scope)
         return None
 
 
@@ -278,10 +282,9 @@ def _display(path):
 
 
 def char_count(path):
-    try:
-        return len(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except OSError:
-        return 0
+    """Chars in the file; 0 when absent (silent) or unreadable (recorded as blind)."""
+    text = read_text_or_blind(path, "global")
+    return 0 if text is None else len(text)
 
 
 # --- Import resolution ---------------------------------------------------------------
@@ -306,7 +309,8 @@ def resolve_imports(path, visited=None, order=None, scope="global"):
     except _ABSENT:
         return order
     except OSError as exc:
-        record_blind(path, exc, scope)
+        if exc.errno not in _NOT_A_PATH:
+            record_blind(path, exc, scope)
         return order
     if not stat.S_ISREG(st.st_mode):
         return order
@@ -1201,6 +1205,49 @@ def selftest():
             reload_config()
             boot_files_for_scope(str(widget_root / "nope"))
             check(blind_reads() == [], "blind: an absent CLAUDE.md in the chain stays silent")
+
+            # --- fix round 1 ---
+            reload_config()
+            record_blind("/stale/entry.md", PermissionError(1, "Operation not permitted"), "x")
+            rc, text = run_check()
+            check("/stale/entry.md" not in text, "blind: check_mode starts from a clean record")
+            _write(blind_settings, '["not", "an", "object"]')
+            reload_config()
+            is_auto_memory_enabled(str(widget_root))
+            check(len(blind_reads()) == 1 and "not a JSON object" in blind_reads()[0][2],
+                  "blind: settings JSON that is not an object is BLIND")
+            blind_settings.unlink()
+            # an os.stat that fails for a reason other than absence is recorded (the stat branch)
+            stat_target = widget_root / "stat-denied.md"
+            _write(stat_target, "x\n")
+            real_stat = os.stat
+
+            def fake_stat(f, *a, **k):
+                if str(f).endswith("stat-denied.md"):
+                    raise PermissionError(1, "Operation not permitted")
+                return real_stat(f, *a, **k)
+            os.stat = fake_stat
+            try:
+                reload_config()
+                resolve_imports(str(stat_target), scope="sc")
+            finally:
+                os.stat = real_stat
+            check(blind_reads() == [(str(stat_target), "sc", "PermissionError: Operation not permitted")],
+                  "blind: a PermissionError from os.stat in resolve_imports is recorded")
+            # an over-long @token names nothing: absent, not BLIND
+            reload_config()
+            long_imp = widget_root / "long-import" / "CLAUDE.md"
+            _write(long_imp, "@" + "a" * 300 + "\n")
+            resolve_imports(str(long_imp), scope="sc")
+            check(blind_reads() == [], "blind: a 300-char @token (ENAMETOOLONG) is absent, not BLIND")
+            # char_count: unreadable records, absent is 0 and silent
+            reload_config()
+            with deny_open("Widget/CLAUDE.md"):
+                n = char_count(str(widget_root / "CLAUDE.md"))
+            check(n == 0 and len(blind_reads()) == 1, "blind: char_count on an unreadable file records BLIND")
+            reload_config()
+            check(char_count(str(widget_root / "absent.md")) == 0 and blind_reads() == [],
+                  "blind: char_count on an absent file is 0 and silent")
 
         # --- Regression guard: WARN_AT must stay reachable below TOTAL_LIMIT ---
         check(orig_warn < orig_total, "WARN_AT stays strictly below TOTAL_LIMIT in the real config")

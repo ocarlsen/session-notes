@@ -144,8 +144,16 @@ def _run_checks(env, run, out, checks):
     worst = 0
     for kind in kinds:
         for name, argv in checks_for(kind):
-            r = run(argv, env=dict(env, SESSION_NOTES_AGENT=kind),
-                    capture_output=True, text=True, timeout=600)
+            try:
+                r = run(argv, env=dict(env, SESSION_NOTES_AGENT=kind),
+                        capture_output=True, text=True, timeout=600)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                # A hung or unlaunchable check is a crash of THAT check; the others
+                # still run and the record is still written.
+                checks.append({"agent": kind, "check": name, "status": "crashed", "findings": 0})
+                out.write("== %s: %s (CRASHED %s: %s) ==\n" % (kind, name, type(exc).__name__, exc))
+                worst = 1
+                continue
             text = (r.stdout or "") + (r.stderr or "")
             if r.returncode == 0:
                 checks.append({"agent": kind, "check": name, "status": "clean", "findings": 0})
@@ -173,7 +181,8 @@ def _run_checks(env, run, out, checks):
 
 
 def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
-    """The one line `status` prints, or "" when the last run is clean and fresh."""
+    """The one line `status` prints, or "" when the last run is clean and fresh.
+    Fails closed: anything it cannot positively read as clean is a loud line."""
     now = now or datetime.now(timezone.utc)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -188,14 +197,18 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
             raise ValueError("no UTC offset")
         rc, checks = doc["rc"], doc["checks"]
         rows = [(c["agent"], c["check"], c["status"], int(c["findings"])) for c in checks]
-    except (KeyError, TypeError, ValueError, AttributeError):
+        age = (now - ran).total_seconds() / 86400.0
+        day = ran.astimezone().strftime("%Y-%m-%d")
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         return "MEMORY CHECKS STATUS UNREADABLE: %s (malformed record)" % path
-    day = ran.astimezone().strftime("%Y-%m-%d")
-    age = (now - ran).total_seconds() / 86400.0
+    if type(rc) is not int or rc not in (0, 1, EXIT_FINDINGS):
+        return "MEMORY CHECKS STATUS UNREADABLE: %s (unknown rc %r)" % (path, rc)
+    if age < -1:
+        return "MEMORY CHECKS STATUS UNREADABLE: timestamp in the future (%s)" % path
     if age > max_age_days:
         return "MEMORY CHECKS STALE: last run %s, %d days ago" % (day, int(age))
-    if rc == 1:
-        bad = ", ".join("%s %s" % (a, n) for a, n, st, _ in rows if st == "crashed")
+    bad = ", ".join("%s %s" % (a, n) for a, n, st, _ in rows if st not in ("clean", "findings"))
+    if bad or rc == 1:
         return "MEMORY CHECKS CRASHED (%s): %s" % (day, bad or "see nightly_check.py")
     found = [(a, n, f) for a, n, st, f in rows if st == "findings"]
     if rc == 0 and not found:
@@ -386,6 +399,62 @@ def selftest():
         check("status: --max-age-days is honoured",
               status_line(rec(0, clean), 20, old) == "")
 
+        # --- fix round 1: a check that hangs or cannot launch still gets recorded ---
+        for exc in (subprocess.TimeoutExpired(["x"], 600), FileNotFoundError(2, "No such file")):
+            seen = []
+
+            def boom(argv, env=None, **kw):
+                seen.append(os.path.basename(argv[1]))
+                if os.path.basename(argv[1]) == "memory_hygiene_canary.py" and env[
+                        "SESSION_NOTES_AGENT"] == "claude":
+                    raise exc
+                return R(0)
+            buf = _Buf()
+            rc = run_all(env, boom, buf, now=lambda: t0)
+            with open(status_file) as fh:
+                doc = json.load(fh)
+            check("%s from a check: rc 1, CRASHED block naming it, record rewritten, others still run"
+                  % type(exc).__name__,
+                  rc == 1 and "CRASHED %s" % type(exc).__name__ in buf.text
+                  and doc["rc"] == 1 and doc["checks"][0]["status"] == "crashed"
+                  and "boot_budget.py" in seen and len(doc["checks"]) == 3)
+
+        def rec2(doc_over, name="rec2.json"):
+            base = {"version": 1, "timestamp": t0.isoformat(), "rc": 0, "checks": clean, "report": ""}
+            base.update(doc_over)
+            p = os.path.join(d, name)
+            with open(p, "w") as fh:
+                fh.write(json.dumps(base))
+            return p
+        check("status: unknown rc is UNREADABLE",
+              status_line(rec2({"rc": 2}), 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
+        check("status: rc 'true' is not rc 1",
+              status_line(rec2({"rc": True}), 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
+        bad_row = [{"agent": "claude", "check": "x", "status": "weird", "findings": 0}]
+        check("status: an unknown row status is loud CRASHED",
+              status_line(rec2({"checks": bad_row}), 8, later).startswith("MEMORY CHECKS CRASHED"))
+        crow = [{"agent": "claude", "check": "x", "status": "crashed", "findings": 0}]
+        check("status: a crashed row with rc 0 is still loud CRASHED",
+              status_line(rec2({"checks": crow}), 8, later).startswith("MEMORY CHECKS CRASHED"))
+        check("status: a crashed row with rc 3 is still loud CRASHED",
+              status_line(rec2({"rc": 3, "checks": crow}), 8, later).startswith("MEMORY CHECKS CRASHED"))
+        check("status: year 0001 timestamp is UNREADABLE, not a traceback",
+              status_line(rec2({"timestamp": "0001-01-01T00:00:00+00:00"}), 8, later)
+              .startswith("MEMORY CHECKS STATUS UNREADABLE"))
+        inf = os.path.join(d, "inf.json")
+        with open(inf, "w") as fh:
+            fh.write('{"version": 1, "timestamp": "%s", "rc": 3, "report": "", "checks": ['
+                     '{"agent": "claude", "check": "x", "status": "findings", "findings": Infinity}]}'
+                     % t0.isoformat())
+        check("status: findings Infinity is UNREADABLE, not a traceback",
+              status_line(inf, 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
+        check("status: a timestamp more than a day in the future is loud",
+              status_line(rec2({}), 8, t0 - timedelta(days=3)).startswith(
+                  "MEMORY CHECKS STATUS UNREADABLE: timestamp in the future"))
+        check("status: a naive timestamp is UNREADABLE",
+              status_line(rec2({"timestamp": "2026-01-10T12:00:00"}), 8, later)
+              .startswith("MEMORY CHECKS STATUS UNREADABLE"))
+
 
     print("all ok" if not fails else "%d FAILED" % len(fails))
     return 0 if not fails else 1
@@ -414,7 +483,10 @@ def main(argv=None):
         except notes_config.ConfigError as exc:
             print("MEMORY CHECKS STATUS UNREADABLE: bad config (%s)" % exc)
             return 0
-        line = status_line(path, a.max_age_days)
+        try:
+            line = status_line(path, a.max_age_days)
+        except Exception as exc:  # noqa: BLE001 -- status must never traceback
+            line = "MEMORY CHECKS STATUS UNREADABLE: %s (%s)" % (path, type(exc).__name__)
         if line:
             print(line)
         return 0
