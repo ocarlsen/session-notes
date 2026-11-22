@@ -212,6 +212,10 @@ if [ "$CODEX" = 1 ]; then
     echo "Skipped the skills."
   fi
 
+  # The live-context file sits outside both agent homes; Codex may write it only if its
+  # directory is a writable root too.
+  LIVE_DIR=$(SESSION_NOTES_AGENT=codex python3 "$REPO/bin/notes_config.py" --live-path 2>/dev/null)
+  LIVE_DIR=$(dirname "${LIVE_DIR:-$HOME/.local/state/session-notes/live-context.md}")
   CODEX_TOML=$(cat <<TOML
 
 # session-notes: the skills find the tools through these, and \$reflect may write its store.
@@ -219,7 +223,7 @@ if [ "$CODEX" = 1 ]; then
 set = { SESSION_NOTES = "$REPO", SESSION_NOTES_AGENT = "codex" }
 
 [sandbox_workspace_write]
-writable_roots = ["$CODEX_DIR/session-notes"]
+writable_roots = ["$CODEX_DIR/session-notes", "$LIVE_DIR"]
 TOML
 )
   HJ="$CODEX_DIR/hooks.json" CT="$CODEX_DIR/config.toml"
@@ -282,11 +286,19 @@ TOML
     if ask "Append it (keeping a .bak-session-notes copy)?"; then
       if [ -e "$CT" ]; then cp "$CT" "$CT.bak-session-notes"; fi
       printf '%s\n' "$CODEX_TOML" >> "$CT"; echo "appended to $(tilde "$CT")"
+      # Only now: a writable root must exist before the sandbox can write under it.
+      mkdir -p "$LIVE_DIR"
     else
       echo "Skipped config.toml."
     fi
   else
     echo "Add to $(tilde "$CT") by hand, merging into any table of the same name:"; echo "$CODEX_TOML"
+    if grep -q '^writable_roots' "$CT" 2>/dev/null && ! grep '^writable_roots' "$CT" | grep -qF "$LIVE_DIR"; then
+      echo
+      echo "Your writable_roots does not include the live-context directory; add this entry to it:"
+      echo "  \"$LIVE_DIR\""
+    fi
+    echo "Then create that directory (a writable root must exist): mkdir -p $(tilde "$LIVE_DIR")"
   fi
   # The desktop app ignores writable_roots, so each write to the store is an approval prompt.
   # Saves go through one fixed command line; this rule approves exactly that line, nothing else.
@@ -369,6 +381,7 @@ fi
 
 PR="python3 $SHOWN/hooks/session_pane_registry.py"
 BUS="python3 $SHOWN/hooks/session_bus_hook.py"
+LIVE="python3 $SHOWN/bin/live.py hook"
 hook() { printf '    {"hooks": [{"type": "command", "command": "%s"}]}' "$1"; }
 if [ "$ALL" = 1 ]; then
   EXTRA_PROMPT=",
@@ -384,7 +397,8 @@ fi
 HOOKS_JSON=$(cat <<EOF
 {
   "SessionStart": [
-$(hook "$PR")
+$(hook "$PR"),
+$(hook "$LIVE")
   ],
   "UserPromptSubmit": [
 $(hook "$PR"),

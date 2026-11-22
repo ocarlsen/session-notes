@@ -353,6 +353,12 @@ when a cross-cutting item changed. New scope: create its RESUME and add the `@im
     cutting live items).
   - Re-read before writing (sibling race) and re-read after to confirm the open items survived.
 
+- **Live context.** For each DECISION this session made that other sessions should know, write one
+  line (what was decided, not how) with `python3 $SESSION_NOTES/bin/live.py note -`, the text on
+  stdin (a heredoc or `printf`, so the shell does not expand `$` or backticks). Skip it when nothing
+  was decided. Mechanical events (merges and the like) are written by their own tools; do not note
+  those. In an isolated scope the command refuses (exit 3); that is fine, move on.
+
 The RESUME note is the resume channel: write what a future session needs to continue, since the
 conversation itself does not carry across sessions.
 

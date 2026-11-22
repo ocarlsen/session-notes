@@ -88,6 +88,7 @@ fixed line (never the message) into its empty input box. Codex panes started wit
 | Worktrees | `bin/wt.py`, `githooks/pre-commit` | A worktree per change, a PR that merges only on a review verdict, and a staged-content pre-commit. See the `wt` section below. |
 | Environment | `bin/environment_render.py`, `templates/environment.md`, `templates/codex-auto-review-policy.md` | One private Markdown file describing your environment, rendered into Claude Code's `autoMode.environment` and Codex's `[auto_review] policy` (the pinned bundled policy with your entries inserted). `diff` shows the change, `apply` backs up and writes, `check` (run by `nightly_check.py`) reports drift, `upstream` reports when Codex's bundled policy changed. `apply --target codex` also allows `session_bus.py send` in `default.rules`. See `docs/codex.md`. |
 | Standing rules | `rules/core.md`, `rules/review-contract.md`, `bin/rules_block.py` | The rules every session follows, for both agents. `rules_block.py apply` writes them, with `AGENTS.snippet.md` and an optional private addendum (`rules.local` in the config), into a marked block in `~/.codex/AGENTS.md` that every `install.sh --codex` rewrites (a file with an older install of the snippet is migrated, and anything outside the markers is kept; each change keeps a timestamped backup, and only the newest 3 are kept); `claude-apply` adds `@import` lines to `~/.claude/CLAUDE.md`. `codex-defaults` and `profiles` set Codex's model and effort where unset and create `build` and `review` profiles. |
+| Live context | `bin/live.py` | One machine-wide rolling file of what just happened across scopes, loaded at session start. See the `live` section below. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
 | Checkout guard | `hooks/checkout_guard.py` | A PreToolUse guard that keeps edits out of a repo's main checkout, blocks raw `gh pr merge`, and stops destructive git on a dirty tree. See the `checkout_guard` section below. |
 | Example guard | `hooks/em_dash_guard.py` | A harmless PostToolUse hook showing the pattern: it flags em dashes in text the model just wrote and asks for a rewrite. |
@@ -232,6 +233,59 @@ exemption is keyed on the current directory's repo. `gh api` merges are not cove
 tool's name is not verified: the accepted names live in one constant (`SHELL_TOOLS`) and are
 guesses until a live Codex run. For that reason `install.sh --codex` does not register the hook
 yet.
+
+## live: what just happened, across scopes
+
+Memory stores hold what a scope decided and are read at boot; they do not tell a session
+what another session did ten minutes ago. `bin/live.py` keeps one short rolling file for that:
+`~/.local/state/session-notes/live-context.md` (key `live.path`). Claude Code and Codex share it. It lives outside both agent homes because both
+agents write it and Codex must never touch `~/.claude`; `install.sh --codex` adds its directory to
+Codex's `writable_roots` (`notes_config.py --live-path` prints the resolved path).
+
+```
+# Live context (newest first; written by live.py, do not hand-edit)
+
+- 2026-11-21 14:03 PST [recipes-app] merged PR #12: add search (https://github.com/...)
+- 2026-11-21 13:40 PST [finance] decided to keep the old ledger format
+```
+
+One line per event, stamped in `[time].timezone`, tagged with the scope name (a folder outside
+every scope is tagged with its git root's name, else `unscoped`). Only `live.max_lines` (30)
+entries are kept, and one entry's text is at most `live.max_chars` (240) characters: a longer one
+is refused, never truncated. Writes take an flock and replace the file whole, and a symlinked file
+is updated in place. A hand-added non-entry line makes `add` refuse rather than rewrite the file.
+
+Writers:
+- `wt.py merge` adds `merged PR #N: title (url)` after a successful merge (a failure there only
+  warns; the merge result is unchanged).
+- `/reflect` and `$reflect` record each decision other sessions should know, with
+  `live.py note -` (text on stdin).
+- Any tool can `import live; live.add(scope_or_cwd, "text")`. Planned call points: the review
+  verdict, ledger add/close, reminders add.
+
+Readers: the Claude `SessionStart` hook (`live.py hook`, added to the hooks `install.sh` offers),
+the Codex start hook (inside `agent.codex_boot_bytes`, after the memory files, which keep
+priority), and `/refresh` and `$refresh` (`live.py show`). Startup output is silent when the
+file is empty.
+
+Isolation. A scope in the config sets `live`:
+
+| `live` | Reads | Writes |
+| --- | --- | --- |
+| `"shared"` (default) | the shared file | the shared file |
+| `"own"` | only its `live_file` | only its `live_file` |
+| `"none"` | nothing | nothing (`live.py note` exits 3) |
+
+A `<file>.lock` sits beside each live file (the flock target), so an own `live_file` inside a repo
+should be gitignored along with its lock, or placed outside the tree. A linked git worktree
+counts as its main checkout's scope, wherever it lives (even under another scope's folder). If git
+cannot answer cleanly (missing, hung, an error other than "not a git repository", or output it
+cannot parse), the folder is treated as isolated, even inside a shared scope: nothing is read and
+`note` refuses. Limit: a worktree of a submodule (its git dir is not named `.git`) is matched by
+its own path, not its superproject's. `live_file` may not be the shared file,
+and two own scopes may not share one. `live_file` is required with `"own"` and refused otherwise; a relative path is relative to the scope
+root. See `config.example.toml` for a `finance` scope with its own file and a `work-client` scope
+that is fully isolated.
 
 ## Skill feedback: skills that improve from being corrected
 

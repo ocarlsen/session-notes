@@ -27,5 +27,8 @@ be an older version without the Codex code. If neither works, stop and say so.
      `<project>/RESUME.md` (each that exists), then `~/.codex/AGENTS.md` and each AGENTS.md
      from the git root down to cwd. Compare against what the session-start memory block (the
      SessionStart hook's context) or an earlier `$refresh` showed.
+   - Step 2: also run `SESSION_NOTES_AGENT=codex python3 $SESSION_NOTES/bin/live.py show` (live
+     context: what other sessions just did; empty in an isolated scope) and carry entries newer
+     than the session-start block into the Step 4 delta.
    - Step 2b (sibling peek and message): skip.
 3. Report the delta and stop, exactly as its Step 4 says. A `$refresh` never writes.

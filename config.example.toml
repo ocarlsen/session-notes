@@ -106,6 +106,18 @@ exempt_repos = []
 # on the default branch. Every scope's memory store below is always exempt.
 exempt_paths = []
 
+[live]
+# bin/live.py: one machine-wide rolling file of what just happened across scopes, read
+# by every session at start (Claude SessionStart hook, Codex start hook, /refresh).
+# Empty = ~/.local/state/session-notes/live-context.md. Both agents write this file and Codex must
+# never touch ~/.claude, so it lives outside both agent homes (install.sh --codex adds its
+# directory to Codex's writable roots).
+path = ""
+# Entries kept, newest first.
+max_lines = 30
+# Most characters in one entry's text (a longer one is refused, never truncated).
+max_chars = 240
+
 # One block per project folder that keeps its own memory store.
 # `store` is optional, and best left out: empty = the folder Claude Code
 # already keeps for that project, named after its full path, e.g.
@@ -121,3 +133,22 @@ exempt_paths = []
 # manifest = ""
 # # Optional: where wt.py puts this scope's worktrees (relative to root, or absolute).
 # worktree_root = ""
+# # Optional: how the scope takes part in live context (the [live] file above).
+# #   "shared" (default): reads and writes the shared file.
+# #   "own": reads and writes ONLY `live_file` (an isolated scope with its own file).
+# #   "none": isolated; reads nothing, writes nothing.
+# live = "shared"
+# # Required with live = "own", refused otherwise. Relative to root. A `<file>.lock` sits beside
+# # it, so inside a repo gitignore both, or put the file outside the tree.
+# live_file = ""
+#
+# [[scopes]]
+# name = "finance"
+# root = "~/finance"
+# live = "own"
+# live_file = ".live-context.md"
+#
+# [[scopes]]
+# name = "work-client"
+# root = "~/work/client"
+# live = "none"
