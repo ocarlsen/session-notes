@@ -73,7 +73,15 @@ def main():
             return 1
     cap = cfg["size_cap_kb"] * 1024
     findings = []
+    rc, lsout = _git("ls-files", "-s", "-z")
+    modes = {}
+    for ent in lsout.decode("utf-8", "replace").split("\0"):
+        meta, _, path = ent.partition("\t")
+        if path:
+            modes[path] = meta.split(" ")[0]
     for f in files:
+        if modes.get(f) == "160000":
+            continue  # a submodule gitlink has no blob to read
         rc, blob = _git("show", ":" + f)
         if rc != 0:
             findings.append("%s: staged content could not be read (git show :path failed)" % f)

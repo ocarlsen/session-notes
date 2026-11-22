@@ -324,19 +324,22 @@ def hook_script():
 
 
 def build_shim(script, repo):
-    repair = "python3 <session-notes>/bin/wt.py install-hooks %s" % shlex.quote(repo)
+    # Generated text (paths) only ever goes into single-quoted assignments; the message is
+    # static text plus variable expansions, so a path is never re-evaluated by the shell.
     return ("#!/bin/sh\n%s\n"
             "# script-path: %s\n"
             "script=%s\n"
+            "repo=%s\n"
             "if [ ! -f \"$script\" ]; then\n"
-            "  echo \"session-notes pre-commit: $script is missing (the session-notes checkout "
-            "moved or was deleted); the commit is refused. Repair: %s\" >&2\n"
+            "  printf '%%s\\n' \"session-notes pre-commit: $script is missing (the session-notes "
+            "checkout moved or was deleted); the commit is refused. Repair: "
+            "python3 <session-notes>/bin/wt.py install-hooks $repo\" >&2\n"
             "  exit 1\n"
             "fi\n"
             "python3 \"$script\" \"$@\" || exit $?\n"
             "prev=\"$(dirname \"$0\")/pre-commit.pre-session-notes\"\n"
             "if [ -x \"$prev\" ]; then exec \"$prev\" \"$@\"; fi\n"
-            "exit 0\n") % (HOOK_MARKER, script, shlex.quote(script), repair.replace('"', '\\"'))
+            "exit 0\n") % (HOOK_MARKER, script, shlex.quote(script), shlex.quote(repo))
 
 
 def install_hooks(repo=None, out=sys.stdout, dry_run=False):
@@ -575,8 +578,9 @@ def cmd_list(args, cfg):
             continue
         b = w["branch"]
         if w["missing"]:
-            print("%-20s %-20s %s  missing, run git worktree prune" % (
-                os.path.basename(w["path"]), b or "(detached)", w["path"]))
+            print("%-20s %-20s %s  missing; if it is really gone, run wt rm %s --force" % (
+                os.path.basename(w["path"]), b or "(detached)", w["path"],
+                os.path.basename(w["path"])))
             rows += 1
             continue
         prs = _pr_state(gh, main, b) if note is None and b else None
@@ -608,8 +612,12 @@ def cmd_rm(args, cfg):
                              "covers them (--force to discard)" % (
                                  path, "detached HEAD" if not branch else "branch %r" % branch))
     if w["missing"]:
-        git(main, "worktree", "prune")
-        print("pruned the missing worktree record %s (branch %s kept)" % (path, branch or "-"))
+        if not args.force:
+            raise Die(4, "the directory of worktree %s is missing (an unmounted volume?); its "
+                         "record may hold a staged index. If it is really gone, re-run with "
+                         "--force to remove just this record" % path)
+        git(main, "worktree", "remove", "--force", path)
+        print("removed the record of missing worktree %s (branch %s kept)" % (path, branch or "-"))
         return 0
     remove_worktree(main, path, branch, force=args.force)
     print("removed %s and branch %s" % (path, branch or "(detached)"))
@@ -625,7 +633,8 @@ def cmd_gc(args, cfg):
         if w["main"]:
             continue
         if w["missing"]:
-            remove.append((w["path"], w["branch"], "directory is missing (git worktree prune)"))
+            print("missing: %s; if it is really gone, run wt rm %s --force" % (
+                w["path"], os.path.basename(w["path"])))
             continue
         if not w["branch"]:
             continue  # detached: no PR or remote signal says it is finished
@@ -660,14 +669,10 @@ def cmd_gc(args, cfg):
         if args.yes:
             go = True
         elif tty:
-            go = input("%s %s? [y/N] " % ("prune" if not os.path.isdir(path) else "remove", path)
-                       ).strip().lower() in ("y", "yes")
+            go = input("remove %s? [y/N] " % path).strip().lower() in ("y", "yes")
         else:
             go = False
-        if go and not os.path.isdir(path):
-            git(main, "worktree", "prune")
-            print("pruned   %s (branch %s kept)" % (path, b or "-"))
-        elif go:
+        if go:
             remove_worktree(main, path, b)
             print("removed  %s" % path)
     if not args.yes and not tty:
@@ -1078,14 +1083,24 @@ def selftest():
         # N2: a hand-deleted worktree directory
         import shutil
         gw, _ = pushed_wt("ghostwt")
+        gx, _ = pushed_wt("ghostx")
         shutil.rmtree(gw)
+        shutil.rmtree(gx)
         rc, out, err = wt(R, "list")
-        check("list shows a missing worktree as its own row and does not crash",
-              rc == 0 and "ghostwt" in out and "missing, run git worktree prune" in out, (rc, out, err))
-        rc, out, err = wt(R, "gc")
-        check("gc lists a missing worktree without crashing", rc == 0 and "directory is missing" in out, (rc, out, err))
+        check("list shows missing worktrees as their own rows and does not crash",
+              rc == 0 and "ghostwt" in out and "wt rm ghostwt --force" in out, (rc, out, err))
         rc, out, err = wt(R, "gc", "--yes")
-        check("gc --yes prunes it", rc == 0 and "pruned" in out and "ghostwt" not in g(R, "worktree", "list"), (rc, out, err))
+        wl = g(R, "worktree", "list")
+        check("gc --yes only lists missing worktrees, never removes them",
+              rc == 0 and "missing: " in out and "wt rm ghostwt --force" in out
+              and "ghostwt" in wl and "ghostx" in wl, (rc, out, err))
+        rc, out, err = wt(R, "rm", "ghostwt")
+        check("rm of a missing worktree without --force is refused (4)", rc == 4 and "--force" in err, (rc, err))
+        rc, out, err = wt(R, "rm", "ghostwt", "--force")
+        wl = g(R, "worktree", "list")
+        check("rm --force removes only that one record, the sibling stays",
+              rc == 0 and "ghostwt" not in wl and "ghostx" in wl, (rc, err, wl))
+        wt(R, "rm", "ghostx", "--force")
 
         # N3: hook install failing inside `new` is a warning, the path still prints
         R13 = mkrepo("newwarn")
@@ -1226,6 +1241,24 @@ def selftest():
         check("a dangling-symlink pre-commit is refused cleanly (no traceback), untouched",
               rc == 1 and "dangling symlink" in err and "Traceback" not in err and os.path.islink(h10), (rc, err))
 
+        # shim: a hostile repo path is never evaluated by the shell
+        evil = os.path.join(T, "d$(touch PWNED)")
+        os.makedirs(evil)
+        R14 = mkrepo("x", with_origin=False)
+        evil_repo = os.path.join(evil, "r")
+        shutil_ = __import__("shutil")
+        shutil_.copytree(R14, evil_repo, symlinks=True)
+        h14 = os.path.join(evil_repo, ".git", "hooks", "pre-commit")
+        os.makedirs(os.path.dirname(h14), exist_ok=True)
+        with open(h14, "w") as fh:
+            fh.write(build_shim("/nonexistent/session-notes/githooks/pre-commit", evil_repo))
+        os.chmod(h14, 0o755)
+        r = commit(evil_repo, "e.txt")
+        check("shim: a repo path with $(...) is printed literally, never executed",
+              r[0] != 0 and "d$(touch PWNED)" in r[1] + r[2] and "install-hooks" in r[1] + r[2]
+              and not os.path.exists(os.path.join(evil_repo, "PWNED")) and not os.path.exists(os.path.join(T, "PWNED"))
+              and not any("PWNED" in f and not f.startswith("d$") for f in os.listdir(evil)), r)
+
         # B4: --dry-run writes nothing, through wt.py and through install.sh in either arg order
         R11 = mkrepo("dry", with_origin=False)
         h11 = os.path.join(R11, ".git", "hooks", "pre-commit")
@@ -1236,6 +1269,8 @@ def selftest():
             rc, out, err = sh(["sh", inst] + order, T)[0:3]
             check("install.sh %s writes nothing" % " ".join(order[:1] + order[2:]),
                   rc == 0 and "would:" in out and not os.path.exists(h11), (rc, out, err))
+        rc, out, err = sh(["sh", inst, "--git-hooks", ""], T)
+        check("install.sh --git-hooks with an empty repo is a usage error (2)", rc == 2 and "non-empty" in err, (rc, err))
         rc, out, err = sh(["sh", inst, "--git-hooks", R11], T)
         check("install.sh --git-hooks installs", rc == 0 and os.path.isfile(h11), (rc, out, err))
 
@@ -1253,6 +1288,11 @@ def selftest():
         os.makedirs(nongit)
         rc, out, err = sh([sys.executable, hook_script()], nongit)
         check("hook fails loudly when git diff fails", rc == 1 and "git diff --cached failed" in out, (rc, out, err))
+        R15 = mkrepo("gitlink", with_origin=False)
+        wt(T, "install-hooks", R15)
+        g(R15, "update-index", "--add", "--cacheinfo", "160000,%s,vendor/lib" % ("1" * 40))
+        r = sh(["git", "commit", "-q", "-m", "add submodule pointer"], R15)
+        check("a staged gitlink (submodule) passes the hook", r[0] == 0, r)
         R12 = mkrepo("blobless", with_origin=False)
         wt(T, "install-hooks", R12)
         open(os.path.join(R12, "f.txt"), "w").write("content to lose\n")
