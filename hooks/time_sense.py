@@ -133,10 +133,10 @@ def run(payload, now, cfg):
             lines.append(
                 "⏰ %s have passed since the previous message in this "
                 "session: the boot-loaded context (CLAUDE.md imports, RESUME, "
-                "memory index) is STALE. RUN /refresh NOW, as your first action "
+                "memory index) is STALE. RUN %s NOW, as your first action "
                 "this turn, BEFORE acting on the user's message, then handle the "
                 "message with the refreshed context. (An idle session must never "
-                "answer from its stale boot snapshot.)" % human(gap)
+                "answer from its stale boot snapshot.)" % (human(gap), refresh_cmd())
             )
         elif gap >= note_gap:
             lines.append("⏱ %s since the previous message in this session." % human(gap))
@@ -156,6 +156,11 @@ def run(payload, now, cfg):
         },
         "suppressOutput": True,
     }
+
+
+def refresh_cmd():
+    """The refresh skill's invocation: Codex spells skills with `$`, Claude Code with `/`."""
+    return "$refresh" if os.environ.get("SESSION_NOTES_AGENT", "").strip().lower() == "codex" else "/refresh"
 
 
 def main():
@@ -205,6 +210,11 @@ def selftest():
         t1 = t0 + 600 + 45 * 60
         stale = run({"session_id": "alpha"}, t1 + 3 * 3600, cfg)
         check("stale gap directs /refresh", "RUN /refresh NOW" in ctx(stale))
+        os.environ["SESSION_NOTES_AGENT"] = "codex"
+        cx = ctx(run({"session_id": "cx"}, t0, cfg))
+        cx = ctx(run({"session_id": "cx"}, t0 + 3 * 3600, cfg))
+        os.environ.pop("SESSION_NOTES_AGENT")
+        check("codex stale gap directs $refresh", "RUN $refresh NOW" in cx and "/refresh" not in cx)
         check("date flip noted", "today is now Wednesday 2023-11-15" in ctx(stale))
         check("generic wording", "the user's message" in ctx(stale))
         check("sessions isolated", "clock anchor" in ctx(run({"session_id": "beta"}, t1, cfg)))

@@ -47,6 +47,7 @@ rather than a repo fact.
 """
 import fcntl
 import json
+import subprocess
 import os
 import sys
 import tempfile
@@ -131,12 +132,33 @@ def _payload():
         return {}
 
 
+def _agent_pid(pane):
+    """The pid recorded for this pane's session: CLAUDE_PID, or for Codex (which sets no
+    such variable) the pane's own process or a direct child of it that this hook descends
+    from (session_peers.pane_ancestor_pid, shared with the bus hook).
+
+    Only under SESSION_NOTES_AGENT=codex, so a Claude session without CLAUDE_PID still
+    refuses. Which readers accept which shape: the turn-state reader (apply_hook_state)
+    takes the pane's pid or a direct child; the transcript and lineage readers
+    (resolve_pane_transcript, parents_by_session) require exactly the pane's pid, so a
+    Codex entry that is a child verifies for turn state only. None found: "" and the
+    caller refuses."""
+    pid = os.environ.get("CLAUDE_PID", "").strip()
+    if pid or os.environ.get("SESSION_NOTES_AGENT", "").strip().lower() != "codex":
+        return pid
+    try:
+        import session_peers
+        return session_peers.pane_ancestor_pid(pane)
+    except Exception:
+        return ""
+
+
 def record_turn_state(pane, event, payload):
     """Write this pane's working/idle state for a turn event. Fail-open."""
     state = TURN_EVENTS.get(event, "idle")
     if event == "Notification" and payload.get("notification_type") not in (None, "idle_prompt"):
         return  # a permission prompt or other notice is not the end of a turn
-    claude_pid = os.environ.get("CLAUDE_PID", "").strip()
+    claude_pid = _agent_pid(pane)
     if not claude_pid:
         return  # unverifiable, so the reader would have to trust it blindly
     try:
@@ -175,7 +197,7 @@ def main():
     # The reader compares this against the live pane_pid. tmux REUSES pane ids
     # after a pane dies, so pane id alone would happily resolve a dead session's
     # transcript for whoever inherits the id.
-    claude_pid = os.environ.get("CLAUDE_PID", "").strip()
+    claude_pid = _agent_pid(pane)
     if not claude_pid:
         # Refuse to write an entry the reader cannot verify. An entry without a
         # pid is INDISTINGUISHABLE from a live one at read time, so it would be
@@ -353,6 +375,46 @@ def selftest():
         main()
         check("SessionStart sweep deletes nothing when liveness is unknown (None)",
               session_peers.read_pane_state("%dead2") is not None)
+
+        # Codex payload: no CLAUDE_PID / CLAUDE_CODE_SESSION_ID; id from the payload, pid by walking up.
+        for k in ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID"):
+            os.environ.pop(k, None)
+        os.environ.update(TMUX_PANE="%7", SESSION_NOTES_AGENT="codex")
+        _live_pane_ids = lambda: {"%7", "%3", "%1", "%2"}
+        sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart", "session_id": "codex-1"}))
+        main()
+        with open(reg_file) as f:
+            reg = json.load(f)
+        check("codex without a findable pid: refuses", "%7" not in reg)
+        real_run = subprocess.run
+
+        class _R:
+            def __init__(self, out):
+                self.returncode, self.stdout = 0, out
+        me, up = str(os.getppid()), "88888"
+
+        def fake_run(cmd, *a, **k):
+            if cmd[0] == "tmux":
+                return _R(up + "\n")
+            return _R("%s %s\n%s 1\n" % (me, up, up))
+        subprocess.run = fake_run
+        try:
+            sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart", "session_id": "codex-1"}))
+            main()
+            with open(reg_file) as f:
+                reg = json.load(f)
+            check("codex: entry recorded from payload id, pid = pane child",
+                  reg.get("%7", {}).get("session_id") == "codex-1"
+                  and reg["%7"].get("claude_pid") == me)
+            check("codex: UserPromptSubmit records turn state", turn("UserPromptSubmit", pane="%7") == "working")
+            check("codex: Stop records idle", turn("Stop", pane="%7") == "idle")
+            os.environ["SESSION_NOTES_AGENT"] = ""
+            check("claude without CLAUDE_PID still refuses", _agent_pid("%7") == "")
+        finally:
+            subprocess.run = real_run
+            os.environ.pop("SESSION_NOTES_AGENT", None)
+            os.environ["CLAUDE_PID"] = "4242"
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-delta"
 
         _live_pane_ids = lambda: None
         check("unknown liveness prunes nothing but age",

@@ -155,7 +155,7 @@ MAX_BODY = 4000
 # interrupted turn gets the second offer it exists for. If Stop ever fired on an
 # interrupt anyway, the cost would be that one lost re-offer, never a duplicate.
 DELIVERIES = int(os.environ.get("CLAUDE_SESSION_BUS_DELIVERIES", "2"))
-# A hookless harness (Codex) is offered mail by bus_nudge, one offer per
+# A pane whose hook cannot inject (Codex without its hook in the pane) is offered mail by bus_nudge, one offer per
 # nudge, and nothing confirms it was pulled. Retiring at DELIVERIES would make each
 # message pullable for exactly one nudge window, so a missed pull loses it silently.
 # One window more: the next nudge's pull shows it again, labeled [RE-DELIVERY].
@@ -203,7 +203,7 @@ def session_info(env=None):
     return parts[0].strip(), created
 
 
-# A hookless agent's shell often cannot say which session it is in. Codex's
+# A pulling agent's shell (Codex in daemon mode) often cannot say which session it is in. Codex's
 # sandbox refuses the tmux socket, and a RESUMED Codex session runs its commands in
 # the app-server daemon, whose environment has no TMUX/TMUX_PANE at all (observed
 # 2026-11-20: fresh `codex` saw TMUX_PANE, `codex resume` saw it empty). So bus_nudge,

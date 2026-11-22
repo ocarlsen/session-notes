@@ -232,6 +232,33 @@ def process_parents():
     return out
 
 
+def pane_ancestor_pid(pane_id, start_pid=None, parents=None):
+    """The process of `pane_id` that the CALLER descends from: the pane's own process or a
+    direct child of it, as a pid string; "" when the caller is not inside that pane (or tmux
+    or ps cannot say).
+
+    The shared "is this hook really running in the pane TMUX_PANE names" test. A
+    TMUX_PANE in the environment is not proof: a daemon started inside pane A hands %A
+    to every session it later serves. Walking up from the hook's own parent process to
+    the pane's pid is. Walks from os.getppid() unless `start_pid` is given."""
+    try:
+        r = _tmux(["display-message", "-p", "-t", pane_id, "#{pane_pid}"], timeout=5)
+        pane_pid = r.stdout.strip() if r.returncode == 0 else ""
+        table = parents if parents is not None else process_parents()
+    except Exception:
+        return ""
+    if not pane_pid or not table:
+        return ""
+    cur = str(start_pid if start_pid is not None else os.getppid())
+    for _ in range(32):
+        if cur == pane_pid or table.get(cur) == pane_pid:
+            return cur
+        cur = table.get(cur, "")
+        if not cur or cur in ("0", "1"):
+            return ""
+    return ""
+
+
 def apply_hook_state(panes, read=read_pane_state, parents=process_parents):
     """Overwrite each Claude pane's title-derived state with its hook record,
     when the record was written by the claude process now in that pane: the
@@ -711,8 +738,12 @@ def render_checks(lines, limit=20):
 # version/model rule in parse_pane_line, and its empty-box test lives in
 # bcast.input_box_empty. A harness listed here carries:
 #   command    regex fullmatched against #{pane_current_command}
-#   hook       False: it has no prompt hook to inject bus mail, so bus_nudge types
-#              a fixed "pull your inbox" line and the agent runs session_bus.py inbox
+#   hook_in_pane  optional callable(pane) -> True when the harness's prompt hook runs
+#              INSIDE the pane (it sees TMUX_PANE), so bus mail rides its next prompt
+#              like Claude Code's. Absent or False: bus_nudge types a fixed "pull your
+#              inbox" line and the agent runs session_bus.py inbox. Codex runs its
+#              hooks as TUI children only without the shared daemon, so its answer
+#              depends on how THIS pane's codex was started (codex_hook_in_pane).
 #   empty_box  raw -e screen -> True only on an empty input box (safe to type + Enter)
 #   busy       raw -e screen -> True while the agent works or shows a dialog
 # The Codex signatures were read off a live Codex CLI 0.170.0 pane (fixtures in the
@@ -751,10 +782,65 @@ def codex_busy(raw_lines):
                for l in raw_lines or [])
 
 
+def process_table():
+    """{pid: (ppid, argv string)} for every process, from one `ps` call; None if ps failed."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for ln in r.stdout.splitlines():
+        f = ln.split(None, 2)
+        if len(f) >= 2:
+            out[f[0]] = (f[1], f[2] if len(f) > 2 else "")
+    return out
+
+
+def codex_hook_in_pane(pane, table=None, registry=None):
+    """True only on positive evidence that Codex's hooks run inside this pane.
+
+    Hooks see TMUX_PANE when codex runs as a TUI child (`codex --no-daemon`), and not when
+    a shared daemon runs them. Two signals, either is enough:
+      * the pane's process tree holds a codex process whose argv has --no-daemon;
+      * the pane registry holds an entry for this pane whose pid is a live process of
+        this pane's tree: the pane-registry hook ran here WITH TMUX_PANE (this covers a
+        no-daemon default set in config, where the argv carries no flag).
+    Anything unreadable (no ps, no pane pid) answers False, so the caller falls back
+    to the pull line, which works in either mode."""
+    pane_pid = str(pane.get("pane_pid") or "").strip()
+    if not pane_pid:
+        return False
+    table = table if table is not None else process_table()
+    if not table:
+        return False
+    tree, frontier = {pane_pid}, [pane_pid]
+    while frontier:
+        cur = frontier.pop()
+        for pid, (ppid, _) in table.items():
+            if ppid == cur and pid not in tree:
+                tree.add(pid)
+                frontier.append(pid)
+    for pid in tree:
+        argv = (table.get(pid) or ("", ""))[1].split()
+        if "--no-daemon" in argv and any(os.path.basename(a).startswith("codex") for a in argv):
+            return True
+    if registry is None:
+        try:
+            import session_lineage
+            registry = session_lineage.read_registry()
+        except Exception:
+            registry = {}
+    ent = (registry or {}).get(pane.get("pane_id") or "")
+    return isinstance(ent, dict) and str(ent.get("claude_pid") or "") in tree and bool(ent.get("session_id"))
+
+
 HARNESSES = {
     "codex": {
         "command": re.compile(r"codex"),
-        "hook": False,
+        "hook_in_pane": codex_hook_in_pane,
         "empty_box": codex_input_box_empty,
         "busy": codex_busy,
     },
@@ -1209,6 +1295,47 @@ def selftest():
     # Codex CLI 0.170.0 pane on 2026-11-20.
     def chk(cond, name):
         check(name, cond)
+    # Codex hook-in-pane detection, against a stubbed process table.
+    tbl = {"500": ("1", "-zsh"), "501": ("500", "node /x/bin/codex --no-daemon"),
+           "502": ("501", "/x/codex-code-mode-host --listen grpc"),
+           "600": ("1", "codex"), "601": ("600", "codex-host"),
+           "700": ("1", "-zsh"), "701": ("700", "codex"),
+           "800": ("1", "/usr/bin/vim --no-daemon notes.txt")}
+    cxp = lambda pid, pane_id="%90": {"pane_pid": pid, "pane_id": pane_id, "harness": "codex"}
+    chk(codex_hook_in_pane(cxp("500"), table=tbl, registry={}),
+        "no-daemon: argv flag on a child of the pane process")
+    chk(codex_hook_in_pane(cxp("501"), table=tbl, registry={}),
+        "no-daemon: argv flag on the pane process itself")
+    chk(not codex_hook_in_pane(cxp("600"), table=tbl, registry={}),
+        "daemon mode: no flag, no registry entry -> pull")
+    chk(not codex_hook_in_pane(cxp("800"), table=tbl, registry={}),
+        "a --no-daemon flag on a non-codex process does not count")
+    chk(codex_hook_in_pane(cxp("700", "%91"), table=tbl,
+                           registry={"%91": {"session_id": "s", "claude_pid": "701"}}),
+        "config-set no-daemon: the registry hook ran in this pane for a live child")
+    chk(not codex_hook_in_pane(cxp("700", "%91"), table=tbl,
+                               registry={"%91": {"session_id": "s", "claude_pid": "999"}}),
+        "a registry entry for a pid not in this pane's tree is stale")
+    chk(not codex_hook_in_pane(cxp(""), table=tbl, registry={}), "no pane pid -> pull")
+    chk(not codex_hook_in_pane(cxp("500"), table={}, registry={}), "ps unreadable -> pull")
+    chk(HARNESSES["codex"]["hook_in_pane"] is codex_hook_in_pane, "codex harness uses the detector")
+    # pane_ancestor_pid: in-pane passes, a TMUX_PANE from another tree is refused.
+    _saved_tmux = _tmux
+    class _TR:
+        returncode, stdout = 0, "500\n"
+    globals()["_tmux"] = lambda args, timeout=10: _TR()
+    try:
+        anc = {"500": "1", "501": "500", "502": "501", "900": "1", "901": "900"}
+        chk(pane_ancestor_pid("%1", start_pid="502", parents=anc) == "501",
+            "pane_ancestor_pid: found the pane's direct child above the caller")
+        chk(pane_ancestor_pid("%1", start_pid="500", parents=anc) == "500",
+            "pane_ancestor_pid: the pane process itself")
+        chk(pane_ancestor_pid("%1", start_pid="901", parents=anc) == "",
+            "pane_ancestor_pid: a caller outside the pane's tree is refused")
+        chk(pane_ancestor_pid("%1", start_pid="502", parents={}) == "",
+            "pane_ancestor_pid: unreadable ps is refused")
+    finally:
+        globals()["_tmux"] = _saved_tmux
     working = line("⠐ build api", pane_id="%31", session="31")
     shell = _SEP.join(["2", "0", "%5", "zsh-title", "/tmp/h", "999", "zsh", "",
                        "1690000050", ""])

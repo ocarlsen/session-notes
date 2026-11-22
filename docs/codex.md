@@ -2,7 +2,8 @@
 
 The memory loop (`$refresh`, `$reflect`, `$rnr` and the boot-time load of the
 index and RESUME) runs in OpenAI Codex, in both the CLI and the desktop app.
-They share `~/.codex`, so one install covers both.
+They share `~/.codex`, so one install covers both. Codex also gets the per-prompt hooks
+Claude Code gets (time sense, the pane registry, bus mail, the em-dash guard); see Hooks.
 
 ## Two agents, two memories
 
@@ -36,9 +37,10 @@ sh install.sh --codex
 It asks `[y/N]` before each step:
 
 1. Link the three Codex skills into `~/.codex/skills/`.
-2. Write `~/.codex/hooks.json` with the SessionStart hook, if the file does not
-   exist yet. An existing file is never edited, and the block is printed so you
-   can merge it in.
+2. Register the hooks in `~/.codex/hooks.json` (see Hooks below). An existing file is
+   refreshed, not skipped: only the entries from this checkout are replaced, and every
+   other entry and event is kept. The step shows a diff first and keeps a
+   `.bak-session-notes` copy.
 3. Append two tables to `~/.codex/config.toml` (keeping a `.bak-session-notes`
    copy). `shell_environment_policy.set` gives the skills `SESSION_NOTES` and
    `SESSION_NOTES_AGENT`. `sandbox_workspace_write.writable_roots` lets
@@ -51,17 +53,59 @@ It asks `[y/N]` before each step:
    command, `python3 <repo>/bin/codex_save.py commit`, so the desktop app saves
    memory without asking (see Saving memory below).
 
-Then trust the hook: `/hooks` in the CLI, or Settings > Hooks in the app. Codex
-trusts a hook by its hash, so an edited hook needs trusting again.
+Then trust the new or changed hooks (next section).
+
+## Hooks
+
+`install.sh --codex` registers these in `~/.codex/hooks.json` (every command is prefixed
+`SESSION_NOTES_AGENT=codex`):
+
+| Event | Hooks |
+|---|---|
+| SessionStart | `codex_session_start.py` (boot load), `session_pane_registry.py` |
+| UserPromptSubmit | `time_sense.py`, `session_bus_hook.py`, `session_pane_registry.py` |
+| Stop | `session_bus_hook.py`, `session_pane_registry.py` |
+| PostToolUse (`apply_patch`) | `em_dash_guard.py`, which checks only the lines a patch adds |
+
+The output shape is Claude's (`hookSpecificOutput.additionalContext`), so the same scripts
+serve both. The differences are small: Codex has no Notification event, so there is no
+idle-prompt hook; `time_sense.py` tells Codex to run `$refresh` where it tells Claude
+`/refresh`; and file edits arrive as `apply_patch` with the patch text.
+
+**Refresh.** Rerunning the install updates the file in place through `bin/codex_hooks.py`.
+It replaces only this repo's entries: a command with the `SESSION_NOTES_AGENT=codex` prefix
+that runs one of the five scripts above from a `hooks/<script>` path (so entries from a moved
+or removed checkout are cleaned up too). Everything else, including your private hooks, is
+kept, and nothing is written when nothing changed, so a second run is a no-op. A file whose
+`hooks` shape is unexpected is refused untouched. `python3 bin/codex_hooks.py merge --repo <checkout> --file
+~/.codex/hooks.json --dry-run` shows the diff.
+
+**Trust.** Codex runs a hook only after you trust it, and it trusts the exact hook
+definition: a new hook, or any change to an entry (the command, the timeout, a limit),
+may need trusting again, and until then the hook is silently skipped. Open `/hooks` in the
+CLI, or Settings > Hooks in the desktop app, after every install that changed something.
 
 ## Sessions and the bus
 
-Codex has no prompt hook, so bus mail cannot ride its next prompt the way it does in
-Claude Code. Instead `bus_nudge.py` types one fixed line into an idle Codex pane, asking
-it to run `session_bus.py inbox --nudged --as <session>:<created>`. The mail arrives as
-that command's output, fenced and attributed to its sender. The loop reads the address
+With the hooks trusted and Codex started as `codex --no-daemon` (or with the shared daemon
+turned off in config), bus mail arrives the way it does in Claude Code: `bus_nudge.py` types
+its one fixed line into an idle pane, and the pane's UserPromptSubmit hook injects the mail,
+fenced and attributed to its sender, on that prompt. Hooks run as children of the TUI only
+in that mode, so they see `TMUX_PANE` and can say which pane they are in. `bus_nudge` checks
+this per pane (a `--no-daemon` codex in the pane's process tree, or a pane-registry entry the
+hook wrote from inside the pane). If a pane was nudged and still shows the mail unoffered on
+a later tick, its hook did not run (usually an untrusted hook), and the next nudge is the
+pull line below.
+
+Without it (default daemon mode, where hooks run in the shared background process with no
+`TMUX_PANE`), the fallback is the pull: `bus_nudge.py` types a different fixed line asking
+the pane to run `session_bus.py inbox --nudged --as <session>:<created>`, and the mail
+arrives as that command's output, again fenced and attributed. The loop reads the address
 from tmux, because a Codex shell often cannot: the sandbox refuses the tmux socket, and a
-resumed session (`codex resume`) runs commands in a daemon with no `TMUX_PANE`.
+resumed session (`codex resume`) runs commands in the daemon.
+
+The desktop app has no tmux pane, so the bus does not reach it. The time-sense, pane-registry
+(a no-op without tmux) and em-dash hooks do run there once trusted.
 
 `bcast` reaches Codex panes too, but only when the input box is empty and idle (never an
 approval prompt, a running turn or typed text). A bare slash command such as `/refresh`
@@ -134,8 +178,14 @@ match the rule and falls back to an approval prompt.
 
 ## Limits
 
-- The commands (`handoff_session`, `session_peers`, `bcast`) and the bus are
-  Claude Code only, so `$refresh` does not peek at sibling sessions.
+- The commands (`handoff_session`, `session_peers`, `bcast`) are Claude Code's; Codex can
+  run them from its shell with approval (see above), but `$refresh` does not peek at
+  sibling sessions.
+- Bus mail rides the prompt hook only when the hook runs inside the pane (`codex --no-daemon`,
+  or `daemon_auto_start = false` in `config.toml`); otherwise it is pulled.
+  The desktop app has no pane, so it receives no bus mail.
+- An untrusted hook does not run and says nothing. If time stamps or bus mail never appear,
+  check `/hooks` first.
 - `memory_hygiene_canary.py` checks Codex's own stores in codex mode (index and
   files agree, frontmatter, index size). Its `@import` checks are Claude Code
   only and are skipped. A store Codex has not saved to yet is not reported.

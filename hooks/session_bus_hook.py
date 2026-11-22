@@ -72,6 +72,19 @@ def fallback_errors_dir():
     return os.path.join(root, "session-bus", "errors")
 
 
+def in_pane():
+    """False only for Codex when this hook cannot be shown to run inside the pane TMUX_PANE
+    names (its daemon may have inherited another pane's TMUX_PANE). Claude: always True."""
+    if os.environ.get("SESSION_NOTES_AGENT", "").strip().lower() != "codex":
+        return True
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    try:
+        import session_peers
+        return bool(pane and session_peers.pane_ancestor_pid(pane))
+    except Exception:
+        return False
+
+
 def main():
     try:
         payload = json.load(sys.stdin)  # identity comes from tmux, not the UUID
@@ -88,6 +101,8 @@ def main():
     if not bus._live(bus._read()):
         return
 
+    if not in_pane():
+        return  # Codex, hook not provably in the pane: deliver nothing
     me, created = bus.session_info()
     if not me:
         return  # not in tmux: no address, nothing to deliver
@@ -148,6 +163,8 @@ def on_stop(bus):
             return  # nothing offered to this pane: no tmux call
     except FileNotFoundError:
         return
+    if not in_pane():
+        return  # Codex, hook not provably in the pane: retire nothing
     me, created = bus.session_info()
     if not me:
         return
@@ -257,6 +274,62 @@ def selftest():
             with contextlib.redirect_stdout(out):
                 main()
             return out.getvalue()
+
+        # A Codex payload (session_id, turn_id, transcript_path; no CLAUDE_* variables)
+        # behaves the same: identity comes from tmux, never from the payload.
+        saved = {k: os.environ.pop(k, None) for k in ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID")}
+        os.environ["SESSION_NOTES_AGENT"] = "codex"
+        import session_peers
+        real_anc = session_peers.pane_ancestor_pid
+        old_pane = os.environ.get("TMUX_PANE")
+        os.environ["TMUX_PANE"] = "%9"
+        session_peers.pane_ancestor_pid = lambda pane, **k: "4321"   # provably in the pane
+        cx = {"session_id": "019e-codex", "turn_id": "t1", "cwd": "/tmp", "model": "gpt",
+              "transcript_path": "/tmp/x.jsonl"}
+        bus.append({"id": "mc", "ts": time.time(), "from": "beta", "from_created": 1,
+                    "to": "alpha", "body": "codex mail"})
+        sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="UserPromptSubmit")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main()
+        check("codex UserPromptSubmit payload: mail injected",
+              "codex mail" in out.getvalue()
+              and '"hookEventName": "UserPromptSubmit"' in out.getvalue())
+        sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="Stop")))
+        with contextlib.redirect_stdout(io.StringIO()):
+            main()
+        check("codex Stop payload retires the offer", run() == "")
+
+        # Codex hook NOT in the pane (TMUX_PANE inherited by a daemon): nothing delivered or retired.
+        bus.append({"id": "md", "ts": time.time(), "from": "beta", "from_created": 1,
+                    "to": "alpha", "body": "daemon mail"})
+        session_peers.pane_ancestor_pid = lambda pane, **k: ""
+        sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="UserPromptSubmit")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main()
+        check("codex hook outside the pane's tree: nothing delivered", out.getvalue() == "")
+        session_peers.pane_ancestor_pid = lambda pane, **k: "4321"
+        sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="UserPromptSubmit")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main()
+        check("the undelivered mail was untouched, delivered once in the pane", "daemon mail" in out.getvalue())
+        session_peers.pane_ancestor_pid = lambda pane, **k: ""
+        sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="Stop")))
+        with contextlib.redirect_stdout(io.StringIO()):
+            main()
+        session_peers.pane_ancestor_pid = lambda pane, **k: "4321"
+        check("codex Stop outside the pane retires nothing", "daemon mail" in run())
+        session_peers.pane_ancestor_pid = real_anc
+        if old_pane is None:
+            os.environ.pop("TMUX_PANE", None)
+        else:
+            os.environ["TMUX_PANE"] = old_pane
+        os.environ.pop("SESSION_NOTES_AGENT", None)
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
 
         # A turn that FINISHES retires its mail: no second offer.
         bus.append({"id": "m2", "ts": time.time(), "from": "beta", "from_created": 1,

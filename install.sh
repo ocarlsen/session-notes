@@ -30,7 +30,7 @@
 #   sh install.sh --git-hooks <repo>  install the session-notes pre-commit into a git repo
 #                                    (chains any hook already there; see docs/tools.md, wt)
 #   sh install.sh --codex            set up OpenAI Codex instead (docs/codex.md): link the
-#                                    Codex skills into ~/.codex/skills, offer the hooks.json
+#                                    Codex skills into ~/.codex/skills, refresh hooks.json
 #                                    and config.toml edits, the rules block, the model
 #                                    defaults and profiles; never touches ~/.claude
 set -eu
@@ -168,27 +168,6 @@ if [ "$CODEX" = 1 ]; then
     echo "Skipped the skills."
   fi
 
-  CODEX_HOOKS=$(cat <<JSON
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "SESSION_NOTES_AGENT=codex python3 $REPO/hooks/codex_session_start.py",
-            "statusMessage": "Loading session notes",
-            "timeout": 10,
-            "additionalContextLimit": 4000
-          }
-        ]
-      }
-    ]
-  }
-}
-JSON
-)
   CODEX_TOML=$(cat <<TOML
 
 # session-notes: the skills find the tools through these, and \$reflect may write its store.
@@ -201,15 +180,28 @@ TOML
 )
   HJ="$CODEX_DIR/hooks.json" CT="$CODEX_DIR/config.toml"
   echo
-  if [ "$ASK" = 1 ] && [ ! -e "$HJ" ]; then
-    echo "$(tilde "$HJ") does not exist yet. It would contain:"; echo "$CODEX_HOOKS"
-    if ask "Write it?"; then
-      printf '%s\n' "$CODEX_HOOKS" > "$HJ"; echo "wrote $(tilde "$HJ")"
+  CH="$REPO/bin/codex_hooks.py"
+  # A refusal (corrupt or unexpected hooks.json) skips this step only; the rest still runs.
+  ch() { python3 "$CH" "$@"; }
+  hooks_skipped() { echo "Hooks step skipped: $(tilde "$HJ") was left untouched (see above)."; }
+  echo "Hooks for $(tilde "$HJ"): boot load, time sense, bus mail, pane registry, em-dash guard."
+  echo "An existing file is refreshed: only this repo's hook entries change, yours are kept."
+  if [ "$DRY" = 1 ]; then
+    ch merge --repo "$REPO" --file "$HJ" --dry-run || hooks_skipped
+  elif [ "$ASK" = 1 ]; then
+    if ch merge --repo "$REPO" --file "$HJ" --dry-run; then
+      if ask "Write it (keeping a .bak-session-notes copy)?"; then
+        ch merge --repo "$REPO" --file "$HJ" | tail -n 1
+      else
+        echo "Skipped hooks.json."
+      fi
     else
-      echo "Skipped hooks.json."
+      hooks_skipped
     fi
   else
-    echo "Merge into $(tilde "$HJ") by hand (an existing file is never edited):"; echo "$CODEX_HOOKS"
+    echo "Merge into $(tilde "$HJ") by hand, or run:"
+    echo "  python3 '$CH' merge --repo '$REPO' --file '$HJ'"
+    ch show --repo "$REPO"
   fi
   echo
   if [ "$ASK" = 1 ] && ! grep -q -E '^\[(shell_environment_policy|sandbox_workspace_write)\]' "$CT" 2>/dev/null; then
@@ -261,10 +253,14 @@ RULE
   echo
   echo "Profiles for sub-agent roles in $(tilde "$CODEX_DIR") (codex -p build, codex -p review; never overwritten):"
   offer "Create the missing ones?" profiles --dir "$CODEX_DIR"
-  cat <<TXT
+  cat <<'TXT'
 
-Then trust the hook: /hooks in the Codex CLI, or Settings > Hooks in the desktop app.
-Codex trusts a hook by its hash, so re-trust it after any edit. Details: docs/codex.md
+Trust new or changed hooks: /hooks in the Codex CLI, or Settings > Hooks in the desktop app.
+Codex trusts the exact hook definition, so any change to an entry (even its timeout) may need
+trusting again; an untrusted hook silently does not run.
+Bus mail rides the next prompt when the hook runs inside the pane (`codex --no-daemon`, or
+daemon_auto_start = false in config.toml); otherwise bus_nudge falls back to the pull line.
+Details: docs/codex.md
 TXT
   offer_jobs
   exit 0
