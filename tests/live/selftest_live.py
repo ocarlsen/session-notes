@@ -1011,18 +1011,16 @@ class Live:
                 pass
         return False
 
-    def count_answers(self, cli, tok):
-        """How many distinct transcripts hold `tok` in an assistant message."""
+    def count_arrivals(self, cli, tok):
         root = os.path.join(self.claude_dir, "projects") if cli == "claude" else os.path.join(self.codex_dir, "sessions")
         n = 0
         for f in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
-            d = tempfile.mkdtemp(dir=self.root)
             try:
-                os.symlink(f, os.path.join(d, "t.jsonl"))
-                if seen(tok, transcript_text(d)):
-                    n += 1
-            finally:
-                shutil.rmtree(d, ignore_errors=True)
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    if any(tok in ln and "via bcast" in ln for ln in fh):
+                        n += 1
+            except OSError:
+                pass
         return n
 
     def evid(self, name):
@@ -1086,10 +1084,12 @@ class Live:
             self.wait_idle(n)
         r = self.run([sys.executable, os.path.join(self.repo, "bin", "bcast.py"), "--to", "%s,%s" % (a, b), line],
                      "bcast-%s.txt" % cli, timeout=60)
-        if not self.wait_for(lambda: self.count_answers(cli, tok) >= 2, 120):
-            return FAIL, "fewer than 2 panes answered %s (bcast: %s)" % (
-                tok, (r.stdout + r.stderr).strip()[-150:]), "bcast-%s.txt" % cli
-        return PASS, "line typed into both panes and both answered", None
+        # Proof is arrival: the attributed line shows up as a submitted user message in each pane's
+        # own transcript. A model may rightly decline to act on a broadcast, so obedience is not the test.
+        if not self.wait_for(lambda: self.count_arrivals(cli, tok) >= 2, 120):
+            return FAIL, "the broadcast line reached fewer than 2 panes' transcripts (bcast: %s)" % (
+                (r.stdout + r.stderr).strip()[-150:]), "bcast-%s.txt" % cli
+        return PASS, "attributed line typed into and submitted in both panes", None
 
     def row_bus(self, cli):
         a, _ = self.pane_pair(cli)
