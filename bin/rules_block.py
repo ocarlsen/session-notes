@@ -20,7 +20,8 @@ The block holds, in order: AGENTS.snippet.md, rules/core.md, and the user's priv
 byte; (b) no markers but an old install of the snippet: drop each section whose heading is one
 of the snippet's headings and put the block where the first one was; (c) neither: append the
 block. The file is created if missing, a copy named PATH.bak-session-notes-YYYYmmdd-HHMMSS is kept
-before any change (an existing backup is never overwritten), and a second run changes nothing.
+before any change (an existing backup is never overwritten; only the newest 3 of these are kept),
+and a second run changes nothing.
 Codex caps the combined size of the global and project AGENTS.md files at 32 KiB, so a result
 over 32768 bytes is refused.
 """
@@ -134,6 +135,10 @@ def known_lines(repo=REPO):
     return {ln.strip() for ln in split_lines(text) if ln.strip()} | set(OLD_WORDING)
 
 
+def _is_heading(s):
+    return s.startswith("# ") or s.startswith("## ")
+
+
 def compute(old, block, headings, known=()):
     """The new file text. old is None for a missing file."""
     if old is None:
@@ -214,18 +219,18 @@ def backup_path(path):
 KEEP_BACKUPS = 3
 
 
-def prune_backups(path):
-    """Keep the newest KEEP_BACKUPS of this tool's own timestamped backups of PATH. Only names
-    of exactly that pattern are touched; install.sh's PATH.bak-session-notes never is."""
+def prune_backups(path, keep):
+    """Keep the newest KEEP_BACKUPS of this tool's own timestamped backups of PATH, newest by
+    file mtime (ties by name), and always the one just written (`keep`). Only names of exactly
+    that pattern are touched; install.sh's PATH.bak-session-notes never is."""
     d, base = os.path.split(path)
-    pat = re.compile(r"^%s%s-(\d{8}-\d{6})(?:-(\d+))?$" % (re.escape(base), re.escape(BAK)))
-    found = []
-    for name in os.listdir(d or "."):
-        m = pat.match(name)
-        if m:
-            found.append(((m.group(1), int(m.group(2) or 0)), name))
-    for _, name in sorted(found)[:-KEEP_BACKUPS]:
-        os.unlink(os.path.join(d or ".", name))
+    d = d or "."
+    pat = re.compile(r"^%s%s-\d{8}-\d{6}(?:-\d+)?$" % (re.escape(base), re.escape(BAK)))
+    found = sorted(((os.stat(os.path.join(d, n)).st_mtime, n) for n in os.listdir(d)
+                    if pat.match(n)), reverse=True)
+    for _, name in found[KEEP_BACKUPS:]:
+        if os.path.join(d, name) != keep:
+            os.unlink(os.path.join(d, name))
 
 
 def write_with_backup(path, new, old):
@@ -234,8 +239,9 @@ def write_with_backup(path, new, old):
     bak = None
     if old is not None:
         bak = backup_path(path)
-        shutil.copy2(target, bak)
-        prune_backups(path)
+        shutil.copyfile(target, bak)   # not copy2: the backup's mtime is when it was made
+        shutil.copymode(target, bak)
+        prune_backups(path, bak)
     d = os.path.dirname(target) or "."
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".rules_block.")
@@ -301,77 +307,26 @@ def claude_lines(repo=REPO, local=None):
     return [line for line, _ in claude_targets(repo, local)]
 
 
-def _fence_flags(lines):
-    """flags[i] is True for a line inside (or opening or closing) a ``` or ~~~ fenced block."""
-    flags, fence = [], None
-    for ln in lines:
-        body = ln.lstrip()
-        if fence is None:
-            if body.startswith("```") or body.startswith("~~~"):
-                fence = body[0] * 3
-                flags.append(True)
-                continue
-            flags.append(False)
-        else:
-            flags.append(True)
-            if body.startswith(fence):
-                fence = None
-    return flags
-
-
-def _is_heading(s):
-    return s.startswith("# ") or s.startswith("## ")
-
-
 def cmd_claude_apply(path, dry, repo=REPO, local=None):
-    """Adds the missing lines. Outside our own `## Standing rules` section it never edits or
-    removes a line; inside it, a stale line (our rules file, no longer on disk) is replaced."""
+    """Add-only: appends the lines that are missing, never edits or removes an existing line."""
     old = load_existing(path)
-    lines = split_lines(old or "")
+    lines = (old or "").splitlines(keepends=True)
     here = os.path.dirname(os.path.abspath(path))
-    notes = []
-
-    def target_of(line):
-        b = line.strip()
+    imported = set()   # real files the existing @ lines point at, resolved the way Claude does
+    for ln in lines:
+        b = ln.strip()
         if b.startswith("@") and len(b) > 1:
             p = os.path.expanduser(b[1:])
-            return p if os.path.isabs(p) else os.path.join(here, p)
-        return None
-
-    # Stale lines inside our section: ours (they name our rules files) and dangling.
-    fenced = _fence_flags(lines)
-    bare = [ln.rstrip("\r\n") for ln in lines]
-    heads = [i for i, b in enumerate(bare) if b == CLAUDE_HEADING and not fenced[i]]
-    if heads:
-        end = next((i for i in range(heads[0] + 1, len(lines))
-                    if not fenced[i] and _is_heading(bare[i])), len(lines))
-        drop = []
-        for i in range(heads[0] + 1, end):
-            t = target_of(lines[i])
-            if (t and not fenced[i] and t.endswith((CORE, REVIEW)) and not os.path.exists(t)):
-                notes.append("removed stale line %s (that file is gone)" % lines[i].strip())
-                drop.append(i)
-        lines = [ln for i, ln in enumerate(lines) if i not in drop]
-    fenced = _fence_flags(lines)
-    imported = set()   # real files the existing @ lines point at, resolved the way Claude does
-    for i, ln in enumerate(lines):
-        t = target_of(ln)
-        if t and not fenced[i]:
-            imported.add(os.path.realpath(t))
+            imported.add(os.path.realpath(p if os.path.isabs(p) else os.path.join(here, p)))
     missing = [line for line, target in claude_targets(repo, local)
                if os.path.realpath(target) not in imported]
-    if not missing and not notes:
+    if not missing:
         print("unchanged: %s" % tilde(path))
         return 0
-    for n in notes:
-        print(n)
     bare = [ln.rstrip("\r\n") for ln in lines]
-    heads = [i for i, b in enumerate(bare) if b == CLAUDE_HEADING and not fenced[i]]
-    if not missing:
-        new = "".join(lines)
-    elif heads:
-        i = heads[0] + 1
-        while i < len(lines) and not (not fenced[i] and bare[i].startswith("## ")):
+    if CLAUDE_HEADING in bare:
+        i = bare.index(CLAUDE_HEADING) + 1
+        while i < len(lines) and not bare[i].startswith("## "):
             i += 1
         while i > 0 and not bare[i - 1].strip():
             i -= 1   # after the section's last non-blank line
@@ -380,7 +335,7 @@ def cmd_claude_apply(path, dry, repo=REPO, local=None):
             head[-1] += "\n"
         new = "".join(head) + "".join(m + "\n" for m in missing) + "".join(lines[i:])
     else:
-        text = ensure_nl("".join(lines)) if lines else ""
+        text = ensure_nl("".join(lines)) if old else ""
         if text.strip():
             text += "\n"
         new = text + CLAUDE_HEADING + "\n" + "".join(m + "\n" for m in missing)
@@ -891,38 +846,6 @@ def selftest():
         check("scanner: U+2028 then [fake] inside a multi-line string stays in the string",
               ls2.index("model =") > ls2.index('[fake]') + 12 and ls2.index("model =") < ls2.index("[tui]"))
 
-        # F1: a dangling line of ours inside our section is replaced; outside it, never touched
-        gone = os.path.join(tmp, "gone-worktree", "rules", "core.md")
-        stale = "@" + gone
-        open(cm, "w").write("# mine\n" + stale + "\n\n" + CLAUDE_HEADING + "\n" + stale + "\n\n## Other\nz\n")
-        rc, out = quiet(lambda: cmd_claude_apply(cm, False, repo, local))
-        text = open(cm).read()
-        check("claude-apply removes a dangling rules line inside our section and says so",
-              "removed stale line" in out and text.count(stale) == 1
-              and text.startswith("# mine\n" + stale + "\n")
-              and text.index("rules/core.md", text.index(CLAUDE_HEADING)) < text.index("## Other")
-              and text.endswith("## Other\nz\n") and "review-contract.md" in text)
-        rc, out = quiet(lambda: cmd_claude_apply(cm, False, repo, local))
-        check("claude-apply stale cleanup is idempotent", "unchanged" in out)
-        # an existing user file in our section is never removed
-        mine2 = os.path.join(tmp, "elsewhere2", "rules")
-        os.makedirs(mine2)
-        open(os.path.join(mine2, "core.md"), "w").write("x\n")
-        open(cm, "w").write(CLAUDE_HEADING + "\n@" + os.path.join(mine2, "core.md") + "\n")
-        quiet(lambda: cmd_claude_apply(cm, False, repo, local))
-        check("claude-apply keeps an existing-file line inside our section",
-              ("@" + os.path.join(mine2, "core.md")) in open(cm).read())
-
-        # F2: an @ line inside a fenced block is not an import
-        fenced_core = "@" + os.path.join(repo, "rules", "core.md")
-        for fence in ("```", "~~~"):
-            open(cm, "w").write("# doc\n" + fence + "\n" + fenced_core + "\n" + fence + "\n")
-            rc, out = quiet(lambda: cmd_claude_apply(cm, False, repo, local))
-            text = open(cm).read()
-            check("claude-apply: an @ line inside a %s fence does not count" % fence,
-                  text.startswith("# doc\n" + fence + "\n" + fenced_core + "\n" + fence + "\n")
-                  and text.count("rules/core.md") == 2 and CLAUDE_HEADING in text)
-
         # R4: only the newest 3 of the tool's own backups are kept
         pr = os.path.join(tmp, "PRUNE.md")
         lookalike = pr + BAK + "-old"
@@ -938,6 +861,20 @@ def selftest():
               len(mine_baks) == 3 and sorted(open(b).read() for b in mine_baks) == ["v3\n", "v4\n", "v5\n"])
         check("prune: install.sh's backup and a lookalike name are never touched",
               open(lookalike).read() == "keep\n" and open(install_bak).read() == "keep\n")
+
+        # backups with names stamped later than now: the new backup is never the one pruned
+        fut = os.path.join(tmp, "FUT.md")
+        open(fut, "w").write("old\n")
+        for k, stamp in enumerate(("29991231-235959", "29991231-235958", "29991231-235957")):
+            b = "%s%s-%s" % (fut, BAK, stamp)
+            open(b, "w").write("f%d\n" % k)
+            os.utime(b, (time.time() - 100 * (k + 1), time.time() - 100 * (k + 1)))
+        rc, out = apply(path=fut)
+        kept = baks(fut)
+        newest = [b for b in kept if "2999" not in b]
+        check("prune: a fresh backup survives three future-named older ones, and its path is real",
+              len(newest) == 1 and open(newest[0]).read() == "old\n" and len(kept) == 3
+              and os.path.basename(newest[0]) in out)
 
         # R5: a snippet heading followed directly by the user's own text stays, body and all
         mine3 = "## Codex and other sessions\n- my own notes on codex\n"

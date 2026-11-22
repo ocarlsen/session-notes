@@ -76,7 +76,10 @@ run() { if [ "$DRY" = 1 ]; then echo "would: $*"; else "$@"; fi; }
 link() {  # link SRC DEST: create or refresh a symlink, never clobber a real file
   src=$1 dest=$2
   if [ -L "$dest" ]; then
-    run ln -sfn "$src" "$dest"
+    case "$(readlink "$dest")" in
+      "$REPO"/*) run ln -sfn "$src" "$dest" ;;
+      *) echo "skip: $dest is a symlink to somewhere else (remove it to install)" >&2; return 0 ;;
+    esac
   elif [ -e "$dest" ]; then
     echo "skip: $dest exists and is not a symlink (move it aside to install)" >&2
     return 0

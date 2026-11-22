@@ -21,7 +21,7 @@ left to you:
   each pane and type the answer yourself.
 
 session-notes covers the first with three skills, which work in any Claude
-Code session, and the second with four commands: three that run in tmux, and `wt`, which needs only git. It is
+Code session, and the second with four commands: three that run in tmux, and `wt`, which needs git (and `gh` for `wt pr` and `wt merge`). It is
 plain Python 3.9+ with no dependencies.
 
 ## The memory loop
