@@ -29,7 +29,8 @@ output first, then the contract, the reviewer's instructions, the PR title and b
 the repo path and sha, and the diff.
 
 From round 2 on, `prepare` also runs the test-edit check on the range since the last reviewed
-head (the previous `meta.json` head, else the sha in the newest of your own verdict comments),
+head (the sha in the newest of your own verdict comments at another sha; no own verdict means
+no section),
 under the sub-heading "Since the last reviewed head <sha>" in the first section, and names that
 prior verdict comment's URL so the reviewer can check whether the fix introduced defects. If git
 cannot produce that range, it warns and says so in that sub-heading; it never fails.

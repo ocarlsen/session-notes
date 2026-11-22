@@ -978,19 +978,38 @@ def selftest():
         check(txt_z == "caf\u00e9\n" and err_z.getvalue() == "",
               "z2. a UTF-8 diff file reads silently")
 
+    # --- z3. stdin with a non-UTF-8 byte is decoded with replacement and a warning ---
+    saved_stdin = sys.stdin
+    sys.stdin = io.TextIOWrapper(io.BytesIO(
+        b"diff --git a/tests/test_s.py b/tests/test_s.py\n--- a/tests/test_s.py\n"
+        b"+++ b/tests/test_s.py\n@@ -1,1 +1,1 @@\n-x = 'caf\xe9'\n+x = 2\n"), encoding="utf-8")
+    err_s, out_s = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err_s), contextlib.redirect_stdout(out_s):
+            rc_s = main(["--diff-file", "-"])
+    finally:
+        sys.stdin = saved_stdin
+    check(rc_s == 0 and "stdin is not valid UTF-8" in err_s.getvalue()
+          and "tests/test_s.py" in out_s.getvalue(),
+          "z3. a non-UTF-8 byte on stdin warns and the hit is still reported")
+
     print("selftest:", "PASS" if ok else "FAIL")
     return ok
 
 
-def read_diff_file(path):
-    """The diff file's text. Bytes that are not UTF-8 are replaced, with a warning on stderr."""
-    data = Path(path).read_bytes()
+def _decode_diff(data, label):
+    """Diff text from bytes. Bytes that are not UTF-8 are replaced, with a warning on stderr."""
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         print("test_edit_check: warning: %s is not valid UTF-8; undecodable bytes were replaced"
-              % path, file=sys.stderr)
+              % label, file=sys.stderr)
         return data.decode("utf-8", errors="replace")
+
+
+def read_diff_file(path):
+    """The diff file's text, decoded by _decode_diff."""
+    return _decode_diff(Path(path).read_bytes(), path)
 
 
 def main(argv=None):
@@ -1015,7 +1034,7 @@ def main(argv=None):
         return 1
 
     if args.diff_file == "-":
-        diff_text = sys.stdin.read()
+        diff_text = _decode_diff(sys.stdin.buffer.read(), "stdin")
     else:
         diff_text = read_diff_file(args.diff_file)
 

@@ -11,8 +11,8 @@ here, never restated.
         (<state_dir>/review/<owner>-<repo>-<PR>/). Prints the prompt path, the head sha and the
         review round. Says so, and still exits 0, when this is the last review the contract's
         fix-round limit allows or the limit is already passed. From round 2 on it also runs the
-        test-edit check on the range since the last reviewed head (the previous meta.json head,
-        else the sha in the newest own verdict comment) and names that verdict comment.
+        test-edit check on the range since the last reviewed head (the sha in the newest own
+        verdict comment at another sha; no own verdict, no section) and names that comment.
     review.py post <PR> APPROVE|CHANGES --body-file FILE [--dry-run]
         Post the reviewer's reply as the verdict comment: first line
         `Review verdict: <V> <head sha>`, then the body. Refuses when the PR head moved since
@@ -131,24 +131,20 @@ def _git(repo, *args):
     return r.returncode, r.stdout.decode("utf-8", errors="replace")
 
 
-def last_review_point(prev_meta_sha, comments, login, head):
+def last_review_point(comments, login, head):
     """(sha, verdict comment url) of the last reviewed head, or (None, None).
 
-    The sha is the previous meta.json head when it differs from `head`, else the sha in the
-    newest own verdict comment. The url is that newest own verdict comment's html_url.
+    Only a posted verdict says a head was reviewed: it is the newest verdict comment by `login`
+    whose sha differs from `head`. No own verdict, or none at another sha, means no base.
     """
-    newest = None
+    found = (None, None)
     for c in comments:
         if ((c.get("user") or {}).get("login") or "").lower() != login.lower():
             continue
         v = wt.parse_verdict(c.get("body"))
-        if v:
-            newest = (v[1], c.get("html_url"))
-    url = newest[1] if newest else None
-    for sha in (prev_meta_sha, newest[0] if newest else None):
-        if sha and wt._SHA.match(sha) and sha != head:
-            return sha, url
-    return None, url
+        if v and wt._SHA.match(v[1]) and v[1] != head:
+            found = (v[1], c.get("html_url"))
+    return found
 
 
 def since_last_review(repo, num, prev, head, url, globs):
@@ -180,7 +176,8 @@ def since_last_review(repo, num, prev, head, url, globs):
                            "rewritten)")
     if rc != 0:
         return unavailable("git merge-base failed")
-    rc, diff = _git(repo, "diff", "%s..%s" % (prev, head))
+    rc, diff = _git(repo, "diff", "--no-ext-diff", "--no-color", "--no-textconv",
+                    "%s..%s" % (prev, head))
     if rc != 0:
         return unavailable("git diff failed")
     hits, counts = test_edit_check._scan_blocks(diff, extra_globs=globs)
@@ -246,13 +243,7 @@ def cmd_prepare(args, cfg):
         raise wt.Die(1, "cannot read the review contract %s: %s" % (CONTRACT, exc))
 
     d = _review_dir(owner, repo, num, cfg)
-    prev_meta_sha = None
-    try:
-        with open(os.path.join(d, "meta.json"), encoding="utf-8") as fh:
-            prev_meta_sha = json.load(fh).get("head_sha")
-    except (OSError, ValueError, AttributeError):
-        pass
-    prev, prior_url = last_review_point(prev_meta_sha, comments, login, sha)
+    prev, prior_url = last_review_point(comments, login, sha)
     if prev:
         check_output += "\n\n" + since_last_review(main, num, prev, sha, prior_url, globs)
     os.makedirs(d, exist_ok=True)
@@ -628,6 +619,9 @@ def selftest():
         os.makedirs(os.path.join(repo, "tests"), exist_ok=True)
         with open(os.path.join(repo, "tests", "test_y.py"), "w") as fh:
             fh.write("def t():\n    assert out == [1, 2]\n")
+        os.makedirs(os.path.join(repo, "data"), exist_ok=True)
+        with open(os.path.join(repo, "data", "x.json"), "w") as fh:
+            fh.write("1\n")
         git("add", "-A")
         git("commit", "-q", "-m", "c1")
         c1 = head_sha()
@@ -654,36 +648,112 @@ def selftest():
               rc == 0 and 0 <= i_sub < pt.find("## The review contract")
               and "tests/test_y.py:2 [assertion]" in pt[i_sub:pt.find("## The review contract")]
               and prior_url in pt[i_sub:pt.find("## The review contract")], (rc, err, pt[:600]))
-        # a previous meta.json head wins over the comment, and the sha differing is required
+        # meta.json is never the base: a newer prepared head is not a reviewed head
         shutil.rmtree(sdir)
         os.makedirs(sdir)
         with open(os.path.join(sdir, "meta.json"), "w") as fh:
             json.dump({"head_sha": c1}, fh)
         put("comments.json", [])
         rc, out, err = run("prepare", "7")
-        pt = prompt_text()
-        check("fix round, prior meta head: since-check runs, no url line without a verdict comment",
-              "### Since the last reviewed head %s" % c1[:10] in pt
-              and "tests/test_y.py:2 [assertion]" in pt and "prior verdict comment" not in pt, pt[:500])
+        check("a stale or newer meta head with no own verdict: no since-last-review section",
+              "### Since the last reviewed head" not in prompt_text(), prompt_text()[:400])
         shutil.rmtree(sdir)
         os.makedirs(sdir)
         with open(os.path.join(sdir, "meta.json"), "w") as fh:
             json.dump({"head_sha": c1}, fh)
         put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, "d" * 40, 1)])
         rc, out, err = run("prepare", "7")
-        check("the previous meta head wins over the verdict comment's sha",
-              "### Since the last reviewed head %s" % c1[:10] in prompt_text())
-        put("comments.json", [])
-        rc, out, err = run("prepare", "7")  # meta now == head: nothing since, no sub-heading
-        check("same head as the last prepare: no since-last-review section",
+        check("the previous meta head does NOT win over the verdict comment's sha",
+              "### Since the last reviewed head %s" % ("d" * 10) in prompt_text()
+              and "### Since the last reviewed head %s" % c1[:10] not in prompt_text())
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, c2, 1)])
+        rc, out, err = run("prepare", "7")  # the only own verdict is at the head: no base
+        check("the only own verdict is at the head: no since-last-review section",
               "### Since the last reviewed head" not in prompt_text())
         shutil.rmtree(sdir)
-        put("comments.json", [])
+
+        # A, B, C: CHANGES at A (c1); B (c2) loosens an assert the PR added; C (c4) is an
+        # unrelated push (plus a data/ change for the extra-glob check); prepare at B then at C
+        with open(os.path.join(repo, "bin_u.py"), "w") as fh:
+            fh.write("u = 1\n")
+        os.makedirs(os.path.join(repo, "data"), exist_ok=True)
+        with open(os.path.join(repo, "data", "x.json"), "w") as fh:
+            fh.write("2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "c4")
+        c4 = head_sha()
+        git("reset", "-q", "--hard", c2)
+        cmA = verdict_comment("reviewer-bot", wt.CHANGES, c1, 1)
+        cmA["html_url"] = prior_url
+        put("comments.json", [cmA])
+        view(c2)
+        run("prepare", "7")
+        check("A,B,C: prepare at B shows the loosened assert",
+              "tests/test_y.py:2 [assertion]" in prompt_text())
+        view(c4)
         rc, out, err = run("prepare", "7")
-        check("round 1 (no meta, no verdict): no since-last-review section",
-              "### Since the last reviewed head" not in prompt_text())
-        # git cannot produce the range: a verdict at a sha this repo does not have
+        pt = prompt_text()
+        sec = pt[pt.find("### Since the last reviewed head"):pt.find("## The review contract")]
+        check("A,B,C: prepare at C still shows B's loosened assert, based at A",
+              "### Since the last reviewed head %s" % c1[:10] in sec
+              and "tests/test_y.py:2 [assertion]" in sec and prior_url in sec, (rc, err, sec))
+        check("[review].test_globs reach the since-range scan", "data/x.json" in sec, sec)
+        # round 1: prepares at two different heads, no verdict ever: no section
+        put("comments.json", [])
         shutil.rmtree(sdir)
+        view(c2)
+        run("prepare", "7")
+        a1 = "### Since the last reviewed head" not in prompt_text()
+        view(c4)
+        run("prepare", "7")
+        check("round 1, prepares at two heads: no since-last-review section",
+              a1 and "### Since the last reviewed head" not in prompt_text())
+        # another login's verdict never sets the base or the url; the newest own one wins
+        cmS = verdict_comment("stranger", wt.CHANGES, c2, 3)
+        cmS["html_url"] = "https://example.com/stranger"
+        put("comments.json", [cmS])
+        run("prepare", "7")
+        check("only another login's verdict: no since-last-review section",
+              "### Since the last reviewed head" not in prompt_text())
+        cmO = verdict_comment("reviewer-bot", wt.CHANGES, c2, 2)
+        cmO["html_url"] = "https://example.com/newer-own"
+        put("comments.json", [cmA, cmO, cmS])
+        run("prepare", "7")
+        pt = prompt_text()
+        check("the newest own verdict wins over an older one, a stranger's is ignored",
+              "### Since the last reviewed head %s" % c2[:10] in pt
+              and "https://example.com/newer-own" in pt and prior_url not in pt
+              and "example.com/stranger" not in pt, pt[:500])
+        # the missing-commit fetch asks for this PR's head ref by number
+        real_git = globals()["_git"]
+        seen = []
+
+        def spy(repo_, *a):
+            seen.append(a)
+            return real_git(repo_, *a)
+
+        globals()["_git"] = spy
+        try:
+            put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, "d" * 40, 1)])
+            run("prepare", "feature-branch")
+        finally:
+            globals()["_git"] = real_git
+        check("the fetch uses the PR number", ("fetch", "-q", "origin", "pull/7/head") in seen, seen)
+        # the user's git config (color, external diff) must not hide a hit
+        git("config", "--local", "color.ui", "always")
+        git("config", "--local", "diff.external", "/usr/bin/false")
+        put("comments.json", [cmA])
+        run("prepare", "7")
+        git("config", "--local", "--unset", "color.ui")
+        git("config", "--local", "--unset", "diff.external")
+        check("color.ui=always and diff.external do not hide the since-range hit",
+              "tests/test_y.py:2 [assertion]" in prompt_text())
+        shutil.rmtree(sdir, ignore_errors=True)
+        git("reset", "-q", "--hard", c2)
+        view(c2)
+        put("comments.json", [])
+        # git cannot produce the range: a verdict at a sha this repo does not have
+        shutil.rmtree(sdir, ignore_errors=True)
         cm2 = verdict_comment("reviewer-bot", wt.CHANGES, "d" * 40, 1)
         cm2["html_url"] = prior_url
         put("comments.json", [cm2])
