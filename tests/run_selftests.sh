@@ -16,6 +16,9 @@ unset TMUX TMUX_PANE
 # committed to. A self-test's `git -C <tmpdir> ...` would then act on THAT repo (GIT_DIR
 # overrides -C). Self-tests must never inherit the caller's repo, so drop every GIT_ var.
 for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+# A session launched by handoff_session exports SESSION_NOTES_PARENT_*, which the pane
+# registry's self-test must not see; drop those too.
+for v in $(env | sed -n 's/^\(SESSION_NOTES_PARENT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 fail=0
 for f in "$ROOT"/bin/*.py "$ROOT"/hooks/*.py "$ROOT"/skills/*/*.py "$ROOT"/tools/*.py "$ROOT"/tests/leak_scan.py; do
   [ -f "$f" ] || continue
