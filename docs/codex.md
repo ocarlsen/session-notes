@@ -38,17 +38,23 @@ It asks `[y/N]` before each step:
 
 1. Link the three Codex skills into `~/.codex/skills/`.
 2. Register the hooks in `~/.codex/hooks.json` (see Hooks below). An existing file is
-   refreshed, not skipped: only the entries from this checkout are replaced, and every
-   other entry and event is kept. The step shows a diff first and keeps a
+   refreshed, not skipped: only session-notes entries are replaced (from any checkout,
+   so a moved checkout's entries do not pile up), and every other entry and event is kept. The step shows a diff first and keeps a
    `.bak-session-notes` copy.
 3. Append two tables to `~/.codex/config.toml` (keeping a `.bak-session-notes`
    copy). `shell_environment_policy.set` gives the skills `SESSION_NOTES` and
    `SESSION_NOTES_AGENT`. `sandbox_workspace_write.writable_roots` lets
    `$reflect` write `~/.codex/session-notes` from the CLI's default sandbox.
    If either table already exists, the text is printed instead.
-4. Add [`AGENTS.snippet.md`](../AGENTS.snippet.md) to `~/.codex/AGENTS.md`. It tells
-   Codex that only `$reflect` writes the store. Without it, a "remember this"
-   turn makes Codex write memory files by hand before any skill loads.
+4. Write a marked block (`<!-- session-notes:begin ... -->` to
+   `<!-- session-notes:end -->`) into `~/.codex/AGENTS.md`, rewritten on every
+   install so an older install gets the newer sections too. It holds
+   [`AGENTS.snippet.md`](../AGENTS.snippet.md) (only `$reflect` writes the store;
+   without it a "remember this" turn makes Codex write memory files by hand before
+   any skill loads), the standing rules `rules/core.md` and
+   `rules/review-contract.md`, and an optional private addendum (config key
+   `rules.local`). The same step sets a default model and effort in `config.toml`
+   only where unset, and offers `build` and `review` profiles (`codex -p build`).
 5. Add two lines to `~/.codex/rules/default.rules` that approve exactly one
    command, `python3 <repo>/bin/codex_save.py commit`, so the desktop app saves
    memory without asking (see Saving memory below).
@@ -84,6 +90,13 @@ kept, and nothing is written when nothing changed, so a second run is a no-op. A
 definition: a new hook, or any change to an entry (the command, the timeout, a limit),
 may need trusting again, and until then the hook is silently skipped. Open `/hooks` in the
 CLI, or Settings > Hooks in the desktop app, after every install that changed something.
+
+**Moving or removing a checkout.** A hook whose script file is missing BLOCKS every
+prompt ("can't open file"), and a running Codex session keeps the hooks it loaded at
+start. So never delete a checkout that `hooks.json` points at, including a test worktree:
+run `install.sh --codex` from the checkout that stays, restart every open Codex session
+(and trust the changed hooks), then delete the old one. `codex_hooks.py merge` warns about
+any entry, ours or not, whose script is missing.
 
 ## Sessions and the bus
 

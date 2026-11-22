@@ -170,6 +170,32 @@ def refresh(path, repo, dry_run=False):
     return True, diff
 
 
+def missing_scripts(path):
+    """Every handler in the hooks file (ours or not) whose script file is gone. Codex
+    BLOCKS every prompt on such a hook ("can't open file"), and a running Codex session
+    keeps the hooks it loaded at start, so a removed checkout breaks it until restart."""
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for groups in (doc.get("hooks") or {}).values() if isinstance(doc, dict) else []:
+        for g in groups if isinstance(groups, list) else []:
+            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                cmd = str(h.get("command", "")) if isinstance(h, dict) else ""
+                try:
+                    words = shlex.split(cmd)
+                except ValueError:
+                    continue
+                for w in words:
+                    if "/" in w and w.endswith((".py", ".sh")):
+                        if not os.path.exists(os.path.expanduser(w)) and cmd not in out:
+                            out.append(cmd)
+                        break
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -194,6 +220,9 @@ def main(argv=None):
     else:
         sys.stdout.write(diff)
         print(("would update %s" if a.dry_run else "updated %s") % a.file)
+    for cmd in missing_scripts(a.file):
+        print("codex_hooks: WARNING: %s runs a missing file; Codex blocks every prompt "
+              "until it is fixed: %s" % (a.file, cmd), file=sys.stderr)
     return 0
 
 
@@ -369,6 +398,19 @@ def selftest():
             fh.write("{broken")
         check("corrupt file refused untouched", main(["merge", "--repo", repo, "--file", path]) == 1
               and open(path).read() == "{broken")
+
+        # a handler whose script is gone (removed checkout) is reported, ours or foreign
+        live = os.path.join(tmp, "live.py")
+        open(live, "w").close()
+        with open(path, "w") as fh:
+            json.dump({"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "python3 %s" % live},
+                {"type": "command", "command": "python3 %s/gone/hooks/origin_sense.py" % tmp},
+                {"type": "command", "command": "python3 /x/codex_suggest.py hook"}]}]}}, fh)
+        gone = missing_scripts(path)
+        check("missing script reported, present one not",
+              gone == ["python3 %s/gone/hooks/origin_sense.py" % tmp,
+                       "python3 /x/codex_suggest.py hook"])
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
