@@ -300,15 +300,16 @@ def pane_ancestor_pid(pane_id, start_pid=None, parents=None, table=None):
     else:
         return ""
     top = chain[-1]
-    seen_agent = False
-    for pid in chain:
-        kind = _agent_kind(argv.get(pid, ""))
-        if kind == "agent":
-            if seen_agent:
-                return ""  # a second, distinct agent above the nearest one: nested session
-            seen_agent = True
-        elif kind == "wrapper" and not seen_agent:
-            seen_agent = True  # a bare wrapper is the agent's launcher, not a second agent
+    # Classify the pane's own process too: when the agent IS the pane process (a pane
+    # started as `tmux new-session ... codex`), the walk stops at its child and would
+    # otherwise never see it. Reading from the hook upward, the agent-looking processes
+    # must form ONE session: one agent, one bare wrapper, or an agent directly launched by
+    # its wrapper. Anything more is a nested session.
+    classify = chain if top == pane_pid else chain + [pane_pid]
+    kinds = [k for k in (_agent_kind(argv.get(pid, "")) for pid in classify)
+             if k in ("agent", "wrapper")]
+    if kinds not in ([], ["agent"], ["wrapper"], ["agent", "wrapper"]):
+        return ""
     return top
 
 
@@ -1412,6 +1413,24 @@ def selftest():
             "nested: pane claude -> codex exec -> sh -> hook refused")
         chk(pane_ancestor_pid("%1", start_pid="503", table=t_exec_node) == "",
             "nested: exec child under a node wrapper chain refused")
+        # The agent IS the pane process (tmux new-session ... codex / claude, no shell).
+        t_pc = {"500": ("1", "codex --no-daemon"),
+                "502": ("500", "codex --no-daemon exec -m x"), "503": ("502", "sh -c hook")}
+        t_pcl = dict(t_pc, **{"500": ("1", "/u/.local/bin/claude -n s"),
+                              "501": ("500", "/bin/zsh -c x"), "502": ("501", "codex exec")})
+        t_pcl_direct = {"500": ("1", "/u/.local/bin/claude -n s"), "503": ("500", "sh -c hook")}
+        t_wrap_nested = {"500": ("1", "node /x/bin/codex --no-daemon"),
+                         "501": ("500", "/x/codex-bin --no-daemon"),
+                         "502": ("501", "node /x/bin/codex exec"),
+                         "504": ("502", "/x/codex-bin exec"), "503": ("504", "sh -c hook")}
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_pc) == "",
+            "nested: pane process codex -> codex exec -> sh -> hook refused")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_pcl) == "",
+            "nested: pane process claude -> zsh -> codex exec -> sh -> hook refused")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_pcl_direct) == "503",
+            "nested: pane process claude -> sh -> hook accepted")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_wrap_nested) == "",
+            "nested: a second wrapper chain under the pane wrapper refused")
         chk(pane_ancestor_pid("%1", start_pid="503", table={"500": ("1", "-zsh"),
             "501": ("500", "sh"), "503": ("501", "sh -c hook")}) == "501",
             "nested: no agent-looking process at all rests on ancestry alone")

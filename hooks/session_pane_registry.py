@@ -447,6 +447,26 @@ def selftest():
             stub(0, {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
                      c2: (up, "claude -n x"), up: ("1", "-zsh")})
             check("nested: pane claude -> codex exec -> hook: no pid", _agent_pid("%7") == "")
+            # The agent IS the pane process (tmux new-session ... claude / codex, no shell).
+            stub(0, {me: (c1, "sh -c hook"), c1: (up, "codex --no-daemon exec -m x"),
+                     up: ("1", "codex --no-daemon")})
+            check("nested: pane process codex -> codex exec -> hook: no pid", _agent_pid("%7") == "")
+            pcl = {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
+                   c2: (up, "/bin/zsh -c x"), up: ("1", "claude -n x")}
+            stub(0, pcl)
+            check("nested: pane process claude -> zsh -> codex exec -> hook: no pid",
+                  _agent_pid("%7") == "")
+            os.environ.update(CLAUDE_PID=up, CLAUDE_CODE_SESSION_ID="claude-parent")
+            stub(0, flat)
+            before_entry = dict(sp(sid="codex-2")["%7"])
+            stub(0, pcl)
+            reg = sp(sid="codex-child")
+            check("nested child of a claude pane process: its SessionStart leaves the pane's "
+                  "entry alone", reg["%7"] == before_entry)
+            for k in ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID"):
+                os.environ.pop(k, None)
+            stub(0, {me: (up, "sh -c hook"), up: ("1", "codex --no-daemon")})
+            check("pane process codex -> sh -> hook: accepted", _agent_pid("%7") == me)
             stub(0, {me: (c1, "sh -c hook"), c1: (c2, "/x/codex --no-daemon"),
                      c2: (up, "node /x/bin/codex --no-daemon"), up: ("1", "-zsh")})
             check("wrapper chain: node codex -> codex binary -> hook: accepted",

@@ -343,7 +343,18 @@ def selftest():
         nested = {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
                   c2: (up, "codex --no-daemon"), up: ("1", "-zsh")}
         nested_claude = dict(nested, **{c2: (up, "claude -n x")})
+        # The agent IS the pane process (tmux new-session ... codex / claude, no shell).
+        nested_pc = {me: (c1, "sh -c hook"), c1: (up, "codex --no-daemon exec -m x"),
+                     up: ("1", "codex --no-daemon")}
+        nested_pcl = {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
+                      c2: (up, "/bin/zsh -c x"), up: ("1", "claude -n x")}
         try:
+            stub_tree(nested_pc)
+            check("real ancestry: pane process codex -> codex exec -> hook is NOT the pane's session",
+                  not in_pane())
+            stub_tree(nested_pcl)
+            check("real ancestry: pane process claude -> zsh -> codex exec -> hook is NOT the "
+                  "pane's session", not in_pane())
             stub_tree(direct)
             check("real ancestry: pane codex -> sh -> hook is in the pane", in_pane())
             stub_tree(wrapped)
@@ -366,6 +377,19 @@ def selftest():
                 main()
             stub_tree(direct)
             check("nested child Stop: the pane's mail is not retired", "nested mail" in run())
+            stub_tree(nested_pc)
+            sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="UserPromptSubmit")))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main()
+            check("nested child of a codex pane process: the pane's mail is not injected",
+                  out.getvalue() == "")
+            sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="Stop")))
+            with contextlib.redirect_stdout(io.StringIO()):
+                main()
+            stub_tree(direct)
+            check("nested child of a codex pane process: the pane's mail is not retired",
+                  "nested mail" in run())
         finally:
             session_peers.subprocess.run = real_sp_run
         if old_pane is None:
