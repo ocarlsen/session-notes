@@ -86,6 +86,7 @@ fixed line (never the message) into its empty input box.
 | Worktrees | `bin/wt.py`, `githooks/pre-commit` | A worktree per change, a PR that merges only on a review verdict, and a staged-content pre-commit. See the `wt` section below. |
 | Standing rules | `rules/core.md`, `rules/review-contract.md`, `bin/rules_block.py` | The rules every session follows, for both agents. `rules_block.py apply` writes them, with `AGENTS.snippet.md` and an optional private addendum (`rules.local` in the config), into a marked block in `~/.codex/AGENTS.md` that every `install.sh --codex` rewrites (a file with an older install of the snippet is migrated, and anything outside the markers is kept; each change keeps a timestamped backup, and only the newest 3 are kept); `claude-apply` adds `@import` lines to `~/.claude/CLAUDE.md`. `codex-defaults` and `profiles` set Codex's model and effort where unset and create `build` and `review` profiles. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
+| Checkout guard | `hooks/checkout_guard.py` | A PreToolUse guard that keeps edits out of a repo's main checkout, blocks raw `gh pr merge`, and stops destructive git on a dirty tree. See the `checkout_guard` section below. |
 | Example guard | `hooks/em_dash_guard.py` | A harmless PostToolUse hook showing the pattern: it flags em dashes in text the model just wrote and asks for a rewrite. |
 
 Every script has a `--selftest`; `make test` runs them all with `HOME`
@@ -158,6 +159,76 @@ the checks silently). Re-running `install-hooks` is idempotent when the recorded
 and rewrites the shim in place ("repaired") when the path changed or vanished, keeping the chain.
 A `pre-commit` that is a dangling symlink is refused with a message and left alone. If the repo sets `core.hooksPath`,
 nothing is written and the command says so; wt never sets or changes `core.hooksPath`.
+
+## checkout_guard: keep work out of the main checkout
+
+`hooks/checkout_guard.py` is a PreToolUse hook (installed by default for Claude Code, matcher
+`Edit|Write|MultiEdit|NotebookEdit|Bash`). It reads the tool payload and either exits 0 (allow,
+silent) or exits 2 with one paragraph on stderr (refuse; the model sees the reason).
+
+**Arm A, edits.** `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are
+refused when the target is a tracked file and its repo's MAIN checkout is on the default branch
+(`origin/HEAD`'s branch if set, else `main`, or `master` when that is what is checked out). The
+message says to run `wt new <name>` and edit there. Allowed: a new untracked file, anything in a
+linked worktree (whatever its branch), a main checkout on another branch or a detached HEAD, and
+paths outside a git repo. An `apply_patch` is refused if any file it touches qualifies.
+
+**Arm B, shell.** Refused: any raw `gh pr merge` invocation except `--help` (use `wt merge`, which
+checks the review verdict); and, only when it would destroy uncommitted work, `git checkout -f`,
+`git checkout [<ref>] -- <paths>`, `git checkout <path>`, `git checkout .`, `git restore`
+(a plain `--staged` is fine), `git switch -f`, `git reset --hard`, and `git clean` with force and
+`-d` (not `-X` alone, not a dry run). `git -C <dir>` and a leading `cd <dir> &&` pick the tree.
+Only an invocation counts: the command is parsed (heredoc bodies dropped, env prefixes, shell
+keywords such as `if`/`do`/`!` and wrappers such as `sudo` or `env` skipped), so
+`echo "gh pr merge"` or a commit message that mentions it does not trip it. Redirections
+(`2>&1`, `> /dev/null`, `&>f`, `2> err`, attached or detached) are removed before any argument
+is read, so they are never mistaken for a path operand.
+
+**One predicate for path forms.** For `git checkout` and `git restore` with paths, the hook runs
+`git status --porcelain --untracked-files=no -- <operands>` once and lets git do the glob,
+directory and `.` matching. A plain checkout or restore is allowed only if git succeeded and
+printed nothing. Conflict resolution (`--ours`, `--theirs`, `--merge`, and `-m` for checkout) is
+allowed only if git succeeded, printed something, and every line is an unmerged code (`UU`, `AA`,
+`DD`, `AU`, `UA`, `DU`, `UD`), so a pathspec that also matches a merely modified file is refused.
+Operands exclude commit-ish names and the values of `-b`, `-B` and `--orphan`, so
+`git checkout -b docs` and `git checkout main --` are branch operations, not path checkouts.
+Whole-tree verbs (`checkout -f`, `switch -f`, `reset --hard`, `clean`) ask whether the tree is
+dirty. A repo with no `origin` remote is never refused by Arm A, since there is no PR flow and
+`wt new` needs one.
+
+**Fail safe on git errors.** Inside Arm B, a `git status` that fails in a repo (a pathspec outside
+the repository, a corrupt index) counts as dirty and refuses; it is never read as clean. Outside
+any repo there is nothing to lose and the command passes.
+
+**The config file is protected.** The guard's own config file (the path `notes_config` resolves,
+a symlink and its target alike) cannot be changed by the agent. Edit, Write, MultiEdit,
+NotebookEdit and `apply_patch` on it are refused, and so are shell commands that write it:
+a redirect target, `tee`, `sed -i` or `perl -i`, `cp`/`install`/`ln` onto it, `mv` from or onto it,
+`rm`/`truncate`/`unlink` of it, `dd of=`. Reads (`cat`, `grep`, `cp` out of it) pass. This is
+checked before the config is even loaded and before `exempt_repos` and `exempt_paths`, so a
+config that fails to parse cannot make itself editable and no exemption can cover it. Ask the
+user to edit it.
+
+**Exemptions** are config only, in `[checkout_guard]`: `exempt_repos` (repo roots where the guard
+does nothing, both arms) and `exempt_paths` (glob patterns Arm A allows). Every configured scope's
+memory store is always exempt for edits. There is no environment variable, flag or command-line
+comment that turns the guard off.
+
+**Fail open.** An unreadable payload, an internal error or an import error exits 0 with one
+`checkout_guard: <error>` line on stderr. A config file that fails to parse also fails open (the
+line names the file and says the guard is off for that call), except that the file itself stays
+protected.
+
+**Known limits.** Arm A does not see general shell writes to tracked files (`sed -i` on a source
+file, redirects, `python -c`); only writes to the config file are covered. Shell variables are
+not expanded: a `-C "$VAR"` or `cd "$VAR"` that cannot be resolved is judged against the nearest
+existing parent directory, and `> "$CFG"` is not recognised as a config write. The `gh pr merge`
+exemption is keyed on the current directory's repo. `gh api` merges are not covered.
+
+**Codex.** The hook already understands Codex `apply_patch` and shell payloads, but the shell
+tool's name is not verified: the accepted names live in one constant (`SHELL_TOOLS`) and are
+guesses until a live Codex run. For that reason `install.sh --codex` does not register the hook
+yet.
 
 ## Skill feedback: skills that improve from being corrected
 

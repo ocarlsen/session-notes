@@ -134,6 +134,15 @@ DEFAULTS = {
         # Private terms file for public repos (format: tests/leak_scan.py docstring).
         "leak_terms": "~/.config/session-notes/leak-terms.txt",
     },
+    # hooks/checkout_guard.py: refuse edits to tracked files on the default branch of a
+    # main checkout, raw `gh pr merge`, and destructive git on a dirty tree.
+    "checkout_guard": {
+        # Repo roots where the guard does nothing (a repo with its own guards). Paths.
+        "exempt_repos": [],
+        # Extra glob patterns (fnmatch on the absolute real path, ~ expanded) that edits
+        # may touch on the default branch. Each scope's memory store is always exempt.
+        "exempt_paths": [],
+    },
     # Each scope is a project folder with its own memory store. `store` may be
     # empty, meaning ~/.claude/projects/<encoded root>/memory.
     "scopes": [],
@@ -352,6 +361,13 @@ def _resolve(cfg, base=None, env=None):
     w["root"] = _abs(w["root"], base) if w["root"].strip() else ""
     w["public_repos"] = [_abs(x, base) for x in w["public_repos"]]
     w["leak_terms"] = _abs(w["leak_terms"], base)
+    g = cfg["checkout_guard"]
+    for k in ("exempt_repos", "exempt_paths"):
+        if not isinstance(g[k], list) or not all(isinstance(x, str) and x.strip() for x in g[k]):
+            raise ConfigError("checkout_guard.%s must be a list of non-empty strings, got %r"
+                              % (k, g[k]))
+    g["exempt_repos"] = [_abs(x, base) for x in g["exempt_repos"]]
+    g["exempt_paths"] = [os.path.expanduser(x) for x in g["exempt_paths"]]
     # Empty means no addendum, like handoff.build_note.
     local = cfg["rules"]["local"]
     cfg["rules"]["local"] = _abs(local, base) if local.strip() else ""
@@ -701,6 +717,30 @@ store = "/tmp/beta-store"
             check("wt.size_cap_kb 0 refused", False)
         except ConfigError:
             check("wt.size_cap_kb 0 refused", True)
+    # [checkout_guard] defaults and validation.
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "g.toml")
+        with open(f, "w") as fh:
+            fh.write("")
+        c = load(f)
+        check("checkout_guard defaults empty", c["checkout_guard"] == {
+            "exempt_repos": [], "exempt_paths": []})
+        with open(f, "w") as fh:
+            fh.write('[checkout_guard]\nexempt_repos = ["~/r", "rel"]\nexempt_paths = ["~/x/*.md"]\n')
+        c = load(f)["checkout_guard"]
+        check("checkout_guard repos resolved, paths ~ expanded",
+              c["exempt_repos"] == [os.path.expanduser("~/r"), os.path.join(d, "rel")]
+              and c["exempt_paths"] == [os.path.expanduser("~/x/*.md")])
+        for key, bad in (("exempt_repos", '["a", ""]'), ("exempt_paths", '[1]'),
+                         ("exempt_repos", '"a"')):
+            with open(f, "w") as fh:
+                fh.write("[checkout_guard]\n%s = %s\n" % (key, bad))
+            try:
+                load(f)
+                check("bad checkout_guard.%s %s refused" % (key, bad), False)
+            except ConfigError as exc:
+                check("bad checkout_guard.%s %s refused" % (key, bad),
+                      "checkout_guard." + key in str(exc))
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)

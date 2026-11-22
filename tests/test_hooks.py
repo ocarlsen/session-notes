@@ -159,6 +159,18 @@ def main():
         check("codex_session_start: no writes under ~/.claude",
               sorted(os.walk(os.path.join(home, ".claude"))) == claude_before)
 
+        # checkout_guard: blocks with exit 2 and a stderr reason, never stdout; allows silently.
+        r, el = run_hook("checkout_guard.py", dict(base, hook_event_name="PreToolUse",
+                         tool_name="Bash", tool_input={"command": "gh pr merge 1"}), home)
+        check("checkout_guard: raw gh pr merge blocked (exit 2, reason on stderr)",
+              r.returncode == 2 and r.stdout == "" and "checkout_guard:" in r.stderr, r.stderr[-200:])
+        r, el = run_hook("checkout_guard.py", dict(base, hook_event_name="PreToolUse",
+                         tool_name="Bash", tool_input={"command": "ls"}), home)
+        well_formed("checkout_guard allow", r, el)
+        check("checkout_guard: allow is silent", r.stdout == "" and r.stderr == "", r.stderr[-200:])
+        r, el = run_hook("checkout_guard.py", "not json at all", home)
+        well_formed("checkout_guard bad payload (fails open)", r, el)
+
         traces = swallowed_traces(home)
         check("no swallowed tracebacks", not traces,
               "; ".join(open(t).read()[-300:] for t in traces))

@@ -325,6 +325,9 @@ $(hook "$BUS")
   ],
   "Notification": [
     {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "$PR"}]}
+  ],
+  "PreToolUse": [
+    {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "hooks": [{"type": "command", "command": "python3 $SHOWN/hooks/checkout_guard.py"}]}
   ]$EXTRA_EVENTS
 }
 EOF
