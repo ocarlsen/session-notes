@@ -20,6 +20,13 @@ ARM B, shell commands (Bash, and the Codex shell tools). Refused:
     `git clean` with force and -d (the tree counts untracked files for clean). On a clean
     tree they pass.
 
+Redirections are stripped before any argument is read. Path-form checkout/restore ask `git
+status` over the operands once (git matches globs, directories and `.`); a git error counts as
+dirty, never clean.
+
+CONFIG PROTECTION: the config file itself (symlink and target alike) cannot be edited or written
+by the agent, in either arm, even when its parse is broken and whatever the exemptions say.
+
 EXEMPTIONS come from the config only ([checkout_guard] exempt_repos / exempt_paths, plus every
 scope's memory store for edits). There is NO environment variable, flag or command-line comment
 that turns the guard off; the hook reads no environment variable except HOME and
@@ -130,38 +137,36 @@ def is_tracked(top, real):
     return _git(top, "ls-files", "--error-unmatch", "--", real).returncode == 0
 
 
-def dirty(tree, untracked, paths=None):
-    """True when `tree` has uncommitted changes (only under `paths` when given; "." and magic
-    pathspecs fall back to the whole tree). None when it is not a git repo."""
+def tree_dirty(tree, untracked):
+    """True when the repo at `tree` has uncommitted changes. FAIL SAFE: a `git status` that
+    errors inside a repo counts as dirty, never clean. Not a repo = False (nothing to lose)."""
     d = _nearest_dir(tree)
-    mode = "--untracked-files=" + ("normal" if untracked else "no")
-    if paths and not any(p == "." or p.startswith(":") for p in paths):
-        seen = False
-        for p in paths:
-            r = _git(d, "status", "--porcelain", mode, "--", p)
-            if r.returncode != 0:
-                return None
-            seen = seen or bool(r.stdout.strip())
-        return seen
-    r = _git(d, "status", "--porcelain", mode)
-    if r.returncode != 0:
-        return None
-    return bool(r.stdout.strip())
-
-
-def all_unmerged(tree, paths):
-    """True when every path is an unmerged (conflicted) file. Unknown state = False."""
-    d = _nearest_dir(tree)
-    if not paths:
+    if repo_info(d) is None:
         return False
-    for p in paths:
-        if p == "." or p.startswith(":") or os.path.isdir(os.path.join(d, p)) \
-                or (any(c in p for c in "*?[") and not os.path.lexists(os.path.join(d, p))):
-            return False
-        r = _git(d, "ls-files", "-u", "--", p)
-        if r.returncode != 0 or not r.stdout.strip():
-            return False
-    return True
+    r = _git(d, "status", "--porcelain", "--untracked-files=" + ("normal" if untracked else "no"))
+    return r.returncode != 0 or bool(r.stdout.strip())
+
+
+# porcelain XY codes of an unmerged (conflicted) path
+UNMERGED = ("DD", "AU", "UD", "UA", "DU", "AA", "UU")
+
+
+def paths_would_lose(tree, operands, conflict):
+    """The ONE predicate for path-form checkout/restore: run `git status` once over the
+    operands (git does the glob, directory and `.` matching) and refuse unless it is safe.
+    Plain: safe only if git succeeded and printed nothing. Conflict resolution (--ours,
+    --theirs, --merge): safe only if git succeeded, printed something, and every line is an
+    unmerged code. A git error is never safe. Not a repo = safe (git itself will fail)."""
+    d = _nearest_dir(tree)
+    if repo_info(d) is None:
+        return False
+    r = _git(d, "status", "--porcelain", "--untracked-files=no", "--", *operands)
+    if r.returncode != 0:
+        return True
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    if conflict:
+        return not (lines and all(ln[:2] in UNMERGED for ln in lines))
+    return bool(lines)
 
 
 def wt_command():
@@ -234,15 +239,65 @@ def strip_heredocs(cmd):
     return "\n".join(out)
 
 
+_REDIR_OPS = ("<<<", "<<", "<&", "<>", "<", ">>", ">|", ">&", ">")
+
+
+def _redirect(cmd, i):
+    """The redirection operator at cmd[i] ('<' or '>'): (op, target word, index after it)."""
+    n = len(cmd)
+    op = next(o for o in _REDIR_OPS if cmd.startswith(o, i))
+    j = i + len(op)
+    while j < n and cmd[j] in " \t":
+        j += 1
+    k, q = j, None
+    while k < n:
+        ch = cmd[k]
+        if q:
+            if q == '"' and ch == "\\" and k + 1 < n:
+                k += 2
+                continue
+            if ch == q:
+                q = None
+            k += 1
+            continue
+        if ch == "\\" and k + 1 < n:
+            k += 2
+            continue
+        if ch in "\"'":
+            q = ch
+            k += 1
+            continue
+        if ch.isspace() or ch in ";&|<>()`":
+            break
+        k += 1
+    raw = cmd[j:k]
+    try:
+        parts = shlex.split(raw)
+        word = parts[0] if parts else ""
+    except ValueError:
+        word = raw.strip("\"'")
+    return op, word, k
+
+
+def _is_write_redirect(op, word, amp):
+    if amp or op in (">", ">>", ">|", "<>"):
+        return True
+    return op == ">&" and not re.fullmatch(r"\d+-?|-", word)
+
+
 def split_segments(cmd):
-    """Split on unquoted ; & | newline ( ) and backtick; drop unquoted comments."""
-    segs, buf, q, i, n = [], [], None, 0, len(cmd)
+    """Split on unquoted ; & | newline ( ) and backtick; drop unquoted comments. Redirections
+    (`>`, `>>`, `<`, `<<<`, `&>`, `N>`, `2>&1`, `>|`, attached or detached) are removed from the
+    text and their write targets returned: a list of (text, write targets) per segment."""
+    segs, buf, writes, q, i, n = [], [], [], None, 0, len(cmd)
 
     def flush():
         s = "".join(buf).strip()
+        w = list(writes)
         del buf[:]
-        if s:
-            segs.append(s)
+        del writes[:]
+        if s or w:
+            segs.append((s, w))
     while i < n:
         c = cmd[i]
         if q:
@@ -268,6 +323,16 @@ def split_segments(cmd):
         elif c == "#" and (not buf or buf[-1].isspace()):
             while i < n and cmd[i] != "\n":
                 i += 1
+            continue
+        elif c in "<>" or (c == "&" and i + 1 < n and cmd[i + 1] == ">"):
+            amp = c == "&"
+            pre = "".join(buf)
+            m = re.search(r"(?:^|\s)(\d+)$", pre)
+            if m and not amp:  # an fd number in front: `2>x`
+                del buf[len(pre) - len(m.group(1)):]
+            op, word, i = _redirect(cmd, i + 1 if amp else i)
+            if _is_write_redirect(op, word, amp) and word:
+                writes.append(word)
             continue
         elif c in ";&|\n()`":
             flush()
@@ -335,65 +400,85 @@ def _flags(args):
     return longs, shorts, pos, dd
 
 
-def destructive_verb(sub, args):
-    """(verb text, needs untracked in the dirty check, paths or None for the whole tree) when
-    this git call can destroy uncommitted work, else None."""
+def _is_commit(d, tok):
+    return _git(d, "rev-parse", "--verify", "-q", tok + "^{commit}").returncode == 0
+
+
+def _checkout_operands(d, args):
+    """Pathspec operands of `git checkout`: everything after `--`, plus bare operands before it
+    that are not a commit-ish. The values of -b/-B/--orphan are names, not paths."""
+    ops, skip, dd = [], False, False
+    for t in args:
+        if skip:
+            skip = False
+        elif dd:
+            ops.append(t)
+        elif t == "--":
+            dd = True
+        elif t in ("-b", "-B", "--orphan"):
+            skip = True
+        elif t.startswith("-") and len(t) > 1:
+            continue
+        elif not _is_commit(d, t):
+            ops.append(t)
+    return ops
+
+
+def _restore_operands(args):
+    ops, skip, dd = [], False, False
+    for t in args:
+        if skip:
+            skip = False
+        elif dd:
+            ops.append(t)
+        elif t == "--":
+            dd = True
+        elif t in ("-s", "--source"):
+            skip = True
+        elif t.startswith("-") and len(t) > 1:
+            continue
+        else:
+            ops.append(t)
+    return ops
+
+
+def git_verdict(sub, args, tree):
+    """The verb text when this git call would destroy uncommitted work in `tree`, else None.
+    Path forms (checkout/restore) ask `paths_would_lose`; whole-tree verbs ask `tree_dirty`."""
     longs, shorts, pos, dd = _flags(args)
-    if sub == "checkout":
-        if "--force" in longs or "f" in shorts:
-            return "git checkout -f", False, None
-        if dd:
-            return "git checkout (paths)", False, _after_dd(args)
-        if pos == ["."]:
-            return "git checkout .", False, None
-    elif sub == "switch":
+    d = _nearest_dir(tree)
+    if sub in ("checkout", "restore"):
+        conflict = bool(longs & {"--ours", "--theirs", "--merge"}) or (
+            sub == "checkout" and "m" in shorts)
+        if sub == "checkout":
+            ops = _checkout_operands(d, args)
+        else:
+            if ("--staged" in longs or "S" in shorts) and not (
+                    "--worktree" in longs or "W" in shorts):
+                return None  # only unstages
+            ops = _restore_operands(args)
+        if ops and conflict:
+            return "git %s (paths)" % sub if paths_would_lose(d, ops, True) else None
+        if sub == "checkout" and ("--force" in longs or "f" in shorts):
+            return "git checkout -f" if tree_dirty(d, False) else None
+        if ops:
+            return "git %s (paths)" % sub if paths_would_lose(d, ops, False) else None
+        if sub == "restore":  # no operand we can read (e.g. --pathspec-from-file): whole tree
+            return "git restore" if tree_dirty(d, False) else None
+        return None
+    if sub == "switch":
         if "--force" in longs or "--discard-changes" in longs or "f" in shorts:
-            return "git switch -f", False, None
-    elif sub == "restore":
-        staged = "--staged" in longs or "S" in shorts
-        worktree = "--worktree" in longs or "W" in shorts
-        if not (staged and not worktree):
-            return "git restore", False, pos
+            return "git switch -f" if tree_dirty(d, False) else None
     elif sub == "reset":
         if "--hard" in longs:
-            return "git reset --hard", False, None
+            return "git reset --hard" if tree_dirty(d, False) else None
     elif sub == "clean":
         force = "--force" in longs or "f" in shorts
         dryrun = "--dry-run" in longs or "n" in shorts
         ignored_only = "X" in shorts and "x" not in shorts
         if force and "d" in shorts and not dryrun and not ignored_only:
-            return "git clean -fd", True, None
+            return "git clean -fd" if tree_dirty(d, True) else None
     return None
-
-
-def _after_dd(args):
-    return args[args.index("--") + 1:] if "--" in args else []
-
-
-def _resolving_conflict(sub, args, tree):
-    """`--ours/--theirs/--merge` (checkout also `-m`) naming only unmerged paths."""
-    longs, shorts, pos, dd = _flags(args)
-    if not (longs & {"--ours", "--theirs", "--merge"} or (sub == "checkout" and "m" in shorts)):
-        return False
-    return all_unmerged(tree, pos)
-
-
-def _dirty_path_operand(tree, args):
-    """True for `git checkout <path>` (no `--`) where an operand is not a commit-ish, names an
-    existing path, and that path has tracked changes. A real branch name wins, as in git."""
-    _, _, pos, dd = _flags(args)
-    if dd:
-        return False
-    d = _nearest_dir(tree)
-    for a in pos:
-        if _git(d, "rev-parse", "--verify", "-q", a + "^{commit}").returncode == 0:
-            continue
-        if not os.path.exists(os.path.join(d, a)) and not any(c in a for c in "*?["):
-            continue
-        r = _git(d, "status", "--porcelain", "--untracked-files=no", "--", a)
-        if r.returncode == 0 and r.stdout.strip():
-            return True
-    return False
 
 
 def _git_target(argv, tree):
@@ -425,16 +510,71 @@ def _script_of(argv):
     return None
 
 
-def check_command(cmd, cwd, cfg, depth=0):
+def _config_msg(path):
+    return ("checkout_guard: %s is the session-notes config, which holds this guard's own "
+            "exemptions. It is edited by the user, not the agent: ask the user to change it."
+            % path)
+
+
+def protected_paths():
+    """Real paths of the config file (a symlink and its target resolve to the same one). Known
+    even when the file fails to parse. Empty only if notes_config could not be imported."""
+    if notes_config is None:
+        return set()
+    return {os.path.realpath(os.path.abspath(notes_config.config_path()))}
+
+
+def is_protected(path, cwd, protected):
+    if not path or not protected:
+        return False
+    p = os.path.expanduser(path)
+    p = p if os.path.isabs(p) else os.path.join(cwd, p)
+    return os.path.realpath(p) in protected
+
+
+def _config_write(argv, writes, cwd, protected):
+    """The refusal when this segment writes to the config: a redirect target, tee, sed/perl -i,
+    cp/install/ln (destination), mv (either end), rm/truncate/unlink, dd of=."""
+    cands = list(writes)
+    if argv:
+        name, a = os.path.basename(argv[0]), argv[1:]
+        ops = [t for t in a if not t.startswith("-")]
+        if name == "tee":
+            cands += ops
+        elif name in ("sed", "perl"):
+            if any((t.startswith("-") and not t.startswith("--") and "i" in t[1:])
+                   or t.startswith("--in-place") for t in a):
+                cands += a
+        elif name in ("cp", "install", "ln"):
+            cands += ops[-1:]
+        elif name == "mv" or name in ("rm", "truncate", "unlink"):
+            cands += ops
+        elif name == "dd":
+            cands += [t[3:] for t in a if t.startswith("of=")]
+    for c in cands:
+        if is_protected(c, cwd, protected):
+            return _config_msg(os.path.realpath(os.path.expanduser(c)))
+    return None
+
+
+def check_command(cmd, cwd, cfg, protected, depth=0):
+    """Refusal text for a shell command, or None. cfg None (config failed to parse) leaves only
+    the config-file protection active."""
     wt = wt_command()
-    for seg in split_segments(strip_heredocs(cmd)):
+    for seg, writes in split_segments(strip_heredocs(cmd)):
+        msg = _config_write([], writes, cwd, protected)
+        if msg:
+            return msg
         try:
             argv = shlex.split(seg)
         except ValueError:
-            if _MERGE_FALLBACK_RE.match(seg) and not _exempt_cwd(cfg, cwd):
+            if cfg is not None and _MERGE_FALLBACK_RE.match(seg) and not _exempt_cwd(cfg, cwd):
                 return _merge_msg(wt)
             continue
         argv = strip_prefix(argv)
+        msg = _config_write(argv, [], cwd, protected)
+        if msg:
+            return msg
         if not argv:
             continue
         name = os.path.basename(argv[0])
@@ -446,29 +586,23 @@ def check_command(cmd, cwd, cfg, depth=0):
         if name in SHELLS and depth < 3:
             script = _script_of(argv)
             if script:
-                r = check_command(script, cwd, cfg, depth + 1)
+                r = check_command(script, cwd, cfg, protected, depth + 1)
                 if r:
                     return r
+            continue
+        if cfg is None:
             continue
         if name == "gh":
             if is_gh_pr_merge(argv[1:]) and not _exempt_cwd(cfg, cwd):
                 return _merge_msg(wt)
         elif name == "git":
             sub, args, tree = _git_target(argv, cwd)
-            if sub in ("checkout", "restore") and _resolving_conflict(sub, args, tree):
-                continue
-            hit = destructive_verb(sub, args) if sub else None
-            if not hit and sub == "checkout" and _dirty_path_operand(tree, args):
-                hit = ("git checkout <path>", False, None)
-            if not hit:
-                continue
-            verb, untracked, paths = hit
-            if _exempt_cwd(cfg, tree) or not dirty(tree, untracked, paths):
+            verb = git_verdict(sub, args, tree) if sub else None
+            if not verb or _exempt_cwd(cfg, tree):
                 continue
             return ("checkout_guard: `%s` would destroy uncommitted changes: the tree at %s has "
-                    "%s. Commit them first (a WIP commit is fine) or save a copy, then retry."
-                    % (verb, tree, "uncommitted or untracked files" if untracked
-                       else "uncommitted changes"))
+                    "uncommitted changes. Commit them first (a WIP commit is fine) or save a "
+                    "copy, then retry." % (verb, tree))
     return None
 
 
@@ -525,24 +659,35 @@ def decide(payload):
         return None
     if notes_config is None:
         raise Fail("cannot import notes_config: %s" % _IMPORT_ERROR)
+    # The config file is protected FIRST: before the config is even loaded (so a config that
+    # fails to parse cannot make itself editable) and before any exemption.
+    protected = protected_paths()
+    for p in paths:
+        if is_protected(p, cwd, protected):
+            return _config_msg(os.path.realpath(os.path.join(cwd, os.path.expanduser(p))))
+    cfg = None
     try:
         cfg = notes_config.load()
     except notes_config.ConfigError as exc:
         sys.stderr.write("checkout_guard: LOUD: config %s failed to parse (%s); the guard is "
-                         "OFF for this call, fix the file\n" % (notes_config.config_path(), exc))
-        return None
+                         "OFF for this call except for protecting that file, fix it\n"
+                         % (notes_config.config_path(), exc))
     if tool in SHELL_TOOLS:
         # An apply_patch run through the shell is an edit too.
         if _runs_apply_patch(cmd):
-            r = check_edit(patch_paths(cmd), cwd, cfg)
+            pp = patch_paths(cmd)
+            for p in pp:
+                if is_protected(p, cwd, protected):
+                    return _config_msg(os.path.realpath(os.path.join(cwd, os.path.expanduser(p))))
+            r = check_edit(pp, cwd, cfg) if cfg is not None else None
             if r:
                 return r
-        return check_command(cmd, cwd, cfg)
-    return check_edit(paths, cwd, cfg)
+        return check_command(cmd, cwd, cfg, protected)
+    return check_edit(paths, cwd, cfg) if cfg is not None else None
 
 
 def _runs_apply_patch(cmd):
-    for seg in split_segments(strip_heredocs(cmd)):
+    for seg, _writes in split_segments(strip_heredocs(cmd)):
         try:
             argv = strip_prefix(shlex.split(seg))
         except ValueError:
@@ -639,6 +784,40 @@ def selftest():
         for dirty_name in ("b.txt", "c.txt"):
             with open(os.path.join(conf, dirty_name), "w") as fh:
                 fh.write("dirty\n")
+        def mkmerge(name, files, conflicted):
+            d = mkrepo(name, files)
+            sh(d, "git", "checkout", "-q", "-b", "other")
+            for f in conflicted:
+                with open(os.path.join(d, f), "w") as fh:
+                    fh.write("theirs\n")
+            sh(d, "git", "commit", "-q", "-am", "o")
+            sh(d, "git", "checkout", "-q", "main")
+            for f in conflicted:
+                with open(os.path.join(d, f), "w") as fh:
+                    fh.write("ours\n")
+            sh(d, "git", "commit", "-q", "-am", "m")
+            subprocess.run(["git", "merge", "other"], cwd=d, env=gitenv, capture_output=True)
+            return d
+
+        def touch(d, f, text="dirty\n"):
+            os.makedirs(os.path.dirname(os.path.join(d, f)), exist_ok=True)
+            with open(os.path.join(d, f), "w") as fh:
+                fh.write(text)
+        globrepo = mkmerge("globrepo", ("a.txt", "b.txt"), ("a.txt",))
+        touch(globrepo, "b.txt")
+        touch(globrepo, "*.txt", "junk\n")  # untracked file literally named like the glob
+        brk = mkmerge("brk", ("app/[id]/page.tsx", "app/i/page.tsx"), ("app/[id]/page.tsx",))
+        touch(brk, "app/i/page.tsx")
+        onlyconf = mkmerge("onlyconf", ("a.txt", "b.txt"), ("a.txt", "b.txt"))
+        dirtydocs = mkrepo("dirtydocs", ("a.txt", "docs/g.md", "docs/h.md"))
+        touch(dirtydocs, "docs/g.md")
+        # A branch literally named like the dirty directory: `docs --` is a branch switch.
+        branchdocs = mkrepo("branchdocs", ("a.txt", "docs/g.md"))
+        sh(branchdocs, "git", "branch", "docs")
+        touch(branchdocs, "docs/g.md")
+        corrupt = mkrepo("corrupt")
+        with open(os.path.join(corrupt, ".git", "index"), "wb") as fh:
+            fh.write(b"garbage, not an index")
         dirty_repo = mkrepo("dirty")
         with open(os.path.join(dirty_repo, "a.txt"), "w") as fh:
             fh.write("changed\n")
@@ -805,9 +984,14 @@ def selftest():
         check("B refuse (conflict tree): git restore --theirs on a non-conflicted dirty path",
               refused(bash("git restore --theirs b.txt", conf)))
         for cmd in ("git checkout --theirs '*.txt'", "git checkout --theirs *.txt",
-                    "git checkout --ours -- '*'", "git restore --theirs '*.txt'",
-                    "git checkout --theirs a.tx?"):
+                    "git checkout --ours -- '*'", "git restore --theirs '*.txt'"):
             check("B refuse (conflict tree, glob): " + cmd, refused(bash(cmd, conf)))
+        # Git's own pathspec matching decides: a.tx? matches only the conflicted a.txt, so
+        # this is a safe resolution (it was refused by the old character heuristic).
+        check("B pass (conflict tree, glob matching only conflicted paths): --theirs a.tx?",
+              passed(bash("git checkout --theirs a.tx?", conf)))
+        check("B refuse (conflict tree, glob matching a dirty path): --theirs '*.tx?'",
+              refused(bash("git checkout --theirs '*.tx?'", conf)))
         for cmd in ("git checkout --theirs 'app/[id]/page.tsx'",
                     "git checkout --ours -- 'app/[id]/page.tsx'",
                     "git restore --theirs 'app/[id]/page.tsx'"):
@@ -833,7 +1017,7 @@ def selftest():
               passed(bash("git restore a.txt", clean_repo)))
         check("B refuse: git checkout -- b.txt names the dirty file",
               refused(bash("git checkout -- b.txt", clean_repo)))
-        check("B refuse: git checkout -- . falls back to the whole tree",
+        check("B refuse: git checkout -- . (git status over '.' sees the dirty file)",
               refused(bash("git checkout -- .", clean_repo)))
         check("B pass (dirty): git checkout -b newbranch",
               passed(bash("git checkout -b newbranch", dirty_repo)))
@@ -843,6 +1027,162 @@ def selftest():
               passed(bash("git reset --hard", untr_repo)))
         check("B pass: not a git repo", passed(bash("git reset --hard", nongit)))
         check("B pass: gh pr merge in an exempt repo", passed(bash("gh pr merge 1", exrepo)))
+
+        bad = os.path.join(tmp, "bad.toml")
+        with open(bad, "w") as fh:
+            fh.write("this is not toml\n")
+
+        # Redirections are not operands (B1)
+        for cmd in ("git restore docs/g.md 2> /dev/null",
+                    "git checkout -- docs/g.md > /dev/null 2>&1", "git restore docs/g.md 2>/dev/null",
+                    "git restore docs/g.md &> /dev/null", "git restore docs/g.md >| /dev/null"):
+            check("B refuse (redirections): " + cmd, refused(bash(cmd, dirtydocs)))
+        for cmd in ("git checkout --theirs a.txt 2>&1", "git checkout --theirs a.txt 2>/dev/null",
+                    "git checkout --theirs a.txt > /dev/null", "git checkout --theirs a.txt 2> err.log"):
+            check("B pass (redirections, mid-merge): " + cmd, passed(bash(cmd, conf)))
+        check("B refuse (redirections): gh pr merge 1 2>&1", refused(bash("gh pr merge 1 2>&1", nongit)))
+        check("B refuse (redirections): gh pr merge 1 &>/dev/null",
+              refused(bash("gh pr merge 1 &>/dev/null", nongit)))
+        check("B pass (redirections): a quoted > is not a redirect",
+              passed(bash("echo 'a > b' \"2>&1\"", nongit)))
+
+        # One path predicate: git matches globs, directories and `.`
+        check("B refuse (N1): --theirs '*.txt' with an untracked file literally named *.txt",
+              refused(bash("git checkout --theirs '*.txt'", globrepo)))
+        check("B pass (N1 control): --theirs a.txt in the same repo",
+              passed(bash("git checkout --theirs a.txt", globrepo)))
+        # git's pathspec matches BOTH app/[id]/page.tsx (literal) and app/i/page.tsx (glob [id]),
+        # and the second is only dirty, so resolving would also overwrite it: refuse.
+        check("B refuse (brackets): --theirs 'app/[id]/page.tsx' when git also matches app/i/page.tsx",
+              refused(bash("git checkout --theirs 'app/[id]/page.tsx'", brk)))
+        check("B pass (brackets): literal bracket path conflicted, nothing else matching",
+              passed(bash("git checkout --theirs 'app/[id]/page.tsx'", conf)))
+        check("B pass: --theirs . when only conflicted files are dirty",
+              passed(bash("git checkout --theirs .", onlyconf)))
+        check("B pass: git restore --theirs . when only conflicted files are dirty",
+              passed(bash("git restore --theirs .", onlyconf)))
+        check("B refuse: --theirs . when a non-conflicted file is dirty",
+              refused(bash("git checkout --theirs .", conf)))
+        for cmd in ("git checkout -b docs", "git checkout -B docs", "git checkout --orphan docs",
+                    "git checkout -b docs main", "git switch -c docs"):
+            check("B pass (N2): new branch named like a dirty dir: " + cmd,
+                  passed(bash(cmd, dirtydocs)))
+        check("B pass (N3): git checkout main -- (branch switch, no paths)",
+              passed(bash("git checkout main --", dirtydocs)))
+        check("B pass (N3): git checkout docs -- where docs is a branch AND a dirty directory",
+              passed(bash("git checkout docs --", branchdocs)))
+        check("B refuse (N3 control): git checkout docs -- docs when the path part is named",
+              refused(bash("git checkout docs -- docs", branchdocs)))
+        check("B refuse: git checkout main -- docs/g.md still names the dirty path",
+              refused(bash("git checkout main -- docs/g.md", dirtydocs)))
+        check("B refuse: git checkout docs (bare directory operand holding a dirty file)",
+              refused(bash("git checkout docs", dirtydocs)))
+        check("B pass: git restore docs/h.md (clean sibling of the dirty file)",
+              passed(bash("git restore docs/h.md", dirtydocs)))
+
+        # A git failure is never read as clean
+        check("fail safe: git restore with a pathspec outside the repo is refused",
+              refused(bash("git restore /nonexistent-outside/x", dirtydocs)))
+        check("fail safe: git status failing (corrupt index) refuses reset --hard",
+              refused(bash("git reset --hard", corrupt)))
+        check("fail safe: git status failing (corrupt index) refuses clean -fd",
+              refused(bash("git clean -fd", corrupt)))
+        check("fail safe: not a repo at all still passes", passed(bash("git restore x", nongit)))
+
+        # The config file is protected (N6)
+        cfgp = env["SESSION_NOTES_CONFIG"]
+        cfgdir = os.path.dirname(cfgp)
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        cfg_refused = {}
+        for label, payload in (
+                ("Edit", {"tool_name": "Edit", "tool_input": {"file_path": cfgp}, "cwd": tmp}),
+                ("Write", {"tool_name": "Write", "tool_input": {"file_path": cfgp}, "cwd": tmp}),
+                ("MultiEdit", {"tool_name": "MultiEdit", "tool_input": {"file_path": cfgp}, "cwd": tmp}),
+                ("relative path", {"tool_name": "Edit", "tool_input": {"file_path": "../config.toml"},
+                                   "cwd": os.path.join(tmp, "sub")}),
+                ("apply_patch", {"tool_name": "apply_patch", "cwd": tmp, "tool_input": {
+                    "command": "*** Begin Patch\n*** Update File: config.toml\n@@\n-a\n+b\n*** End Patch\n"}}),
+                ("apply_patch via shell", {"tool_name": "shell", "cwd": tmp, "tool_input": {
+                    "command": ["bash", "-lc", "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: config.toml\n@@\n-a\n+b\n*** End Patch\nEOF"]}})):
+            r = run(payload)
+            check("config protected (Arm A): " + label, refused(r) and "user" in r.stderr, r.stderr)
+        alias = os.path.join(tmp, "alias.toml")
+        os.symlink(cfgp, alias)
+        check("config protected: an edit through a symlink that points at it",
+              refused(edit("Edit", alias)))
+        real_cfg = os.path.join(tmp, "cfg_real.toml")
+        link_cfg = os.path.join(tmp, "cfg_link.toml")
+        with open(real_cfg, "w") as fh:
+            fh.write("")
+        os.symlink(real_cfg, link_cfg)
+        lenv = dict(env, SESSION_NOTES_CONFIG=link_cfg)
+
+        def run_env(e, payload):
+            return subprocess.run([sys.executable, os.path.realpath(__file__)], env=e,
+                                  input=json.dumps(payload), capture_output=True, text=True,
+                                  timeout=30)
+        for label, target in (("the symlink", link_cfg), ("its target", real_cfg)):
+            r = run_env(lenv, {"tool_name": "Edit", "tool_input": {"file_path": target}, "cwd": tmp})
+            check("config protected: config is a symlink, edit " + label, refused(r), r.stderr)
+        r = run_env(lenv, {"tool_name": "Bash", "cwd": tmp,
+                           "tool_input": {"command": "echo x >> " + real_cfg}})
+        check("config protected: config is a symlink, shell append to its target", refused(r), r.stderr)
+        # exempt_repos / exempt_paths cannot exempt the config
+        cfgrepo = mkrepo("cfgrepo", ("x.txt",))
+        exc_cfg = os.path.join(cfgrepo, "cfg.toml")
+        with open(exc_cfg, "w") as fh:
+            fh.write('[checkout_guard]\nexempt_repos = ["%s"]\nexempt_paths = ["%s/*"]\n'
+                     % (cfgrepo, cfgrepo))
+        sh(cfgrepo, "git", "add", "cfg.toml")
+        sh(cfgrepo, "git", "commit", "-q", "-m", "cfg")
+        eenv = dict(env, SESSION_NOTES_CONFIG=exc_cfg)
+        r = run_env(eenv, {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(cfgrepo, "x.txt")},
+                           "cwd": tmp})
+        check("config protected (control): the exemption is live for other files in that repo",
+              passed(r), r.stderr)
+        r = run_env(eenv, {"tool_name": "Edit", "tool_input": {"file_path": exc_cfg}, "cwd": tmp})
+        check("config protected: refused even when the config exempts its own repo and path",
+              refused(r), r.stderr)
+        r = run_env(eenv, {"tool_name": "Bash", "cwd": cfgrepo,
+                           "tool_input": {"command": "gh pr merge 1"}})
+        check("config protected (control): exempt repo still lets gh pr merge through",
+              passed(r), r.stderr)
+        # a config that does not parse must not make itself editable
+        r = run_env(dict(env, SESSION_NOTES_CONFIG=bad), {
+            "tool_name": "Edit", "tool_input": {"file_path": bad}, "cwd": tmp})
+        check("config protected: refused while the config is unparseable (Edit)",
+              refused(r), r.stderr)
+        r = run_env(dict(env, SESSION_NOTES_CONFIG=bad), {
+            "tool_name": "Bash", "cwd": tmp, "tool_input": {"command": "echo x >> " + bad}})
+        check("config protected: refused while the config is unparseable (shell)",
+              refused(r), r.stderr)
+        r = run_env(dict(env, SESSION_NOTES_CONFIG=bad), {
+            "tool_name": "Edit", "tool_input": {"file_path": os.path.join(main_repo, "a.txt")},
+            "cwd": tmp})
+        check("config protected (control): unparseable config still fails open elsewhere",
+              r.returncode == 0 and "LOUD" in r.stderr, r.stderr)
+        for cmd, where in (("echo x >> " + cfgp, tmp), ("echo x > " + cfgp, tmp),
+                           ("echo x >" + cfgp, tmp), ("echo x 2>&1 >> " + cfgp, tmp),
+                           ("cat > " + cfgp + " <<EOF\nexempt_repos = []\nEOF", tmp),
+                           ("echo x | tee " + cfgp, tmp), ("echo x | tee -a " + cfgp, tmp),
+                           ("sed -i '' s/a/b/ " + cfgp, tmp), ("sed -i.bak s/a/b/ " + cfgp, tmp),
+                           ("perl -pi -e 's/a/b/' " + cfgp, tmp),
+                           ("cp /tmp/x " + cfgp, tmp), ("mv /tmp/x " + cfgp, tmp),
+                           ("install -m 600 /tmp/x " + cfgp, tmp), ("ln -sf /tmp/x " + cfgp, tmp),
+                           ("rm " + cfgp, tmp), ("rm -f " + cfgp, tmp),
+                           ("truncate -s 0 " + cfgp, tmp), ("unlink " + cfgp, tmp),
+                           ("dd if=/tmp/x of=" + cfgp, tmp), ("mv " + cfgp + " /tmp/gone", tmp),
+                           ("echo x >> config.toml", tmp), ("echo x >> ../config.toml", os.path.join(tmp, "sub")),
+                           ("echo x >> ~/../config.toml", tmp), ("cd .. && echo x >> config.toml", os.path.join(tmp, "sub")),
+                           ("sudo tee " + cfgp, tmp), ("bash -c 'echo x >> " + cfgp + "'", tmp),
+                           ("true; echo x >> " + cfgp, tmp), ("echo x >> " + alias, tmp)):
+            r = bash(cmd, where)
+            check("config protected (shell): " + cmd.replace("\n", "\\n"),
+                  refused(r) and "user" in r.stderr, r.stderr)
+        for cmd in ("cat " + cfgp, "grep x " + cfgp, "cp " + cfgp + " /tmp/copy-of-config",
+                    "less " + cfgp, "sed -n 1p " + cfgp, "echo hi > " + os.path.join(tmp, "other.txt"),
+                    "tee " + os.path.join(tmp, "other.txt"), "cat " + cfgp + " > " + os.path.join(tmp, "o2.txt")):
+            check("config protected (control, reads pass): " + cmd, passed(bash(cmd, tmp)))
 
         # No override
         for cmd in ("CHECKOUT_GUARD=off gh pr merge 1", "gh pr merge 1 # checkout_guard: allow",
@@ -865,9 +1205,6 @@ def selftest():
         check("fail open: non-dict payload", passed(run(["x"])))
         check("fail open: tool_input of the wrong type",
               passed(run({"tool_name": "Bash", "tool_input": "oops", "cwd": nongit})))
-        bad = os.path.join(tmp, "bad.toml")
-        with open(bad, "w") as fh:
-            fh.write("this is not toml\n")
         r = subprocess.run([sys.executable, os.path.realpath(__file__)],
                            env=dict(env, SESSION_NOTES_CONFIG=bad),
                            input=json.dumps({"tool_name": "Bash", "cwd": nongit,

@@ -174,34 +174,56 @@ linked worktree (whatever its branch), a main checkout on another branch or a de
 paths outside a git repo. An `apply_patch` is refused if any file it touches qualifies.
 
 **Arm B, shell.** Refused: any raw `gh pr merge` invocation except `--help` (use `wt merge`, which
-checks the review verdict); and, only when the tree has uncommitted changes, `git checkout -f`,
-`git checkout -- <paths>`, `git checkout .`, `git restore` (a plain `--staged` is fine),
-`git reset --hard`, and `git clean` with force and `-d` (for `clean`, untracked files count as
-changes). `git -C <dir>` and a leading `cd <dir> &&` pick the tree. On a clean tree all of these
-pass, and a plain `git checkout <branch>` is never refused. Only an invocation counts: the
-command is parsed (heredoc bodies dropped, env prefixes and wrappers such as `sudo` or `env`
-skipped), so `echo "gh pr merge"` or a commit message that mentions it does not trip it.
+checks the review verdict); and, only when it would destroy uncommitted work, `git checkout -f`,
+`git checkout [<ref>] -- <paths>`, `git checkout <path>`, `git checkout .`, `git restore`
+(a plain `--staged` is fine), `git switch -f`, `git reset --hard`, and `git clean` with force and
+`-d` (not `-X` alone, not a dry run). `git -C <dir>` and a leading `cd <dir> &&` pick the tree.
+Only an invocation counts: the command is parsed (heredoc bodies dropped, env prefixes, shell
+keywords such as `if`/`do`/`!` and wrappers such as `sudo` or `env` skipped), so
+`echo "gh pr merge"` or a commit message that mentions it does not trip it. Redirections
+(`2>&1`, `> /dev/null`, `&>f`, `2> err`, attached or detached) are removed before any argument
+is read, so they are never mistaken for a path operand.
+
+**One predicate for path forms.** For `git checkout` and `git restore` with paths, the hook runs
+`git status --porcelain --untracked-files=no -- <operands>` once and lets git do the glob,
+directory and `.` matching. A plain checkout or restore is allowed only if git succeeded and
+printed nothing. Conflict resolution (`--ours`, `--theirs`, `--merge`, and `-m` for checkout) is
+allowed only if git succeeded, printed something, and every line is an unmerged code (`UU`, `AA`,
+`DD`, `AU`, `UA`, `DU`, `UD`), so a pathspec that also matches a merely modified file is refused.
+Operands exclude commit-ish names and the values of `-b`, `-B` and `--orphan`, so
+`git checkout -b docs` and `git checkout main --` are branch operations, not path checkouts.
+Whole-tree verbs (`checkout -f`, `switch -f`, `reset --hard`, `clean`) ask whether the tree is
+dirty. A repo with no `origin` remote is never refused by Arm A, since there is no PR flow and
+`wt new` needs one.
+
+**Fail safe on git errors.** Inside Arm B, a `git status` that fails in a repo (a pathspec outside
+the repository, a corrupt index) counts as dirty and refuses; it is never read as clean. Outside
+any repo there is nothing to lose and the command passes.
+
+**The config file is protected.** The guard's own config file (the path `notes_config` resolves,
+a symlink and its target alike) cannot be changed by the agent. Edit, Write, MultiEdit,
+NotebookEdit and `apply_patch` on it are refused, and so are shell commands that write it:
+a redirect target, `tee`, `sed -i` or `perl -i`, `cp`/`install`/`ln` onto it, `mv` from or onto it,
+`rm`/`truncate`/`unlink` of it, `dd of=`. Reads (`cat`, `grep`, `cp` out of it) pass. This is
+checked before the config is even loaded and before `exempt_repos` and `exempt_paths`, so a
+config that fails to parse cannot make itself editable and no exemption can cover it. Ask the
+user to edit it.
 
 **Exemptions** are config only, in `[checkout_guard]`: `exempt_repos` (repo roots where the guard
 does nothing, both arms) and `exempt_paths` (glob patterns Arm A allows). Every configured scope's
 memory store is always exempt for edits. There is no environment variable, flag or command-line
 comment that turns the guard off.
 
-**Fail open.** An unreadable payload, a git failure or an import error exits 0 with one
-`checkout_guard: <error>` line on stderr. A config file that fails to parse also fails open, and
-the line names the file and says the guard is off for that call.
+**Fail open.** An unreadable payload, an internal error or an import error exits 0 with one
+`checkout_guard: <error>` line on stderr. A config file that fails to parse also fails open (the
+line names the file and says the guard is off for that call), except that the file itself stays
+protected.
 
-**Conflict resolution passes.** `git checkout --ours/--theirs/--merge/-m <paths>` and
-`git restore --ours/--theirs/--merge <paths>` are allowed when every named path is unmerged. A glob operand (`*`, `?`, `[`) is never treated as
-conflict resolution and goes through the dirty check, unless it names an existing file (a literal
-path such as `app/[id]/page.tsx`). `git
-checkout -- <paths>` and `git restore <paths>` are judged by the named paths only (`.` or a magic
-pathspec falls back to the whole tree). `git clean -X` (ignored files only) passes. A repo with
-no `origin` remote is never refused by Arm A, since there is no PR flow and `wt new` needs one.
-
-**Known limits.** Arm A does not see shell writes (`sed -i`, redirects). A `-C "$VAR"` or
-`cd "$VAR"` that cannot be resolved is judged against the nearest existing parent directory. The
-`gh pr merge` exemption is keyed on the current directory's repo. `gh api` merges are not covered.
+**Known limits.** Arm A does not see general shell writes to tracked files (`sed -i` on a source
+file, redirects, `python -c`); only writes to the config file are covered. Shell variables are
+not expanded: a `-C "$VAR"` or `cd "$VAR"` that cannot be resolved is judged against the nearest
+existing parent directory, and `> "$CFG"` is not recognised as a config write. The `gh pr merge`
+exemption is keyed on the current directory's repo. `gh api` merges are not covered.
 
 **Codex.** The hook already understands Codex `apply_patch` and shell payloads, but the shell
 tool's name is not verified: the accepted names live in one constant (`SHELL_TOOLS`) and are
