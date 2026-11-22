@@ -69,8 +69,8 @@ Then trust the new or changed hooks (next section).
 | Event | Hooks |
 |---|---|
 | SessionStart | `codex_session_start.py` (boot load), `session_pane_registry.py` |
-| UserPromptSubmit | `time_sense.py`, `session_bus_hook.py`, `session_pane_registry.py` |
-| Stop | `session_bus_hook.py`, `session_pane_registry.py` |
+| UserPromptSubmit | `time_sense.py`, `session_bus_hook.py` |
+| Stop | `session_bus_hook.py` |
 | PostToolUse (`apply_patch`) | `em_dash_guard.py`, which checks only the lines a patch adds |
 
 The output shape is Claude's (`hookSpecificOutput.additionalContext`), so the same scripts
@@ -195,7 +195,8 @@ match the rule and falls back to an approval prompt.
   run them from its shell with approval (see above), but `$refresh` does not peek at
   sibling sessions.
 - Bus mail rides the prompt hook only when the hook runs inside the pane (`codex --no-daemon`,
-  or `daemon_auto_start = false` in `config.toml`); otherwise it is pulled.
+  or `codex features disable daemon_auto_start`, which sets it under `[features]` in
+  `config.toml`); otherwise it is pulled.
   The desktop app has no pane, so it receives no bus mail.
 - An untrusted hook does not run and says nothing. If time stamps or bus mail never appear,
   check `/hooks` first.

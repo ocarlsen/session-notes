@@ -132,20 +132,25 @@ def _payload():
         return {}
 
 
-def _agent_pid(pane):
-    """The pid recorded for this pane's session: CLAUDE_PID, or for Codex (which sets no
-    such variable) the pane's own process or a direct child of it that this hook descends
-    from (session_peers.pane_ancestor_pid, shared with the bus hook).
+def _codex_mode():
+    return os.environ.get("SESSION_NOTES_AGENT", "").strip().lower() == "codex"
 
-    Only under SESSION_NOTES_AGENT=codex, so a Claude session without CLAUDE_PID still
-    refuses. Which readers accept which shape: the turn-state reader (apply_hook_state)
-    takes the pane's pid or a direct child; the transcript and lineage readers
-    (resolve_pane_transcript, parents_by_session) require exactly the pane's pid, so a
-    Codex entry that is a child verifies for turn state only. None found: "" and the
-    caller refuses."""
-    pid = os.environ.get("CLAUDE_PID", "").strip()
-    if pid or os.environ.get("SESSION_NOTES_AGENT", "").strip().lower() != "codex":
-        return pid
+
+def _agent_pid(pane):
+    """The pid recorded for this pane's session: CLAUDE_PID, or under
+    SESSION_NOTES_AGENT=codex (which sets no such variable) the pane's own process or a
+    direct child of it that this hook descends from, refused when a different agent
+    process sits between (session_peers.pane_ancestor_pid, shared with the bus hook: a
+    nested `codex exec` child is not the pane's session).
+
+    Codex mode IGNORES an inherited CLAUDE_PID: a Codex child of a Claude session
+    inherits it, and it names the parent Claude, not this session (bin/reflect_lock.py
+    does the same). A Claude session without CLAUDE_PID still refuses. The transcript and
+    lineage readers (resolve_pane_transcript, parents_by_session) require exactly the
+    pane's pid, so a Codex entry that is a child verifies for turn state only. None found:
+    "" and the caller refuses."""
+    if not _codex_mode():
+        return os.environ.get("CLAUDE_PID", "").strip()
     try:
         import session_peers
         return session_peers.pane_ancestor_pid(pane)
@@ -187,7 +192,8 @@ def main():
         except Exception:
             pass
 
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    session_id = ("" if _codex_mode()   # an inherited Claude id names the parent session
+                  else os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip())
     if not session_id:
         # The hook payload carries it too; prefer env, fall back to stdin.
         session_id = str(payload.get("session_id") or "").strip()
@@ -381,33 +387,70 @@ def selftest():
             os.environ.pop(k, None)
         os.environ.update(TMUX_PANE="%7", SESSION_NOTES_AGENT="codex")
         _live_pane_ids = lambda: {"%7", "%3", "%1", "%2"}
-        sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart", "session_id": "codex-1"}))
-        main()
-        with open(reg_file) as f:
-            reg = json.load(f)
-        check("codex without a findable pid: refuses", "%7" not in reg)
         real_run = subprocess.run
 
         class _R:
-            def __init__(self, out):
-                self.returncode, self.stdout = 0, out
+            def __init__(self, out, rc=0):
+                self.returncode, self.stdout = rc, out
         me, up = str(os.getppid()), "88888"
 
-        def fake_run(cmd, *a, **k):
-            if cmd[0] == "tmux":
-                return _R(up + "\n")
-            return _R("%s %s\n%s 1\n" % (me, up, up))
-        subprocess.run = fake_run
-        try:
-            sys.stdin = io.StringIO(json.dumps({"hook_event_name": "SessionStart", "session_id": "codex-1"}))
+        def sp(event="SessionStart", sid="codex-1"):
+            sys.stdin = io.StringIO(json.dumps({"hook_event_name": event, "session_id": sid}))
             main()
             with open(reg_file) as f:
-                reg = json.load(f)
+                return json.load(f)
+
+        def stub(tmux_rc, table):
+            """tmux and ps stubbed: pane_pid is `up` (or a tmux failure), ps shows `table`."""
+            def fake_run(cmd, *a, **k):
+                if cmd[0] == "tmux":
+                    return _R(up + "\n" if tmux_rc == 0 else "", tmux_rc)
+                return _R("".join("%s %s %s\n" % (pid, pp, argv) for pid, (pp, argv) in table.items()))
+            subprocess.run = fake_run
+        flat = {me: (up, "sh -c hook"), up: ("1", "-zsh")}
+        try:
+            stub(1, flat)  # no tmux answer: nothing real is consulted
+            check("codex without a findable pid: refuses", "%7" not in sp())
+            stub(0, flat)
+            reg = sp()
             check("codex: entry recorded from payload id, pid = pane child",
                   reg.get("%7", {}).get("session_id") == "codex-1"
                   and reg["%7"].get("claude_pid") == me)
             check("codex: UserPromptSubmit records turn state", turn("UserPromptSubmit", pane="%7") == "working")
             check("codex: Stop records idle", turn("Stop", pane="%7") == "idle")
+
+            # Codex mode ignores an inherited CLAUDE_PID / CLAUDE_CODE_SESSION_ID.
+            os.environ.update(CLAUDE_PID="4242", CLAUDE_CODE_SESSION_ID="sess-parent")
+            reg = sp(sid="codex-2")
+            check("codex: inherited CLAUDE_CODE_SESSION_ID ignored, payload id used",
+                  reg["%7"]["session_id"] == "codex-2")
+            check("codex: inherited CLAUDE_PID ignored, ancestry pid used",
+                  reg["%7"]["claude_pid"] == me and _agent_pid("%7") == me)
+            for k in ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID"):
+                os.environ.pop(k, None)
+
+            # Nested sessions: a codex exec child inside the pane is not the pane's session.
+            c1, c2 = "77771", "77772"
+            before_entry = dict(sp(sid="codex-2")["%7"])
+            stub(0, {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
+                     c2: (up, "codex --no-daemon"), up: ("1", "-zsh")})
+            check("nested: pane codex -> codex exec -> hook: no pid", _agent_pid("%7") == "")
+            reg = sp(sid="codex-child")
+            check("nested: the child's SessionStart leaves the pane's entry alone",
+                  reg["%7"] == before_entry)
+            stub(0, flat)
+            turn("UserPromptSubmit", pane="%7")
+            stub(0, {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
+                     c2: (up, "codex --no-daemon"), up: ("1", "-zsh")})
+            check("nested: the child's Stop does not flip the pane's state to idle",
+                  turn("Stop", pane="%7") == "working")
+            stub(0, {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
+                     c2: (up, "claude -n x"), up: ("1", "-zsh")})
+            check("nested: pane claude -> codex exec -> hook: no pid", _agent_pid("%7") == "")
+            stub(0, {me: (c1, "sh -c hook"), c1: (c2, "/x/codex --no-daemon"),
+                     c2: (up, "node /x/bin/codex --no-daemon"), up: ("1", "-zsh")})
+            check("wrapper chain: node codex -> codex binary -> hook: accepted",
+                  _agent_pid("%7") == c2)
             os.environ["SESSION_NOTES_AGENT"] = ""
             check("claude without CLAUDE_PID still refuses", _agent_pid("%7") == "")
         finally:

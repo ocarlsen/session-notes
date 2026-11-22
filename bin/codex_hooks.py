@@ -14,9 +14,12 @@ exact hook definition and any change to it forces a re-trust.
 
 What gets registered (every command is prefixed SESSION_NOTES_AGENT=codex):
   SessionStart      codex_session_start.py (boot load), session_pane_registry.py
-  UserPromptSubmit  time_sense.py, session_bus_hook.py, session_pane_registry.py
-  Stop              session_bus_hook.py, session_pane_registry.py
+  UserPromptSubmit  time_sense.py, session_bus_hook.py
+  Stop              session_bus_hook.py
   PostToolUse       apply_patch: em_dash_guard.py
+session_pane_registry.py is SessionStart only: it is not on UserPromptSubmit or Stop
+because nothing reads a Codex pane's turn state (session_peers skips non-Claude panes).
+An older file that has it there loses those two entries on the next refresh.
 
 A file that is not valid JSON, or whose "hooks" shape is unexpected (an event that is not a
 list, a group or handler that is not an object), is refused untouched with a clear error.
@@ -55,13 +58,11 @@ def desired(repo):
         ],
         "UserPromptSubmit": [
             {"hooks": [h("time_sense.py", timeout=10),
-                       h("session_bus_hook.py", timeout=10, additionalContextLimit=6000),
-                       h("session_pane_registry.py", timeout=10)]},
+                       h("session_bus_hook.py", timeout=10, additionalContextLimit=6000)]},
         ],
         "Stop": [
             # no additionalContextLimit: Stop cannot add context, and Codex warns on it
-            {"hooks": [h("session_bus_hook.py", timeout=10),
-                       h("session_pane_registry.py", timeout=10)]},
+            {"hooks": [h("session_bus_hook.py", timeout=10)]},
         ],
         "PostToolUse": [
             {"matcher": "apply_patch", "hooks": [h("em_dash_guard.py", timeout=10)]},
@@ -256,9 +257,12 @@ def selftest():
                        "statusMessage": "Loading session notes", "timeout": 10,
                        "additionalContextLimit": 4000}]})
         check("fresh: prompt hooks", [c.rsplit("/", 1)[1] for c in cmds(d, "UserPromptSubmit")]
-              == ["time_sense.py", "session_bus_hook.py", "session_pane_registry.py"])
+              == ["time_sense.py", "session_bus_hook.py"])
         check("fresh: stop hooks", [c.rsplit("/", 1)[1] for c in cmds(d, "Stop")]
-              == ["session_bus_hook.py", "session_pane_registry.py"])
+              == ["session_bus_hook.py"])
+        check("fresh: the pane registry hook is on SessionStart only", [
+            e for e in d["hooks"] if any(c.endswith("/session_pane_registry.py")
+                                         for c in cmds(d, e))] == ["SessionStart"])
         check("fresh: em dash guard on apply_patch",
               d["hooks"]["PostToolUse"][0]["matcher"] == "apply_patch")
         check("fresh: every command carries the agent prefix", all(
@@ -305,9 +309,9 @@ def selftest():
             {"hooks": [{"type": "command", "command": pre + "/old/worktree/hooks/session_bus_hook.py"}]},
             {"hooks": [{"type": "command", "command": "python3 /opt/session-notes/hooks/session_bus_hook.py"}]},
             {"hooks": [{"type": "command", "command": "python3 /backup/x/hooks/foo.py"}]},
-            {"hooks": [{"type": "command", "command": pre + "/p/hooks/origin_sense.py"},
-                       {"type": "command", "command": pre + "/p/hooks/uploads_sense.py"},
-                       {"type": "command", "command": pre + "/p/hooks/uploads_claim.py"}]},
+            {"hooks": [{"type": "command", "command": pre + "/p/hooks/private_a.py"},
+                       {"type": "command", "command": pre + "/p/hooks/private_b.py"},
+                       {"type": "command", "command": pre + "/p/hooks/private_c.py"}]},
             {"hooks": [{"type": "command", "command": pre + "/p/nothooks/time_sense.py"}]}]
         with open(path, "w") as fh:
             fh.write(render(old))
@@ -319,7 +323,7 @@ def selftest():
         check("old: no prefix means not ours", "python3 /opt/session-notes/hooks/session_bus_hook.py" in stop
               and "python3 /backup/x/hooks/foo.py" in stop)
         check("old: private hooks with the prefix are kept", all(
-            pre + "/p/hooks/" + n in stop for n in ("origin_sense.py", "uploads_sense.py", "uploads_claim.py")))
+            pre + "/p/hooks/" + n in stop for n in ("private_a.py", "private_b.py", "private_c.py")))
         check("old: path-component boundary, not substring", pre + "/p/nothooks/time_sense.py" in stop)
         bus_cmd = pre + "/opt/session-notes/hooks/session_bus_hook.py"
         check("bus hook carries additionalContextLimit 6000 on UserPromptSubmit", any(
@@ -391,6 +395,23 @@ def selftest():
               and open(hj).read() == "{broken" and not os.path.exists(calls_log))
 
         # an empty or unusable file
+        # an older file that registers the pane registry on UserPromptSubmit and Stop is cleaned
+        reg_cmd = lambda r: pre + r + "/hooks/session_pane_registry.py"
+        legacy = {"hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": reg_cmd("/old")},
+                                            {"type": "command", "command": "python3 /opt/mine.py"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": reg_cmd("/old")}]}],
+            "SessionStart": [{"hooks": [{"type": "command", "command": reg_cmd("/old")}]}]}}
+        with open(path, "w") as fh:
+            fh.write(render(legacy))
+        refresh(path, repo)
+        n = load()
+        check("legacy: registry entry removed from UserPromptSubmit and Stop",
+              not any("session_pane_registry" in c for c in cmds(n, "UserPromptSubmit"))
+              and not any("session_pane_registry" in c for c in cmds(n, "Stop")))
+        check("legacy: registry entry kept (refreshed) on SessionStart, foreign hook kept",
+              cmds(n, "SessionStart").count(pre + repo + "/hooks/session_pane_registry.py") == 1
+              and "python3 /opt/mine.py" in cmds(n, "UserPromptSubmit"))
         with open(path, "w") as fh:
             fh.write("")
         check("empty file treated as fresh", refresh(path, repo)[0] and "SessionStart" in load()["hooks"])
@@ -405,12 +426,12 @@ def selftest():
         with open(path, "w") as fh:
             json.dump({"hooks": {"Stop": [{"hooks": [
                 {"type": "command", "command": "python3 %s" % live},
-                {"type": "command", "command": "python3 %s/gone/hooks/origin_sense.py" % tmp},
-                {"type": "command", "command": "python3 /x/codex_suggest.py hook"}]}]}}, fh)
+                {"type": "command", "command": "python3 %s/gone/hooks/private_a.py" % tmp},
+                {"type": "command", "command": "python3 /x/private_d.py hook"}]}]}}, fh)
         gone = missing_scripts(path)
         check("missing script reported, present one not",
-              gone == ["python3 %s/gone/hooks/origin_sense.py" % tmp,
-                       "python3 /x/codex_suggest.py hook"])
+              gone == ["python3 %s/gone/hooks/private_a.py" % tmp,
+                       "python3 /x/private_d.py hook"])
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 

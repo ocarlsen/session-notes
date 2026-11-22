@@ -232,31 +232,84 @@ def process_parents():
     return out
 
 
-def pane_ancestor_pid(pane_id, start_pid=None, parents=None):
+_JS_RUNNERS = ("node", "nodejs", "bun", "deno")
+
+
+def _agent_kind(argv):
+    """How an argv string looks to the nested-session test: "agent" for a codex or claude
+    process (argv[0] basename starts with codex/claude, or a node/js wrapper whose script
+    basename does), "wrapper" for a node/js wrapper of one (`node .../codex`, the launcher
+    of the real binary: part of the SAME agent), "helper" for a codex-*/claude-* helper
+    process (codex-code-mode-host: a helper, never a session), "" for anything else."""
+    f = (argv or "").split()
+    if not f:
+        return ""
+    base = os.path.basename(f[0])
+    if base in _JS_RUNNERS:
+        script = next((os.path.basename(a) for a in f[1:] if not a.startswith("-")), "")
+        return "wrapper" if script.startswith(("codex", "claude")) else ""
+    if base.startswith(("codex-", "claude-")):
+        return "helper"
+    return "agent" if base.startswith(("codex", "claude")) else ""
+
+
+def pane_ancestor_pid(pane_id, start_pid=None, parents=None, table=None):
     """The process of `pane_id` that the CALLER descends from: the pane's own process or a
-    direct child of it, as a pid string; "" when the caller is not inside that pane (or tmux
-    or ps cannot say).
+    direct child of it, as a pid string; "" when the caller is not inside that pane, when
+    tmux or ps cannot say, or when the caller belongs to a NESTED agent session.
 
     The shared "is this hook really running in the pane TMUX_PANE names" test. A
     TMUX_PANE in the environment is not proof: a daemon started inside pane A hands %A
     to every session it later serves. Walking up from the hook's own parent process to
-    the pane's pid is. Walks from os.getppid() unless `start_pid` is given."""
+    the pane's pid is. Walks from os.getppid() unless `start_pid` is given.
+
+    Descending from the pane is still not "is the pane's own session": a
+    `codex --no-daemon exec` child started inside the pane inherits TMUX_PANE and the
+    ancestry too. So the NEAREST agent process above the hook must be the pane-level one
+    (or its own node wrapper chain); a different codex/claude process between the hook
+    and the pane-level process refuses. No agent-looking process at all is accepted
+    (the answer then rests on the ancestry alone).
+
+    `table` is {pid: (ppid, argv)} as process_table() returns it (read from ps when
+    neither it nor `parents` is given); `parents` is a bare {pid: ppid}, which carries no
+    argv, so no nested-agent judgment."""
     try:
         r = _tmux(["display-message", "-p", "-t", pane_id, "#{pane_pid}"], timeout=5)
         pane_pid = r.stdout.strip() if r.returncode == 0 else ""
-        table = parents if parents is not None else process_parents()
+        argv = {}
+        if table is None and parents is None:
+            table = process_table()
+        if table is not None:
+            parents = {k: v[0] for k, v in table.items()}
+            argv = {k: v[1] for k, v in table.items()}
+        elif parents is None:
+            parents = process_parents()
     except Exception:
         return ""
-    if not pane_pid or not table:
+    if not pane_pid or not parents:
         return ""
     cur = str(start_pid if start_pid is not None else os.getppid())
+    chain = []
     for _ in range(32):
-        if cur == pane_pid or table.get(cur) == pane_pid:
-            return cur
-        cur = table.get(cur, "")
+        chain.append(cur)
+        if cur == pane_pid or parents.get(cur) == pane_pid:
+            break
+        cur = parents.get(cur, "")
         if not cur or cur in ("0", "1"):
             return ""
-    return ""
+    else:
+        return ""
+    top = chain[-1]
+    seen_agent = False
+    for pid in chain:
+        kind = _agent_kind(argv.get(pid, ""))
+        if kind == "agent":
+            if seen_agent:
+                return ""  # a second, distinct agent above the nearest one: nested session
+            seen_agent = True
+        elif kind == "wrapper" and not seen_agent:
+            seen_agent = True  # a bare wrapper is the agent's launcher, not a second agent
+    return top
 
 
 def apply_hook_state(panes, read=read_pane_state, parents=process_parents):
@@ -1334,6 +1387,34 @@ def selftest():
             "pane_ancestor_pid: a caller outside the pane's tree is refused")
         chk(pane_ancestor_pid("%1", start_pid="502", parents={}) == "",
             "pane_ancestor_pid: unreadable ps is refused")
+        # Nested agents, from an argv table {pid: (ppid, argv)}.
+        t_direct = {"500": ("1", "codex --no-daemon"), "503": ("500", "sh -c hook")}
+        t_wrap = {"500": ("1", "-zsh"), "501": ("500", "node /x/bin/codex --no-daemon"),
+                  "502": ("501", "/x/codex-bin --no-daemon"), "503": ("502", "sh -c hook")}
+        t_wrap2 = dict(t_wrap, **{"502": ("501", "/x/codex --no-daemon")})
+        t_helper = dict(t_wrap, **{"502": ("501", "/x/codex-code-mode-host --listen g")})
+        t_exec = {"500": ("1", "-zsh"), "501": ("500", "codex --no-daemon"),
+                  "502": ("501", "codex --no-daemon exec -m x"), "503": ("502", "sh -c hook")}
+        t_cl = dict(t_exec, **{"501": ("500", "/u/.local/bin/claude -n s")})
+        t_exec_node = dict(t_wrap2, **{"503": ("504", "sh -c hook"),
+                                       "504": ("502", "codex --no-daemon exec -m x")})
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_direct) == "503",
+            "nested: pane-level codex -> sh -> hook accepted")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_wrap2) == "501",
+            "nested: node codex wrapper -> codex binary -> sh -> hook accepted")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_wrap) == "501",
+            "nested: wrapper -> unrelated-name binary -> hook accepted")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_helper) == "501",
+            "nested: codex-* helper process is not a second agent")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_exec) == "",
+            "nested: pane codex -> codex exec -> sh -> hook refused")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_cl) == "",
+            "nested: pane claude -> codex exec -> sh -> hook refused")
+        chk(pane_ancestor_pid("%1", start_pid="503", table=t_exec_node) == "",
+            "nested: exec child under a node wrapper chain refused")
+        chk(pane_ancestor_pid("%1", start_pid="503", table={"500": ("1", "-zsh"),
+            "501": ("500", "sh"), "503": ("501", "sh -c hook")}) == "501",
+            "nested: no agent-looking process at all rests on ancestry alone")
     finally:
         globals()["_tmux"] = _saved_tmux
     working = line("⠐ build api", pane_id="%31", session="31")

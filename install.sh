@@ -259,7 +259,8 @@ Trust new or changed hooks: /hooks in the Codex CLI, or Settings > Hooks in the 
 Codex trusts the exact hook definition, so any change to an entry (even its timeout) may need
 trusting again; an untrusted hook silently does not run.
 Bus mail rides the next prompt when the hook runs inside the pane (`codex --no-daemon`, or
-daemon_auto_start = false in config.toml); otherwise bus_nudge falls back to the pull line.
+`codex features disable daemon_auto_start`, which sets it under [features] in config.toml);
+otherwise bus_nudge falls back to the pull line.
 Details: docs/codex.md
 TXT
   offer_jobs

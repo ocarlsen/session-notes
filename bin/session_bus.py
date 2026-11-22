@@ -762,7 +762,7 @@ def cmd_peers(args):
         mark = "*" if name == me else " "
         errs = delivery_errors(name, panes)
         h = harness.get(name)
-        note = f"  ({h}: no hook; bus_nudge prompts it to pull `inbox --nudged`)" if h else ""
+        note = f"  ({h}: mail rides its prompt hook when one runs in the pane, else bus_nudge prompts it to pull `inbox --nudged`)" if h else ""
         if errs:
             bad += 1
             print(f" {mark} {name:<8} !! DELIVERY HOOK ERRORED -> {errs[0]}")
@@ -1249,7 +1249,7 @@ def main():
 
     s = sub.add_parser("inbox", help="peek undelivered mail (non-destructive)")
     s.add_argument("--nudged", action="store_true",
-                   help="the pull bus_nudge asks a hookless harness (Codex) to run: show "
+                   help="the pull bus_nudge asks a Codex session without a prompt hook in its pane to run: show "
                         "only the batch the nudge announced")
     s.add_argument("--as", dest="as_addr", metavar="SESSION:CREATED",
                    help="read this mailbox instead of asking tmux which session this is "

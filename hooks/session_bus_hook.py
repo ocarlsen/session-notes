@@ -321,7 +321,53 @@ def selftest():
             main()
         session_peers.pane_ancestor_pid = lambda pane, **k: "4321"
         check("codex Stop outside the pane retires nothing", "daemon mail" in run())
+        # Nested sessions, through the REAL ancestry test with tmux and ps stubbed: a
+        # `codex exec` child inside the pane neither receives nor retires the pane's mail.
         session_peers.pane_ancestor_pid = real_anc
+        me, c1, c2, up = str(os.getppid()), "77771", "77772", "88888"
+
+        class _SR:
+            def __init__(self, out, rc=0):
+                self.returncode, self.stdout = rc, out
+        real_sp_run = session_peers.subprocess.run
+
+        def stub_tree(table):
+            def fake(cmd, *a, **k):
+                if cmd[0] == "tmux":
+                    return _SR(up + "\n")
+                return _SR("".join("%s %s %s\n" % (p_, pp, av) for p_, (pp, av) in table.items()))
+            session_peers.subprocess.run = fake
+        direct = {me: (up, "sh -c hook"), up: ("1", "codex --no-daemon")}
+        wrapped = {me: (c1, "sh -c hook"), c1: (c2, "/x/codex --no-daemon"),
+                   c2: (up, "node /x/bin/codex --no-daemon"), up: ("1", "-zsh")}
+        nested = {me: (c1, "sh -c hook"), c1: (c2, "codex --no-daemon exec -m x"),
+                  c2: (up, "codex --no-daemon"), up: ("1", "-zsh")}
+        nested_claude = dict(nested, **{c2: (up, "claude -n x")})
+        try:
+            stub_tree(direct)
+            check("real ancestry: pane codex -> sh -> hook is in the pane", in_pane())
+            stub_tree(wrapped)
+            check("real ancestry: node codex wrapper chain is in the pane", in_pane())
+            stub_tree(nested)
+            check("real ancestry: pane codex -> codex exec -> hook is NOT the pane's session",
+                  not in_pane())
+            stub_tree(nested_claude)
+            check("real ancestry: pane claude -> codex exec -> hook is NOT the pane's session",
+                  not in_pane())
+            bus.append({"id": "mn", "ts": time.time(), "from": "beta", "from_created": 1,
+                        "to": "alpha", "body": "nested mail"})
+            sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="UserPromptSubmit")))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main()
+            check("nested child prompt: the pane's mail is not injected", out.getvalue() == "")
+            sys.stdin = io.StringIO(json.dumps(dict(cx, hook_event_name="Stop")))
+            with contextlib.redirect_stdout(io.StringIO()):
+                main()
+            stub_tree(direct)
+            check("nested child Stop: the pane's mail is not retired", "nested mail" in run())
+        finally:
+            session_peers.subprocess.run = real_sp_run
         if old_pane is None:
             os.environ.pop("TMUX_PANE", None)
         else:
