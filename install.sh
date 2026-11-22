@@ -22,6 +22,8 @@
 #   sh install.sh --all --bin-dir ~/.local/bin
 #   sh install.sh --yes              answer yes to every question
 #   sh install.sh --dry-run          show what would happen
+#   sh install.sh --git-hooks <repo>  install the session-notes pre-commit into a git repo
+#                                    (chains any hook already there; see docs/tools.md, wt)
 #   sh install.sh --codex            set up OpenAI Codex instead (docs/codex.md): link the
 #                                    Codex skills into ~/.codex/skills, offer the hooks.json
 #                                    and config.toml edits; never touches ~/.claude
@@ -35,6 +37,8 @@ DRY=0
 ALL=0
 YES=0
 CODEX=0
+GITHOOKS=""
+GITHOOKS_SET=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -42,11 +46,19 @@ while [ $# -gt 0 ]; do
     --dry-run|-n) DRY=1; shift ;;
     --all) ALL=1; shift ;;
     --yes|-y) YES=1; shift ;;
+    --git-hooks) [ $# -ge 2 ] || { echo "install.sh: --git-hooks needs a repo path" >&2; exit 2; }
+                 [ -n "$2" ] || { echo "install.sh: --git-hooks needs a non-empty repo path" >&2; exit 2; }
+                 GITHOOKS="$2"; GITHOOKS_SET=1; shift 2 ;;
     --codex) CODEX=1; shift ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
+
+if [ "$GITHOOKS_SET" = 1 ]; then
+  if [ "$DRY" = 1 ]; then exec python3 "$REPO/bin/wt.py" install-hooks --dry-run "$GITHOOKS"; fi
+  exec python3 "$REPO/bin/wt.py" install-hooks "$GITHOOKS"
+fi
 
 # A path under $HOME prints as ~/...: shorter, and the hook commands, which run in a shell,
 # still resolve if the home directory's absolute path changes.
