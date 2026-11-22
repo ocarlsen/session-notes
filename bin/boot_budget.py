@@ -179,6 +179,10 @@ def record_blind(path, exc, scope):
         reason = "%s: %s" % (type(exc).__name__, exc.strerror)
     else:
         reason = "%s: %s" % (type(exc).__name__, exc)
+    if scope not in ("global", "user settings"):
+        # one label per scope however the caller spelled it (~, trailing slash), so the
+        # (path, scope) key dedupes a file recorded by two readers into one BLIND line
+        scope = os.path.normpath(_tilde(scope))
     _BLIND.setdefault((str(path), scope), reason)
 
 
@@ -1254,6 +1258,19 @@ def selftest():
                 scope_report(str(widget_root))
             check([sc for _, sc, _ in blind_reads()] == [str(widget_root)],
                   "blind: scope_report records an unreadable scope file once, under its own scope")
+            for spelling in (str(widget_root) + "/", "~/" + os.path.relpath(str(widget_root), HOME)):
+                reload_config()
+                with deny_open("Widget/CLAUDE.md"):
+                    scope_report(spelling)
+                check([sc for _, sc, _ in blind_reads()] == [os.path.normpath(str(widget_root))],
+                      "blind: scope_report spelled %r still records ONE line" % spelling[-12:])
+            reload_config()
+            with deny_open("/CLAUDE.md"):
+                scope_report("~")
+            scopes = [sc for _, sc, _ in blind_reads()]
+            check(scopes and len(scopes) == len(set(blind_reads())) and "~" not in scopes
+                  and len([1 for pth, _, _ in blind_reads()]) == len({pth for pth, _, _ in blind_reads()}),
+                  "blind: the global scope given as ~ records each unreadable file once")
 
         # --- Regression guard: WARN_AT must stay reachable below TOTAL_LIMIT ---
         check(orig_warn < orig_total, "WARN_AT stays strictly below TOTAL_LIMIT in the real config")
