@@ -1,6 +1,6 @@
 # session-notes: the full toolkit
 
-The README covers the default install: three skills and three commands. This page is everything else in the repo, and the reference for the default pieces too. `sh install.sh --all` links all of it.
+The README covers the default install: three skills and four commands (`handoff_session`, `session_peers`, `bcast` and `wt`). This page is everything else in the repo, and the reference for the default pieces too. `sh install.sh --all` links all of it.
 
 ## The mental model
 

@@ -67,6 +67,12 @@ class RulesError(Exception):
     pass
 
 
+def split_lines(text):
+    """Lines with their endings, split on \\n only (str.splitlines also splits on U+2028,
+    form feed and others, which TOML and Markdown do not treat as line breaks)."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
 def tilde(path):
     home = os.path.expanduser("~")
     if path == home or path.startswith(home.rstrip(os.sep) + os.sep):
@@ -111,7 +117,7 @@ def render(repo=REPO, local=None):
     add = addendum_path(local)
     if add and os.path.exists(add):
         text = read_text(add)
-        if any(ln.rstrip("\r\n") in (BEGIN, END) for ln in text.splitlines()):
+        if any(ln.rstrip("\r\n") in (BEGIN, END) for ln in split_lines(text)):
             raise RulesError("%s contains a session-notes marker line; remove it" % tilde(add))
         parts += ["\n", ADDENDUM_HEADING + "\n\n", ensure_nl(text)]
     parts.append(END + "\n")
@@ -120,19 +126,19 @@ def render(repo=REPO, local=None):
 
 def snippet_headings(repo=REPO):
     text = read_text(os.path.join(repo, "AGENTS.snippet.md"))
-    return {ln for ln in text.splitlines() if ln.startswith("## ")}
+    return {ln.rstrip("\r\n") for ln in split_lines(text) if ln.startswith("## ")}
 
 
 def known_lines(repo=REPO):
     text = read_text(os.path.join(repo, "AGENTS.snippet.md"))
-    return {ln.strip() for ln in text.splitlines() if ln.strip()} | set(OLD_WORDING)
+    return {ln.strip() for ln in split_lines(text) if ln.strip()} | set(OLD_WORDING)
 
 
 def compute(old, block, headings, known=()):
     """The new file text. old is None for a missing file."""
     if old is None:
         return block
-    lines = old.splitlines(keepends=True)
+    lines = split_lines(old)
     bare = [ln.rstrip("\r\n") for ln in lines]
     nb, ne = bare.count(BEGIN), bare.count(END)
     if nb or ne:
@@ -146,10 +152,21 @@ def compute(old, block, headings, known=()):
     # A legacy section is its heading plus the lines after it that are known snippet wording
     # (blank lines too). It ends at the next `# ` or `## ` heading, or at the first line that is
     # not known wording: that line and everything after it belongs to the user.
+    def legacy_heading(i):
+        """A snippet heading is ours only if known wording follows (or nothing does): a heading
+        followed directly by the user's own text keeps its heading and body."""
+        if bare[i] not in headings:
+            return False
+        for j in range(i + 1, len(lines)):
+            t = bare[j].strip()
+            if t:
+                return _is_heading(bare[j]) or t in known
+        return True
+
     out, skipping, at = [], False, None
-    for ln, s in zip(lines, bare):
-        if s.startswith("# ") or s.startswith("## "):
-            skipping = s in headings
+    for i, (ln, s) in enumerate(zip(lines, bare)):
+        if _is_heading(s):
+            skipping = legacy_heading(i)
             if skipping:
                 if at is None:
                     at = len(out)
@@ -175,19 +192,40 @@ def compute(old, block, headings, known=()):
 
 def diff_text(path, old, new):
     return "".join(difflib.unified_diff(
-        (old or "").splitlines(keepends=True), new.splitlines(keepends=True),
+        split_lines(old or ""), split_lines(new),
         fromfile=path if old is not None else "/dev/null", tofile=path + " (new)"))
 
 
 def backup_path(path):
-    """PATH.bak-session-notes-YYYYmmdd-HHMMSS (local time), -1, -2 on a same-second clash;
-    never a name that exists."""
+    """PATH.bak-session-notes-YYYYmmdd-HHMMSS (local time); on a same-second clash the next
+    number after every existing one (-1, -2, ...), so a pruned name is never reused out of
+    order. Never a name that exists."""
     base = "%s%s-%s" % (path, BAK, time.strftime("%Y%m%d-%H%M%S"))
-    cand, n = base, 0
-    while os.path.exists(cand):
-        n += 1
-        cand = "%s-%d" % (base, n)
-    return cand
+    d, name = os.path.split(base)
+    top = -1
+    for other in os.listdir(d or "."):
+        if other == name:
+            top = max(top, 0)
+        elif other.startswith(name + "-") and other[len(name) + 1:].isdigit():
+            top = max(top, int(other[len(name) + 1:]))
+    return base if top < 0 else "%s-%d" % (base, top + 1)
+
+
+KEEP_BACKUPS = 3
+
+
+def prune_backups(path):
+    """Keep the newest KEEP_BACKUPS of this tool's own timestamped backups of PATH. Only names
+    of exactly that pattern are touched; install.sh's PATH.bak-session-notes never is."""
+    d, base = os.path.split(path)
+    pat = re.compile(r"^%s%s-(\d{8}-\d{6})(?:-(\d+))?$" % (re.escape(base), re.escape(BAK)))
+    found = []
+    for name in os.listdir(d or "."):
+        m = pat.match(name)
+        if m:
+            found.append(((m.group(1), int(m.group(2) or 0)), name))
+    for _, name in sorted(found)[:-KEEP_BACKUPS]:
+        os.unlink(os.path.join(d or ".", name))
 
 
 def write_with_backup(path, new, old):
@@ -197,6 +235,7 @@ def write_with_backup(path, new, old):
     if old is not None:
         bak = backup_path(path)
         shutil.copy2(target, bak)
+        prune_backups(path)
     d = os.path.dirname(target) or "."
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".rules_block.")
@@ -262,26 +301,77 @@ def claude_lines(repo=REPO, local=None):
     return [line for line, _ in claude_targets(repo, local)]
 
 
-def cmd_claude_apply(path, dry, repo=REPO, local=None):
-    """Add-only: appends the lines that are missing, never edits or removes an existing line."""
-    old = load_existing(path)
-    lines = (old or "").splitlines(keepends=True)
-    here = os.path.dirname(os.path.abspath(path))
-    imported = set()   # real files the existing @ lines point at, resolved the way Claude does
+def _fence_flags(lines):
+    """flags[i] is True for a line inside (or opening or closing) a ``` or ~~~ fenced block."""
+    flags, fence = [], None
     for ln in lines:
-        b = ln.strip()
+        body = ln.lstrip()
+        if fence is None:
+            if body.startswith("```") or body.startswith("~~~"):
+                fence = body[0] * 3
+                flags.append(True)
+                continue
+            flags.append(False)
+        else:
+            flags.append(True)
+            if body.startswith(fence):
+                fence = None
+    return flags
+
+
+def _is_heading(s):
+    return s.startswith("# ") or s.startswith("## ")
+
+
+def cmd_claude_apply(path, dry, repo=REPO, local=None):
+    """Adds the missing lines. Outside our own `## Standing rules` section it never edits or
+    removes a line; inside it, a stale line (our rules file, no longer on disk) is replaced."""
+    old = load_existing(path)
+    lines = split_lines(old or "")
+    here = os.path.dirname(os.path.abspath(path))
+    notes = []
+
+    def target_of(line):
+        b = line.strip()
         if b.startswith("@") and len(b) > 1:
             p = os.path.expanduser(b[1:])
-            imported.add(os.path.realpath(p if os.path.isabs(p) else os.path.join(here, p)))
+            return p if os.path.isabs(p) else os.path.join(here, p)
+        return None
+
+    # Stale lines inside our section: ours (they name our rules files) and dangling.
+    fenced = _fence_flags(lines)
+    bare = [ln.rstrip("\r\n") for ln in lines]
+    heads = [i for i, b in enumerate(bare) if b == CLAUDE_HEADING and not fenced[i]]
+    if heads:
+        end = next((i for i in range(heads[0] + 1, len(lines))
+                    if not fenced[i] and _is_heading(bare[i])), len(lines))
+        drop = []
+        for i in range(heads[0] + 1, end):
+            t = target_of(lines[i])
+            if (t and not fenced[i] and t.endswith((CORE, REVIEW)) and not os.path.exists(t)):
+                notes.append("removed stale line %s (that file is gone)" % lines[i].strip())
+                drop.append(i)
+        lines = [ln for i, ln in enumerate(lines) if i not in drop]
+    fenced = _fence_flags(lines)
+    imported = set()   # real files the existing @ lines point at, resolved the way Claude does
+    for i, ln in enumerate(lines):
+        t = target_of(ln)
+        if t and not fenced[i]:
+            imported.add(os.path.realpath(t))
     missing = [line for line, target in claude_targets(repo, local)
                if os.path.realpath(target) not in imported]
-    if not missing:
+    if not missing and not notes:
         print("unchanged: %s" % tilde(path))
         return 0
+    for n in notes:
+        print(n)
     bare = [ln.rstrip("\r\n") for ln in lines]
-    if CLAUDE_HEADING in bare:
-        i = bare.index(CLAUDE_HEADING) + 1
-        while i < len(lines) and not bare[i].startswith("## "):
+    heads = [i for i, b in enumerate(bare) if b == CLAUDE_HEADING and not fenced[i]]
+    if not missing:
+        new = "".join(lines)
+    elif heads:
+        i = heads[0] + 1
+        while i < len(lines) and not (not fenced[i] and bare[i].startswith("## ")):
             i += 1
         while i > 0 and not bare[i - 1].strip():
             i -= 1   # after the section's last non-blank line
@@ -290,7 +380,7 @@ def cmd_claude_apply(path, dry, repo=REPO, local=None):
             head[-1] += "\n"
         new = "".join(head) + "".join(m + "\n" for m in missing) + "".join(lines[i:])
     else:
-        text = ensure_nl("".join(lines)) if old else ""
+        text = ensure_nl("".join(lines)) if lines else ""
         if text.strip():
             text += "\n"
         new = text + CLAUDE_HEADING + "\n" + "".join(m + "\n" for m in missing)
@@ -298,6 +388,15 @@ def cmd_claude_apply(path, dry, repo=REPO, local=None):
 
 
 _KEY_RE = re.compile(r"""^(?:([A-Za-z0-9_-]+)|"([^"\\]*)"|'([^']*)')\s*(?:=|\.)""")
+
+
+def _quote_run(ln, i, q):
+    # Length of the closing delimiter at i: three quotes, plus up to two more that belong to
+    # the string's content (a string x" closes as x followed by four quote characters).
+    n = 0
+    while i + n < len(ln) and ln[i + n] == q:
+        n += 1
+    return n if n >= 3 else 3
 
 
 def scan_toml(lines):
@@ -323,12 +422,12 @@ def scan_toml(lines):
                 if c == "\\":
                     i += 2
                 elif ln.startswith('"""', i):
-                    state, i = None, i + 3
+                    state, i = None, i + _quote_run(ln, i, '"')
                 else:
                     i += 1
             elif state == "'''":
                 if ln.startswith("'''", i):
-                    state, i = None, i + 3
+                    state, i = None, i + _quote_run(ln, i, "'")
                 else:
                     i += 1
             elif c == "#":
@@ -366,7 +465,7 @@ def scan_toml(lines):
 def codex_defaults(old):
     """config.toml text with top-level model + model_reasoning_effort added if unset.
     Top-level keys must come before the first [table] line."""
-    lines = (old or "").splitlines(keepends=True)
+    lines = split_lines(old or "")
     first, keys, clean = scan_toml(lines)
     add = [ln for key, ln in (
         ("model", 'model = "%s"\n' % DEFAULT_MODEL),
@@ -409,7 +508,7 @@ def cmd_codex_defaults(path, dry):
     old = load_existing(path)
     new = codex_defaults(old)
     if new is not None and new != old:
-        _, before, _ = scan_toml((old or "").splitlines(keepends=True))
+        _, before, _ = scan_toml(split_lines(old or ""))
         validate_defaults(new, {k for k in ("model", "model_reasoning_effort") if k not in before})
     return finish(path, old, new if new is not None else old, dry, "set defaults in")
 
@@ -776,6 +875,84 @@ def selftest():
                     sys.modules.pop("tomllib", None)
                 else:
                     sys.modules["tomllib"] = saved
+
+        # R2: up to two quotes before a closing delimiter, and no splitting on U+2028
+        q4 = defaults_of('b = """x""""\n[tui]\nx = 1\n')
+        check("scanner: a string ending in a quote before the closing triple quote",
+              q4.index("model =") < q4.index("[tui]") and q4.index("model =") > q4.index('x""""'))
+        q5 = defaults_of("c = '''y'''''\n[tui]\nx = 1\n")
+        check("scanner: same for ''' with two quotes of content",
+              q5.index("model =") < q5.index("[tui]") and q5.index("model =") > q5.index("y'''''"))
+        ls = defaults_of('s = "a' + chr(0x2028) + 'b"\n[tui]\nx = 1\n')
+        check("scanner: U+2028 inside a string is not a line break",
+              ("a" + chr(0x2028) + "b") in ls and ls.index("model =") < ls.index("[tui]")
+              and ls.index("model =") > ls.index("b\""))
+        ls2 = defaults_of('s = """a' + chr(0x2028) + '[fake]\n"""\n[tui]\n')
+        check("scanner: U+2028 then [fake] inside a multi-line string stays in the string",
+              ls2.index("model =") > ls2.index('[fake]') + 12 and ls2.index("model =") < ls2.index("[tui]"))
+
+        # F1: a dangling line of ours inside our section is replaced; outside it, never touched
+        gone = os.path.join(tmp, "gone-worktree", "rules", "core.md")
+        stale = "@" + gone
+        open(cm, "w").write("# mine\n" + stale + "\n\n" + CLAUDE_HEADING + "\n" + stale + "\n\n## Other\nz\n")
+        rc, out = quiet(lambda: cmd_claude_apply(cm, False, repo, local))
+        text = open(cm).read()
+        check("claude-apply removes a dangling rules line inside our section and says so",
+              "removed stale line" in out and text.count(stale) == 1
+              and text.startswith("# mine\n" + stale + "\n")
+              and text.index("rules/core.md", text.index(CLAUDE_HEADING)) < text.index("## Other")
+              and text.endswith("## Other\nz\n") and "review-contract.md" in text)
+        rc, out = quiet(lambda: cmd_claude_apply(cm, False, repo, local))
+        check("claude-apply stale cleanup is idempotent", "unchanged" in out)
+        # an existing user file in our section is never removed
+        mine2 = os.path.join(tmp, "elsewhere2", "rules")
+        os.makedirs(mine2)
+        open(os.path.join(mine2, "core.md"), "w").write("x\n")
+        open(cm, "w").write(CLAUDE_HEADING + "\n@" + os.path.join(mine2, "core.md") + "\n")
+        quiet(lambda: cmd_claude_apply(cm, False, repo, local))
+        check("claude-apply keeps an existing-file line inside our section",
+              ("@" + os.path.join(mine2, "core.md")) in open(cm).read())
+
+        # F2: an @ line inside a fenced block is not an import
+        fenced_core = "@" + os.path.join(repo, "rules", "core.md")
+        for fence in ("```", "~~~"):
+            open(cm, "w").write("# doc\n" + fence + "\n" + fenced_core + "\n" + fence + "\n")
+            rc, out = quiet(lambda: cmd_claude_apply(cm, False, repo, local))
+            text = open(cm).read()
+            check("claude-apply: an @ line inside a %s fence does not count" % fence,
+                  text.startswith("# doc\n" + fence + "\n" + fenced_core + "\n" + fence + "\n")
+                  and text.count("rules/core.md") == 2 and CLAUDE_HEADING in text)
+
+        # R4: only the newest 3 of the tool's own backups are kept
+        pr = os.path.join(tmp, "PRUNE.md")
+        lookalike = pr + BAK + "-old"
+        install_bak = pr + BAK
+        open(lookalike, "w").write("keep\n")
+        open(install_bak, "w").write("keep\n")
+        for k in range(6):
+            open(pr, "w").write("v%d\n" % k)
+            apply(path=pr)
+        mine_baks = baks(pr)
+        mine_baks = [b for b in mine_baks if b != lookalike]
+        check("prune: exactly 3 timestamped backups remain, the newest ones",
+              len(mine_baks) == 3 and sorted(open(b).read() for b in mine_baks) == ["v3\n", "v4\n", "v5\n"])
+        check("prune: install.sh's backup and a lookalike name are never touched",
+              open(lookalike).read() == "keep\n" and open(install_bak).read() == "keep\n")
+
+        # R5: a snippet heading followed directly by the user's own text stays, body and all
+        mine3 = "## Codex and other sessions\n- my own notes on codex\n"
+        open(agents, "w").write(mine3)
+        apply()
+        text = open(agents).read()
+        check("legacy R5: heading with the user's own body is kept in place",
+              text.startswith(mine3) and text.count("- my own notes on codex") == 1
+              and text.count(BEGIN) == 1)
+        open(agents, "w").write("## Codex and other sessions\n\n## Uploads\nmine\n")
+        apply()
+        text = open(agents).read()
+        check("legacy R5: an empty snippet section is removed",
+              text.startswith(BEGIN) and text.endswith(END + "\n\n## Uploads\nmine\n")
+              and text.count("## Codex and other sessions") == 1)
 
         # profiles
         cd = os.path.join(tmp, "codexdir")

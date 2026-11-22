@@ -32,8 +32,9 @@ followed by the findings. The sha is the PR head commit the reviewer read.
 `wt merge` refuses unless the NEWEST verdict comment posted by the configured GitHub account is
 APPROVE and its sha equals the PR's current head sha. So any push after an approval needs a fresh
 review (a sha cannot be backdated the way a commit time can), and a verdict from any other account
-is ignored (on a public repo anyone can comment). The marker strings are defined once, in
-`bin/wt.py`; this file quotes them.
+is ignored (on a public repo anyone can comment). A verdict comment that was edited after it was
+posted is refused too: post a new comment instead of editing one. The marker strings are defined
+once, in `bin/wt.py`; this file quotes them.
 
 ## Fix rounds
 - CHANGES goes back to the builder with the quoted findings. At most 2 fix rounds.
