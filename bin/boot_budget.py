@@ -281,9 +281,9 @@ def _display(path):
     return path
 
 
-def char_count(path):
-    """Chars in the file; 0 when absent (silent) or unreadable (recorded as blind)."""
-    text = read_text_or_blind(path, "global")
+def char_count(path, scope="global"):
+    """Chars in the file; 0 when absent (silent) or unreadable (recorded as blind for `scope`)."""
+    text = read_text_or_blind(path, scope)
     return 0 if text is None else len(text)
 
 
@@ -492,7 +492,7 @@ def scope_report(root):
     for f in files:
         if not os.path.isfile(f):
             continue
-        chars = char_count(f)
+        chars = char_count(f, root)
         budget = budget_for(f)
         doubled = bool(auto_on and native_rp and os.path.realpath(f) == native_rp)
         entries.append({"path": f, "chars": chars, "budget": budget, "doubled": doubled})
@@ -1248,6 +1248,12 @@ def selftest():
             reload_config()
             check(char_count(str(widget_root / "absent.md")) == 0 and blind_reads() == [],
                   "blind: char_count on an absent file is 0 and silent")
+            # scope_report: an unreadable scope CLAUDE.md is blind for THAT scope only, one line
+            reload_config()
+            with deny_open("Widget/CLAUDE.md"):
+                scope_report(str(widget_root))
+            check([sc for _, sc, _ in blind_reads()] == [str(widget_root)],
+                  "blind: scope_report records an unreadable scope file once, under its own scope")
 
         # --- Regression guard: WARN_AT must stay reachable below TOTAL_LIMIT ---
         check(orig_warn < orig_total, "WARN_AT stays strictly below TOTAL_LIMIT in the real config")

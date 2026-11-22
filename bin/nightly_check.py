@@ -213,6 +213,8 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
     found = [(a, n, f) for a, n, st, f in rows if st == "findings"]
     if rc == 0 and not found:
         return ""
+    if not found:
+        return "Memory checks (%s): findings reported; run nightly_check.py for the report" % day
     total = sum(f for _, _, f in found)
     return ("Memory checks (%s): %d findings (%s); run nightly_check.py for the report"
             % (day, total, ", ".join("%s %s %d" % x for x in found)))
@@ -364,6 +366,9 @@ def selftest():
         clean = [{"agent": "claude", "check": "boot_budget", "status": "clean", "findings": 0}]
         check("status: clean and fresh prints nothing",
               status_line(rec(0, clean), 8, later) == "")
+        check("status: rc 3 with no finding rows is a findings line, never '0 findings ()'",
+              status_line(rec(3, clean), 8, later).startswith("Memory checks (")
+              and "0 findings" not in status_line(rec(3, clean), 8, later))
         line = status_line(rec(3, [
             {"agent": "claude", "check": "memory_hygiene_canary", "status": "findings", "findings": 2},
             {"agent": "codex", "check": "memory_hygiene_canary", "status": "findings", "findings": 1}]),
