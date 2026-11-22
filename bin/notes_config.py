@@ -104,6 +104,12 @@ DEFAULTS = {
         # `--no-build` omits it.
         "build_note": "",
     },
+    "rules": {
+        # A private addendum to rules/core.md. rules_block.py appends it to the Codex
+        # AGENTS.md block and adds an @import for it to CLAUDE.md. A missing file is
+        # normal; an unreadable one is an error. Empty = no addendum.
+        "local": "~/.config/session-notes/rules.local.md",
+    },
     "budgets": {
         # Boot-prefix budgets, in bytes, checked by boot_budget.py.
         "global_index_bytes": 45000,
@@ -346,6 +352,9 @@ def _resolve(cfg, base=None, env=None):
     w["root"] = _abs(w["root"], base) if w["root"].strip() else ""
     w["public_repos"] = [_abs(x, base) for x in w["public_repos"]]
     w["leak_terms"] = _abs(w["leak_terms"], base)
+    # Empty means no addendum, like handoff.build_note.
+    local = cfg["rules"]["local"]
+    cfg["rules"]["local"] = _abs(local, base) if local.strip() else ""
     files = []
     for i, b in enumerate(cfg["budget_file"]):
         if not isinstance(b, dict) or set(b) != {"path", "bytes"}:
