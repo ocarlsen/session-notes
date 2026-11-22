@@ -109,13 +109,17 @@ CLI, or Settings > Hooks in the desktop app, after every install that changed so
 
 **Moving or removing a checkout.** hooks.json does not name a checkout, so its bytes are the
 same whichever checkout installs: run `install.sh --codex` from the checkout that stays and
-only the launcher is rewritten. Codex sees no change to any hook, so nothing needs trusting
-again. (A running Codex session needs no restart either: the launcher is read on each hook
-run.) Until you do, a missing checkout is survivable: an informational hook prints one
-warning line and passes, so prompts keep working, and a guard hook (`em_dash_guard`) fails
-closed with exit 2, which blocks only that tool call. `codex_hooks.py merge` warns about
-any entry, ours or not, whose script or launcher is missing, or whose launcher's checkout
-lacks the script.
+the launcher is rewritten and hooks.json is unchanged, so no hook needs trusting again. (A
+running Codex session needs no restart either: the launcher is read on each hook run.) The
+other things the installer writes still point at the checkout they were installed from: the
+skill links, the `SESSION_NOTES` value in config.toml and the lines in `rules/default.rules`.
+A later change moves them to the launcher; until then, fix them by hand when you move a
+checkout. Until you reinstall, a missing checkout is survivable: an informational hook prints
+one warning line and passes, so prompts keep working. A guard hook fails closed with exit 2.
+For a PreToolUse guard (`checkout_guard`, once registered) that blocks the tool call. For
+`em_dash_guard`, which is PostToolUse, the edit has already happened, and the model is told
+the check did not run. `codex_hooks.py merge` warns about any entry, ours or not, whose script
+or launcher is missing, or whose launcher's checkout lacks the script.
 
 ## Sessions and the bus
 

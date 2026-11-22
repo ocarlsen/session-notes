@@ -22,10 +22,9 @@ above that cap.
 Silent when there is nothing to load (the start-empty case), and never fails the
 session: any error exits 0 with no output and leaves a trace in <state_dir>/errors/.
 
-Install (hooks.json; install.sh --codex prints it):
-  "SessionStart": [{"matcher": "startup|resume|compact", "hooks": [{"type": "command",
-    "command": "SESSION_NOTES_AGENT=codex python3 <repo>/hooks/codex_session_start.py",
-    "additionalContextLimit": 4000}]}]
+Install: `install.sh --codex` registers it in hooks.json through the launcher it writes,
+as `SESSION_NOTES_AGENT=codex <launcher> hook codex_session_start` (SessionStart, matcher
+startup|resume|compact, additionalContextLimit 4000).
 """
 import json
 import os

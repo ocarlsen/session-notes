@@ -16,9 +16,10 @@ generated launcher, `$HOME/.local/bin/session-notes` by default:
 0755). Rewriting it with the same checkout is a no-op; a file at the path that lacks the
 script's marker line is refused untouched. `session-notes hook <name>` runs
 `<repo>/hooks/<name>.py` with stdin, environment and arguments passed through. When the repo
-or the script is missing, the guard hooks (GUARDS below) fail closed with exit 2, which
-blocks only that tool call; every other hook prints one warning line and exits 0 so prompts
-keep working. `session-notes repo` prints the baked path.
+or the script is missing, the guard hooks (GUARDS below) fail closed with exit 2; every other hook
+prints one warning line and exits 0 so prompts keep working. For a PreToolUse guard
+(checkout_guard, once registered) exit 2 blocks the tool call. em_dash_guard is PostToolUse:
+the edit has already happened, and the model is told the check did not run. `session-notes repo` prints the baked path.
 
 `merge` is a refresh, not a one-shot write: it replaces only session-notes entries and
 leaves every other entry and event exactly as it was (a user may keep private hooks in the
@@ -132,26 +133,42 @@ def owned(hook):
                for t in toks)
 
 
-def worktree_problem(repo):
-    """None when `repo` may be installed from; else the refusal message. A linked git
-    worktree is refused. Not a git repo, or git unavailable, is allowed."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+def _git_dirs(repo, env, flag):
+    """(git_dir, common_dir) as absolute paths, or None. With flag, git < 2.31 does not know
+    --path-format and echoes it as the first output line, so accept only two absolute paths;
+    without it the paths may be relative to `repo`."""
+    argv = ["git", "-C", repo, "rev-parse"] + (["--path-format=absolute"] if flag else []) \
+        + ["--git-dir", "--git-common-dir"]
     try:
-        r = subprocess.run(["git", "-C", repo, "rev-parse", "--path-format=absolute",
-                            "--git-dir", "--git-common-dir"],
-                           capture_output=True, text=True, env=env, timeout=30)
+        r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     lines = r.stdout.splitlines()
     if r.returncode != 0 or len(lines) < 2:
         return None
-    git_dir, common = (os.path.realpath(x) for x in lines[:2])
+    lines = lines[:2]
+    if flag:
+        return tuple(lines) if all(os.path.isabs(x) for x in lines) else None
+    return tuple(os.path.join(repo, x) for x in lines)
+
+
+def worktree_problem(repo):
+    """None when `repo` may be installed from; else the refusal message. A linked git
+    worktree is refused. Not a git repo, or git unavailable, is allowed."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    dirs = _git_dirs(repo, env, True) or _git_dirs(repo, env, False)
+    if dirs is None:
+        return None
+    git_dir, common = (os.path.realpath(x) for x in dirs)
     if git_dir == common:
         return None
-    main = os.path.dirname(common) if os.path.basename(common) == ".git" else None
-    return ("codex_hooks: %s is a linked git worktree; install from the main checkout%s "
+    if os.path.basename(common) != ".git":
+        return ("codex_hooks: %s is a linked worktree of a bare repository; install from a "
+                "clone that is not a worktree (a worktree is deleted when its change merges, "
+                "and the hooks would point at it)" % repo)
+    return ("codex_hooks: %s is a linked git worktree; install from the main checkout (%s) "
             "(a worktree is deleted when its change merges, and the hooks would point at it)"
-            % (repo, " (%s)" % main if main else ""))
+            % (repo, os.path.dirname(common)))
 
 
 def render_launcher(repo):
@@ -349,6 +366,21 @@ def missing_scripts(path):
     return out
 
 
+def missing_warning(path, cmd):
+    """The warning for one entry missing_scripts() reported. A launcher-form hook whose
+    launcher exists is skipped with a warning (info) or fails closed (guard); anything else
+    is a command the shell cannot run, which Codex treats as a failed hook."""
+    lh = _launcher_hook(_split(cmd))
+    if lh and _baked_repo(lh[0]) is not None:
+        if lh[1] in GUARDS:
+            return ("codex_hooks: WARNING: %s: guard hook %s will fail closed (exit 2) because "
+                    "its script is missing from the checkout: %s" % (path, lh[1], cmd))
+        return ("codex_hooks: WARNING: %s: hook %s will be skipped with a warning because its "
+                "script is missing from the checkout: %s" % (path, lh[1], cmd))
+    return ("codex_hooks: WARNING: %s runs a missing file; Codex blocks every prompt "
+            "until it is fixed: %s" % (path, cmd))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -404,8 +436,7 @@ def main(argv=None):
         if not os.path.exists(os.path.join(repo, "hooks", name)):
             print("codex_hooks: WARNING: %s has no hooks/%s" % (repo, name), file=sys.stderr)
     for cmd in missing_scripts(a.file):
-        print("codex_hooks: WARNING: %s runs a missing file; Codex blocks every prompt "
-              "until it is fixed: %s" % (a.file, cmd), file=sys.stderr)
+        print(missing_warning(a.file, cmd), file=sys.stderr)
     return 0
 
 
@@ -701,6 +732,17 @@ def selftest():
                                       new("info_hook", gone_launcher),
                                       new("info_hook", os.path.join(tmp, "no-launcher", "session-notes"))])
 
+        em_cmd = new("em_dash_guard", lpath)
+        check("missing warning: a launcher-form info hook is skipped with a warning",
+              "will be skipped with a warning" in missing_warning(hj, new("nope_hook", lpath))
+              and "blocks every prompt" not in missing_warning(hj, new("nope_hook", lpath)))
+        check("missing warning: a launcher-form guard hook fails closed",
+              not os.path.exists(os.path.join(lrepo, "hooks", "em_dash_guard.py"))
+              and "will fail closed" in missing_warning(hj, em_cmd)
+              and "blocks every prompt" not in missing_warning(hj, em_cmd))
+        check("missing warning: an old-form entry keeps the old wording",
+              "Codex blocks every prompt" in missing_warning(hj, "python3 /x/private_d.py hook"))
+
         # a linked worktree is refused by merge, launcher and check-repo; main checkout and
         # a plain directory are accepted. Real git, GIT_* stripped.
         grepo = os.path.join(tmp, "gitrepo")
@@ -735,6 +777,31 @@ def selftest():
         check("worktree: the main checkout of the same repo is accepted",
               quiet(["launcher", "--repo", grepo, "--path", wl]) == 0 and os.path.exists(wl)
               and quiet(["merge", "--repo", grepo, "--file", wf, "--launcher", wl]) == 0)
+        # git < 2.31 echoes the unknown --path-format flag as its first output line: a fake
+        # git on PATH simulates it. A main checkout is still accepted, a worktree refused.
+        oldgit = os.path.join(tmp, "oldgit")
+        os.makedirs(oldgit)
+        with open(os.path.join(oldgit, "git"), "w") as fh:
+            fh.write('#!/bin/sh\nreal=%s\nfor a in "$@"; do\n  if [ "$a" = --path-format=absolute ]; then\n'
+                     '    echo "$a"\n    set -- $(for b in "$@"; do [ "$b" = "$a" ] || printf "%%s " "$b"; done)\n'
+                     '    break\n  fi\ndone\nexec "$real" "$@"\n' % shlex.quote(shutil.which("git")))
+        os.chmod(os.path.join(oldgit, "git"), 0o755)
+        saved_path = os.environ["PATH"]
+        os.environ["PATH"] = oldgit + os.pathsep + saved_path
+        try:
+            check("worktree: git < 2.31 (flag echoed): main checkout accepted, worktree refused",
+                  worktree_problem(grepo) is None and worktree_problem(gwt) is not None)
+        finally:
+            os.environ["PATH"] = saved_path
+        # a bare repository's linked worktree has no main checkout to name
+        bare = os.path.join(tmp, "bare.git")
+        git(tmp, "clone", "-q", "--bare", grepo, bare)
+        bwt = os.path.join(tmp, "barewt")
+        git(bare, "worktree", "add", "-q", "-b", "bside", bwt)
+        bmsg = worktree_problem(bwt) or ""
+        check("worktree: a bare repository's worktree says so and names no main checkout",
+              "linked worktree of a bare repository" in bmsg and "not a worktree" in bmsg
+              and "from the main checkout" not in bmsg)
         check("worktree: a plain non-git directory is accepted",
               quiet(["check-repo", "--repo", plain]) == 0)
         check("worktree: a path that does not exist is accepted",
@@ -754,13 +821,19 @@ def selftest():
         with open(os.path.join(stubdir, "codex"), "w") as fh:
             fh.write('#!/bin/sh\necho "$@" >> "%s"\nexit 9\n' % calls_log)
         os.chmod(os.path.join(stubdir, "codex"), 0o755)
+        # install.sh offers LaunchAgents on macOS and launch_agents.py runs `launchctl load -w`.
+        # launchd is not sandboxed by a temp HOME, so a stub first on PATH takes every call.
+        lc_log = os.path.join(tmp, "launchctl-called")
+        with open(os.path.join(stubdir, "launchctl"), "w") as fh:
+            fh.write('#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' % lc_log)
+        os.chmod(os.path.join(stubdir, "launchctl"), 0o755)
 
         def install_env(home, ch):
             return dict(clean_env, HOME=home, CODEX_HOME=ch,
                         PATH=stubdir + os.pathsep + os.environ["PATH"])
 
-        def run_install(*extra, home_hooks=None, root=copy):
-            home = os.path.join(tmp, "home")
+        def run_install(*extra, home_hooks=None, root=copy, homename="home"):
+            home = os.path.join(tmp, homename)
             ch = os.path.join(home, ".codex")
             os.makedirs(ch, exist_ok=True)
             hj = os.path.join(ch, "hooks.json")
@@ -793,6 +866,40 @@ def selftest():
               and ("%s hook codex_session_start" % lp) in open(hj).read()
               and ("REPO=%s" % shlex.quote(copy)) in open(lp).read())
         check("install --codex --yes: nothing missing, no warning", "WARNING" not in r.stderr)
+        lc_calls = open(lc_log).read().splitlines() if os.path.exists(lc_log) else []
+        lc_paths = [w for line in lc_calls for w in line.split() if w.endswith(".plist")]
+        check("install --codex --yes: launchctl went to the stub, every plist under the temp HOME",
+              (len(lc_calls) == 2 if sys.platform == "darwin" else not lc_calls)
+              and all(c.startswith("load -w ") for c in lc_calls)
+              and all(x.startswith(os.path.join(home, "Library", "LaunchAgents") + os.sep)
+                      for x in lc_paths) and len(lc_paths) == len(lc_calls))
+        hj_first = open(hj).read()
+        r, hj = run_install("--yes")
+        check("install --codex --yes again: the launcher is current, not shown or asked, hooks.json refreshed",
+              "The launcher is current." in r.stdout and "#!/bin/sh" not in r.stdout
+              and "Write it?" not in r.stdout and "Hooks step skipped" not in r.stdout
+              and os.path.isfile(hj) and open(hj).read() == hj_first)
+        # a launcher path that holds a file that is not ours: refused, so the hooks step is skipped
+        os.makedirs(os.path.join(tmp, "home3", ".local", "bin"))
+        with open(os.path.join(tmp, "home3", ".local", "bin", "session-notes"), "w") as fh:
+            fh.write("#!/bin/sh\necho mine\n")
+        r, hj = run_install("--yes", homename="home3")
+        check("install --codex --yes: a foreign file at the launcher path skips the hooks step",
+              "Hooks step skipped: no launcher" in r.stdout and not os.path.exists(hj)
+              and open(os.path.join(tmp, "home3", ".local", "bin", "session-notes")).read()
+              == "#!/bin/sh\necho mine\n")
+        # a launcher write that fails after the dry run passed (read-only bin dir)
+        bindir = os.path.join(tmp, "home2", ".local", "bin")
+        os.makedirs(bindir)
+        os.chmod(bindir, 0o555)
+        try:
+            if os.geteuid() != 0:
+                r, hj = run_install("--yes", homename="home2")
+                check("install --codex --yes: a failed launcher write skips the hooks step",
+                      "Hooks step skipped: no launcher" in r.stdout and not os.path.exists(hj)
+                      and not os.path.exists(os.path.join(bindir, "session-notes")))
+        finally:
+            os.chmod(bindir, 0o755)
 
         # install.sh --codex from a linked worktree: refused before any step or prompt
         irepo = os.path.join(tmp, "irepo")
@@ -819,6 +926,10 @@ def selftest():
                            env=install_env(ihome, ich), timeout=120)
         check("install --codex from the main checkout of that repo: not refused",
               "linked git worktree" not in r.stderr and "Codex skills to link" in r.stdout)
+        lc_all = open(lc_log).read().splitlines() if os.path.exists(lc_log) else []
+        check("install --codex: no install run reached launchctl outside the stub's log of temp-HOME plists",
+              all(("%s" % os.sep) + "Library" + os.sep + "LaunchAgents" + os.sep in c and tmp in c
+                  for c in lc_all))
 
         # an older file that registers the pane registry on UserPromptSubmit and Stop is cleaned
         reg_cmd = lambda r: oldpre + r + "/hooks/session_pane_registry.py"

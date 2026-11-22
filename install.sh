@@ -202,12 +202,17 @@ TOML
   if [ "$DRY" = 1 ]; then
     ch launcher --repo "$REPO" --path "$LAUNCHER" --dry-run || LAUNCHER_OK=0
   elif [ "$ASK" = 1 ]; then
-    if ch launcher --repo "$REPO" --path "$LAUNCHER" --dry-run; then
-      if ask "Write it?"; then
-        ch launcher --repo "$REPO" --path "$LAUNCHER" | tail -n 1
-      else
-        echo "Skipped the launcher."; LAUNCHER_OK=0
-      fi
+    if PLAN=$(ch launcher --repo "$REPO" --path "$LAUNCHER" --dry-run); then
+      case $(printf '%s\n' "$PLAN" | tail -n 1) in
+        *"(unchanged)") echo "The launcher is current." ;;
+        *)
+          printf '%s\n' "$PLAN"
+          if ask "Write it?"; then
+            ch launcher --repo "$REPO" --path "$LAUNCHER" || LAUNCHER_OK=0
+          else
+            echo "Skipped the launcher."; LAUNCHER_OK=0
+          fi ;;
+      esac
     else
       LAUNCHER_OK=0
     fi
