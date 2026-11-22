@@ -150,10 +150,10 @@ it reuses `wt.py`'s GitHub access (`[wt].token_command`, `$WT_GH`) and its verdi
 
 | Command | What it does |
 | --- | --- |
-| `review.py prepare <PR>` | Fetches the PR's head sha, title, body and diff, runs the test-edit check on the diff, and writes `prompt.md` and `meta.json` under `<state_dir>/review/<owner>-<repo>-<PR>/`. The prompt has the test-edit output first, then the contract, the PR title and body as the spec, the repo path and head sha, the diff (a file beside the prompt when over about 200 KB), and the reviewer's instructions. Prints the prompt path, the head sha and the review round; warns, without failing, when the contract's 2 fix rounds are already used. |
-| `review.py post <PR> APPROVE\|CHANGES --body-file F [--dry-run]` | Posts the reviewer's reply as `Review verdict: <V> <sha>` plus the body. Refuses when `prepare` was never run, when the PR head moved since `prepare` (exit 4), when the body is empty, or when the body's final `VERDICT: X` line disagrees with the argument. `--dry-run` posts nothing. After a post it calls `on_verdict_posted`, which records a short note through `bin/live.py` when that file exists and does nothing otherwise. |
+| `review.py prepare <PR>` | Fetches the PR's head sha, title, body and diff, runs the test-edit check on the diff, and writes `prompt.md` and `meta.json` under `<state_dir>/review/<owner>-<repo>-<PR>/`. The prompt has the test-edit output first, then the contract, the PR title and body as the spec, the repo path and head sha, the diff (a file beside the prompt when over about 200 KB), and the reviewer's instructions. Prints the prompt path, the head sha and the review round; says so, without failing, when this is the last review the contract's 2 fix rounds allow or the limit is passed. |
+| `review.py post <PR> APPROVE\|CHANGES --body-file F [--dry-run]` | Posts the reviewer's reply as `Review verdict: <V> <sha>` plus the body. Refuses when `prepare` was never run, when the PR head moved since `prepare` (exit 4), when the body is empty, when its last non-empty line is not exactly `VERDICT: APPROVE` or `VERDICT: CHANGES`, or when that line disagrees with the argument. A CHANGES that brings the account's CHANGES verdicts past 2 prints a stop-and-report line. `--dry-run` posts nothing. After a post it calls `on_verdict_posted`, which records a short note through `bin/live.py` when that file exists and does nothing otherwise. |
 
-Exit codes: 1 usage, fatal or a refusal, 3 token command failed, 4 the head moved since `prepare`.
+Exit codes: 1 fatal or a refusal, 2 usage error (argparse) or selftest failure, 3 token command failed, 4 the head moved since `prepare`.
 The `/review` skill (and `$review` in Codex) is the procedure: checks and rebase, `prepare`, a
 reviewer sub-agent at high effort, `post`, then `wt merge`.
 
@@ -161,8 +161,10 @@ reviewer sub-agent at high effort, `post`, then `wt merge`.
 removed or changed line in a test, fixture or guard file, every deleted test file, and every
 removed assertion in any Python file. Test-shaped files are the built-in path rules (`tests/`,
 `test_*.py`, `*_test.py`, `*.spec.ts`, `fixtures/`, `evals/`, canary and leak-term names) plus
-the fnmatch globs in `[review].test_globs`. It only reports: exit 0 with or without hits, 1 for a
-usage error or a malformed config value (the message names the key).
+the fnmatch globs in `[review].test_globs`. It also reports a test file that was renamed (even to a
+non-test path), a changed binary fixture, and removed lines inside a multi-line `check(` call (a
+heuristic that counts parentheses within the hunk). It only reports: exit 0 with or without hits,
+1 for a malformed config value (the message names the key), 2 for a usage error.
 
 **Ignored files go too.** `rm`, `gc` and `merge` remove the worktree directory, including
 gitignored files in it (a local `.env`, build output). Copy out anything you want to keep first.

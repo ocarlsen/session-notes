@@ -1,6 +1,6 @@
 ---
 name: review
-description: Run the contract review on a pull request: a fresh-context reviewer tries to refute the change, and its verdict is posted on the PR so `wt merge` can read it. Use when the user says "review PR N", "/review <PR>", or "run the review on this PR".
+description: "Run the contract review on a pull request: a fresh-context reviewer tries to refute the change, and its verdict is posted on the PR so `wt merge` can read it. Use when the user says 'review PR N', '/review <PR>', or 'run the review on this PR'."
 ---
 
 # /review: refute a PR, record the verdict
@@ -28,14 +28,16 @@ It prints the prompt path, the head sha and the review round. The prompt has the
 output first, then the contract, the PR title and body as the spec, the repo path and sha, the
 diff, and the reviewer's instructions.
 
-If it prints `LIMIT REACHED`, the contract's 2 fix rounds are used: stop and report to the user
-instead of starting another round.
+If it prints `LAST REVIEW`, both fix rounds are used and this is the last review the contract
+allows. If it prints `LIMIT REACHED`, stop and report to the user instead of starting another
+round. `post CHANGES` prints the same stop line when it brings the CHANGES count past the limit.
 
 ## Step 3: spawn the reviewer
 
 Use the Agent tool with the reviewer model from the rules model map (`rules/core.md`: Fable) and
-`effort` set explicitly to `high` on the call. The prompt is the content of the prompt file and
-nothing else: no summary of the change, no "this looks done", no builder transcript.
+`effort` set explicitly to `high` on the call. The prompt is one instruction: read the whole
+prompt file, giving its path (real prompts are too large to paste), and follow it. Add nothing
+else: no summary of the change, no "this looks done", no builder transcript.
 
 ## Step 4: post exactly what the reviewer returned
 

@@ -25,10 +25,12 @@ be an older version without the Codex code. If neither works, stop and say so.
    - Step 3 (the reviewer): spawn a native `spawn_agent` child with the model set explicitly to
      `gpt-6.2-astra` (the reviewer row of `rules/core.md`) and the reasoning effort set explicitly
      to HIGH on the call: a child defaults to effort LOW, and a review at LOW is not a review.
-     The child's prompt is the prompt file's content and nothing else. The `spawn_agent`
-     parameter names are confirmed by a live run, so check the tool's schema rather than
-     trusting this text. Alternative: `codex --no-daemon exec -m gpt-6.2-astra ...` with the
-     prompt file on stdin (`--no-daemon` goes before `exec`), and its final message is the reply.
+     The child's prompt is one instruction: read the whole prompt file, giving its path (real
+     prompts are too large to paste), and follow it; add nothing else. The `spawn_agent`
+     parameter names are NOT yet confirmed: they will be checked on the first live run, so read
+     the tool's schema rather than trusting this text. Alternative:
+     `codex --no-daemon exec -m gpt-6.2-astra ...` with the prompt file on stdin (`--no-daemon`
+     goes before `exec`), and its final message is the reply.
    - Every `review.py` call keeps `SESSION_NOTES_AGENT=codex` in front, like the other helpers.
    - There is no memory-store write in this skill, so nothing goes through `codex_save.py`.
 3. Post only the verdict the reviewer returned, and stop at Step 6's `wt merge` hand-off exactly

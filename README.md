@@ -123,7 +123,7 @@ review verdict (also in docs/tools.md).
 ## Works with Codex
 
 The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
-`sh install.sh --codex` links `$refresh`, `$reflect` and `$rnr` into
+`sh install.sh --codex` links `$refresh`, `$reflect`, `$rnr` and `$review` into
 `~/.codex/skills` and adds a SessionStart hook that loads the index and
 RESUME at startup, on resume and after compaction. Codex keeps its own store
 under `~/.codex/session-notes`, separate from Claude's, and the tools refuse a

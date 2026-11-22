@@ -20,8 +20,9 @@ any fnmatch globs in session-notes config `[review].test_globs`.
 
 Pure core (scan, file_counts, format_output) plus a thin CLI; bin/review.py imports the core.
 
-Exit codes: 0 always for a successful scan, whether or not there are hits; 1 for a usage error
-or a malformed config value (the message names the key and value); 2 for --selftest failure.
+Exit codes: 0 for a successful scan, whether or not there are hits; 1 for a malformed config
+value (the message names the key and value); 2 for a usage error (argparse) or a --selftest
+failure.
 """
 import argparse
 import fnmatch
@@ -129,21 +130,46 @@ def _strip_prefix(p):
     return p
 
 
-def _block_path(header_lines):
-    """File path for a block, from its header region ONLY (see
-    _split_header_and_hunks for why that restriction matters)."""
-    b_path = None
-    a_path = None
+def _git_header_path(header_lines):
+    """Path from `diff --git a/X b/X` when both sides name the same file (no rename)."""
+    for line in header_lines:
+        if line.startswith("diff --git "):
+            rest = line[len("diff --git "):].strip()
+            n = (len(rest) - 5) // 2
+            if n > 0:
+                a = rest[2:2 + n]
+                if rest == "a/%s b/%s" % (a, a):
+                    return a
+            if rest.startswith('"') and rest.endswith('"'):
+                return None
+    return None
+
+
+def _block_paths(header_lines):
+    """(old_path, new_path) for a block, from its header region ONLY (see
+    _split_header_and_hunks for why that restriction matters). Either may be None (a new
+    file has no old path, a deleted one no new path). The `---`/`+++` lines win; when they
+    are absent (a pure rename, a binary file, an empty deleted file) `rename from`/`rename to`
+    and then the `diff --git` line supply the path."""
+    old = new = None
+    rename_from = rename_to = None
     for line in header_lines:
         if line.startswith("+++ "):
             p = line[4:].strip()
             if p != "/dev/null":
-                b_path = _strip_prefix(p)
+                new = _strip_prefix(p)
         elif line.startswith("--- "):
             p = line[4:].strip()
             if p != "/dev/null":
-                a_path = _strip_prefix(p)
-    return b_path or a_path
+                old = _strip_prefix(p)
+        elif line.startswith("rename from "):
+            rename_from = line[len("rename from "):].strip()
+        elif line.startswith("rename to "):
+            rename_to = line[len("rename to "):].strip()
+    git_path = _git_header_path(header_lines)
+    old = old or rename_from or git_path
+    new = new or rename_to or git_path
+    return old, new
 
 
 def _count_lines(hunk_lines):
@@ -165,10 +191,22 @@ def _count_lines(hunk_lines):
     return added, removed
 
 
-def _process_block(path, is_new, is_deleted, hunk_lines, extra_globs):
+def _paren_delta(text):
+    """Net open parens on a line, counted from its first `check(` when it has one."""
+    i = text.find("check(")
+    seg = text[i:] if i >= 0 else text
+    return seg.count("(") - seg.count(")")
+
+
+def _process_block(old_path, new_path, is_new, is_deleted, is_binary, hunk_lines, extra_globs):
+    path = new_path or old_path
     hits = []
-    is_test = _is_test_file(path, extra_globs)
-    is_py = path.endswith(".py")
+    renamed = bool(old_path and new_path and old_path != new_path)
+    # A file moved OUT of a test path is still an edit to a test: either path being
+    # test-shaped counts.
+    is_test = _is_test_file(path, extra_globs) or (
+        renamed and _is_test_file(old_path, extra_globs))
+    is_py = path.endswith(".py") or bool(old_path and old_path.endswith(".py"))
 
     if is_new:
         return hits  # new files produce nothing by construction
@@ -191,6 +229,25 @@ def _process_block(path, is_new, is_deleted, hunk_lines, extra_globs):
             )
         return hits  # one hit per deleted file, never one per removed line
 
+    if renamed and _is_test_file(old_path, extra_globs):
+        hits.append(
+            {
+                "file": old_path,
+                "line": 1,
+                "text": f"(renamed) {old_path} -> {new_path}",
+                "reason": "test-file-renamed",
+            }
+        )
+    if is_binary and is_test and not renamed:
+        hits.append(
+            {
+                "file": path,
+                "line": 1,
+                "text": f"(binary file changed) {path}",
+                "reason": "test-file-binary",
+            }
+        )
+
     # Group hunk lines into hunks, each tracking its own old-side line counter.
     hunks = []
     current = None
@@ -210,35 +267,44 @@ def _process_block(path, is_new, is_deleted, hunk_lines, extra_globs):
         # Inside a hunk every line that starts with '-' or '+' is content
         # (the file-header '---'/'+++' lines live outside the hunk region).
         added_stripped = {l[1:].strip() for l in hunk["lines"] if l.startswith("+")}
+        # Multi-line check( heuristic (Python files outside test paths): while a `check(`
+        # call seen on an old-side line of THIS hunk still has unbalanced parens, any removed
+        # line is part of that call and is flagged. Limits: parens inside strings are counted,
+        # and a call that opens before the hunk's first context line is not seen.
+        open_depth = 0
         for line in hunk["lines"]:
             if line.startswith("\\"):
                 continue  # "\ No newline at end of file" is not a real line
             if line.startswith("+"):
                 continue  # added lines don't advance the old-side counter
-            if line.startswith("-"):
-                text = line[1:]
-                stripped = text.strip()
-                cur_old_line = old_line
-                old_line += 1
-                if stripped == "":
-                    continue  # blank removed lines are not a finding
-                if stripped in added_stripped:
-                    continue  # reindent/move within the same hunk
-                if is_test:
+            removed = line.startswith("-")
+            text = line[1:]
+            stripped = text.strip()
+            cur_old_line = old_line
+            old_line += 1
+            inside_call = open_depth > 0
+            if inside_call:
+                open_depth = max(open_depth + text.count("(") - text.count(")"), 0)
+            elif "check(" in stripped and not stripped.startswith("#"):
+                open_depth = max(_paren_delta(stripped), 0)
+            if not removed:
+                continue
+            if stripped == "":
+                continue  # blank removed lines are not a finding
+            if stripped in added_stripped:
+                continue  # reindent/move within the same hunk
+            is_assert = "check(" in stripped or (
+                not stripped.startswith("#") and ASSERT_RE.search(stripped))
+            if is_test:
+                # A changed assertion is its own detail line, never folded into the
+                # "N lines changed" summary row.
+                reason = "assertion" if is_assert else "test-file"
+                hits.append({"file": path, "line": cur_old_line, "text": text, "reason": reason})
+            elif is_py:
+                if is_assert or inside_call:
                     hits.append(
-                        {"file": path, "line": cur_old_line, "text": text, "reason": "test-file"}
+                        {"file": path, "line": cur_old_line, "text": text, "reason": "assertion"}
                     )
-                elif is_py:
-                    if "check(" in stripped:
-                        hits.append(
-                            {"file": path, "line": cur_old_line, "text": text, "reason": "assertion"}
-                        )
-                    elif not stripped.startswith("#") and ASSERT_RE.search(stripped):
-                        hits.append(
-                            {"file": path, "line": cur_old_line, "text": text, "reason": "assertion"}
-                        )
-            else:
-                old_line += 1  # context line
     return hits
 
 
@@ -254,14 +320,18 @@ def _scan_blocks(diff_text, extra_globs=None):
     counts = {}
     for block in _split_blocks(diff_text):
         header, hunk_lines = _split_header_and_hunks(block)
-        path = _block_path(header)
+        old_path, new_path = _block_paths(header)
+        path = new_path or old_path
         if not path:
             continue
         is_new = any(line.startswith("new file mode") for line in header)
         is_deleted = any(line.startswith("deleted file mode") for line in header)
+        is_binary = any(line.startswith("Binary files ") or line.startswith("GIT binary patch")
+                        for line in header)
         added, removed = _count_lines(hunk_lines)
         counts[path] = {"added": added, "removed": removed}
-        hits.extend(_process_block(path, is_new, is_deleted, hunk_lines, extra_globs))
+        hits.extend(_process_block(old_path, new_path, is_new, is_deleted, is_binary,
+                                   hunk_lines, extra_globs))
     return hits, counts
 
 
@@ -303,7 +373,8 @@ def format_output(hits, counts=None):
     entries = []
     collapsed_files = set()
     for h in hits:
-        if h["reason"] in ("assertion", "test-file-deleted"):
+        if h["reason"] in ("assertion", "test-file-deleted", "test-file-renamed",
+                            "test-file-binary"):
             entries.append(f"{h['file']}:{h['line']} [{h['reason']}] {h['text'].strip()}")
             continue
         if no_counts:
@@ -688,6 +759,102 @@ def selftest():
     check("... 5 more" in out_t and out_t.count("test_cap.py:") == _MAX_REPORT_LINES,
           "t. the report is capped and says how many were left out")
 
+    # --- u. a pure rename with no ---/+++ lines is seen, and a rename OUT of tests/ is a hit ---
+    diff_u = (
+        "diff --git a/tests/test_gate.py b/tests/gate.py.off\n"
+        "similarity index 100%\n"
+        "rename from tests/test_gate.py\n"
+        "rename to tests/gate.py.off\n"
+    )
+    hits_u = scan(diff_u)
+    check(len(hits_u) == 1 and hits_u[0]["reason"] == "test-file-renamed"
+          and hits_u[0]["file"] == "tests/test_gate.py",
+          "u1. a pure rename of a test file (no ---/+++ lines) is reported")
+    diff_u2 = (
+        "diff --git a/tests/test_gate.py b/lib/gate.py\n"
+        "similarity index 80%\n"
+        "rename from tests/test_gate.py\n"
+        "rename to lib/gate.py\n"
+        "--- a/tests/test_gate.py\n"
+        "+++ b/lib/gate.py\n"
+        "@@ -4,1 +4,1 @@\n"
+        "-    assert ok\n"
+        "+    pass\n"
+    )
+    hits_u2 = scan(diff_u2)
+    check({h["reason"] for h in hits_u2} == {"test-file-renamed", "assertion"},
+          "u2. a rename OUT of tests/ with edits reports the rename and the removed assert")
+    diff_u3 = (
+        "diff --git a/lib/a.py b/lib/b.py\nsimilarity index 100%\n"
+        "rename from lib/a.py\nrename to lib/b.py\n"
+    )
+    check(scan(diff_u3) == [], "u3. a rename between non-test paths is not a hit")
+
+    # --- v. binary fixtures and empty deleted files (no ---/+++ lines) ---
+    diff_v = (
+        "diff --git a/tests/fixtures/a.bin b/tests/fixtures/a.bin\n"
+        "index 1111111..2222222 100644\n"
+        "Binary files a/tests/fixtures/a.bin and b/tests/fixtures/a.bin differ\n"
+    )
+    hits_v = scan(diff_v)
+    check(len(hits_v) == 1 and hits_v[0]["reason"] == "test-file-binary"
+          and hits_v[0]["file"] == "tests/fixtures/a.bin",
+          "v1. a changed binary fixture is reported")
+    diff_v2 = (
+        "diff --git a/tests/test_empty.py b/tests/test_empty.py\n"
+        "deleted file mode 100644\n"
+        "index e69de29..0000000\n"
+    )
+    hits_v2 = scan(diff_v2)
+    check(len(hits_v2) == 1 and hits_v2[0]["reason"] == "test-file-deleted"
+          and hits_v2[0]["file"] == "tests/test_empty.py",
+          "v2. a deleted empty test file is reported")
+    diff_v3 = (
+        "diff --git a/docs/img.png b/docs/img.png\nindex 1..2 100644\n"
+        "Binary files a/docs/img.png and b/docs/img.png differ\n"
+    )
+    check(scan(diff_v3) == [], "v3. a changed binary file outside test paths is not a hit")
+
+    # --- w. a changed assert in a test file is its own detail line, not a summary row ---
+    diff_w = (
+        "diff --git a/tests/test_x.py b/tests/test_x.py\n"
+        "--- a/tests/test_x.py\n+++ b/tests/test_x.py\n"
+        "@@ -5,1 +5,1 @@\n"
+        "-    assert out == [1, 2]\n"
+        "+    assert out\n"
+    )
+    out_w = format_output(scan(diff_w), file_counts(diff_w))
+    check("tests/test_x.py:5 [assertion]" in out_w and "lines changed" not in out_w,
+          "w. a one-for-one assert swap in a test file shows as a detail line")
+
+    # --- x. multi-line check( in a non-test file: continuation lines are flagged ---
+    diff_x = (
+        "diff --git a/bin/tool.py b/bin/tool.py\n"
+        "--- a/bin/tool.py\n+++ b/bin/tool.py\n"
+        "@@ -40,5 +40,5 @@\n"
+        " def t():\n"
+        '     check("drops short",\n'
+        "-          out == [] and not err,\n"
+        "+          True,\n"
+        '           "detail")\n'
+        "-    y = 2\n"
+        "+    y = 3\n"
+    )
+    hits_x = scan(diff_x)
+    check([h["line"] for h in hits_x] == [42],
+          "x1. a loosened continuation line of a multi-line check( is flagged, and a removed "
+          "line after the call closes is not")
+    diff_x2 = (
+        "diff --git a/bin/tool.py b/bin/tool.py\n"
+        "--- a/bin/tool.py\n+++ b/bin/tool.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " def f(a,\n"
+        "-      b):\n"
+        "+      c):\n"
+        "     return 1\n"
+    )
+    check(scan(diff_x2) == [], "x2. a removed line in a multi-line non-check call is not flagged")
+
     print("selftest:", "PASS" if ok else "FAIL")
     return ok
 
@@ -696,9 +863,6 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Scan a unified diff for edits to existing tests, fixtures and guards. "
                     "Reports only: exits 0 whether or not it finds hits.")
-    ap.add_argument("--repo-root", default=None,
-                    help="the repo the diff is from (diff paths are repo-relative, so this only "
-                         "documents intent; extra globs come from config [review].test_globs)")
     ap.add_argument(
         "--diff-file",
         default="-",

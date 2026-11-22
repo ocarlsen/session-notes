@@ -35,7 +35,7 @@ sh install.sh --codex
 
 It asks `[y/N]` before each step:
 
-1. Link the three Codex skills into `~/.codex/skills/`.
+1. Link the four Codex skills (`$reflect`, `$refresh`, `$rnr`, `$review`) into `~/.codex/skills/`.
 2. Write `~/.codex/hooks.json` with the SessionStart hook, if the file does not
    exist yet. An existing file is never edited, and the block is printed so you
    can merge it in.

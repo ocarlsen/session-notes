@@ -9,21 +9,25 @@ here, never restated.
         Fetch the PR's head sha, title, body and diff, run the test-edit check on the diff, and
         write a reviewer prompt plus meta.json under the state dir
         (<state_dir>/review/<owner>-<repo>-<PR>/). Prints the prompt path, the head sha and the
-        review round. Warns loudly, and still exits 0, when the contract's fix-round limit is
-        already reached.
+        review round. Says so, and still exits 0, when this is the last review the contract's
+        fix-round limit allows or the limit is already passed.
     review.py post <PR> APPROVE|CHANGES --body-file FILE [--dry-run]
         Post the reviewer's reply as the verdict comment: first line
         `Review verdict: <V> <head sha>`, then the body. Refuses when the PR head moved since
         `prepare` (the reviewer read a different commit), when `prepare` was never run, when the
-        body is empty, or when the body's own final `VERDICT: X` line disagrees with <V>.
+        body is empty, when its last non-empty line is not exactly `VERDICT: APPROVE` or
+        `VERDICT: CHANGES`, or when that line disagrees with <V>. A CHANGES that brings the
+        account's CHANGES verdicts past the fix-round limit prints a stop-and-report line.
         --dry-run prints the comment and posts nothing.
     review.py --selftest
 
 The comment is posted with the token from `[wt].token_command` (the account whose verdicts
 `wt merge` trusts). The test-edit check's extra globs come from `[review].test_globs`.
 
-Exit codes: 0 ok; 1 usage, fatal, or a refusal (no prepare, empty body, verdict mismatch, PR
-not open); 3 token command failed; 4 the PR head moved since prepare.
+Exit codes: 0 ok; 1 fatal, no subcommand, or a refusal (no prepare, empty body, a body that does
+not end in its own VERDICT line, verdict mismatch, PR not open); 2 a usage error (argparse: bad
+verdict word, unknown flag) or a --selftest failure; 3 token command failed; 4 the PR head moved
+since prepare.
 """
 import argparse
 import json
@@ -44,7 +48,7 @@ CONTRACT = os.path.join(os.path.dirname(HERE), "rules", "review-contract.md")
 BINDIR = HERE                # where on_verdict_posted looks for live.py
 DIFF_INLINE_CAP = 200 * 1024
 FIX_ROUND_LIMIT = 2          # the contract allows at most this many fix rounds
-_BODY_VERDICT = re.compile(r"^VERDICT: (%s|%s)\s*$" % (wt.APPROVE, wt.CHANGES))
+_BODY_VERDICT = re.compile(r"^VERDICT: (%s|%s)$" % (wt.APPROVE, wt.CHANGES))
 
 INSTRUCTIONS = """\
 You are the reviewer. You have fresh context: no builder transcript and no opinion of this
@@ -94,6 +98,19 @@ def _pr_view(gh, main, pr, owner_repo=None):
     return view
 
 
+def round_notice(changes):
+    """The fix-round line for an account with `changes` CHANGES verdicts, or None."""
+    if changes == FIX_ROUND_LIMIT:
+        return ("LAST REVIEW: %d CHANGES verdicts exist, so both fix rounds the contract allows "
+                "are used. This is the last review the contract allows; if it finds defects, stop "
+                "and report to the user." % changes)
+    if changes > FIX_ROUND_LIMIT:
+        return ("LIMIT REACHED: %d CHANGES verdicts exist, past the contract's %d fix rounds. "
+                "Stop and report to the user instead of starting another round."
+                % (changes, FIX_ROUND_LIMIT))
+    return None
+
+
 def count_rounds(comments, login):
     """(prior verdicts by `login`, how many of those are CHANGES)."""
     own = [wt.parse_verdict(c.get("body")) for c in comments
@@ -107,6 +124,7 @@ def build_prompt(check_output, contract, title, body, repo_path, sha, diff, diff
     parts = ["# Review request\n"]
     parts.append("## Edits to tests, fixtures and guards (look at these first)\n\n%s\n" % check_output)
     parts.append("## The review contract\n\n%s\n" % contract.rstrip())
+    parts.append("## Your instructions\n\n%s" % INSTRUCTIONS)
     parts.append("## The spec it implements (PR title and body)\n\nTitle: %s\n\n%s\n"
                  % (title, (body or "").strip() or "(empty PR body)"))
     parts.append("## Where the code is\n\nLocal repo: %s\nHead sha: %s\n\nRead files at that sha "
@@ -117,7 +135,6 @@ def build_prompt(check_output, contract, title, body, repo_path, sha, diff, diff
                      % diff_path)
     else:
         parts.append("## The diff\n\n```diff\n%s\n```\n" % diff.rstrip("\n"))
-    parts.append("## Your instructions\n\n%s" % INSTRUCTIONS)
     return "\n".join(parts)
 
 
@@ -126,15 +143,16 @@ def cmd_prepare(args, cfg):
     gh = wt.Gh(cfg)
     view = _pr_view(gh, main, args.pr)
     if view.get("state") != "OPEN":
-        raise wt.Die(1, "PR #%s is %s, not OPEN" % (args.pr, view.get("state")))
+        raise wt.Die(1, "PR #%s is %s, not OPEN" % (view["number"], view.get("state")))
     owner, repo = wt._owner_repo(view.get("url"))
     orp = "%s/%s" % (owner, repo)
     sha = view["headRefOid"]
+    num = view["number"]
     try:
-        diff = gh.run(["pr", "diff", str(args.pr), "-R", orp], main)
+        diff = gh.run(["pr", "diff", str(num), "-R", orp], main)
         login = gh.run(["api", "user", "--jq", ".login"], main).strip()
         comments = gh.json(["api", "--paginate",
-                            "repos/%s/issues/%s/comments" % (orp, args.pr)], main)
+                            "repos/%s/issues/%s/comments" % (orp, num)], main)
     except wt.GhError as exc:
         raise wt.Die(1, "gh failed: %s" % exc)
     if not login:
@@ -145,15 +163,16 @@ def cmd_prepare(args, cfg):
     globs = list(cfg["review"]["test_globs"])
     hits, counts = test_edit_check._scan_blocks(diff, extra_globs=globs)
     check_output = (test_edit_check.format_output(hits, counts) if hits else
-                    "No edits to existing tests, fixtures or guards, and no removed assertions, "
-                    "were found in this diff.")
+                    "The test-edit check found no edited tests, fixtures or guards and no removed "
+                    "assertions in this diff. It scans removed lines in test-shaped paths and "
+                    "removed asserts and check( calls, and it is a heuristic, not proof.")
     try:
         with open(CONTRACT, encoding="utf-8") as fh:
             contract = fh.read()
     except OSError as exc:
         raise wt.Die(1, "cannot read the review contract %s: %s" % (CONTRACT, exc))
 
-    d = _review_dir(owner, repo, args.pr, cfg)
+    d = _review_dir(owner, repo, num, cfg)
     os.makedirs(d, exist_ok=True)
     diff_path = None
     if len(diff.encode("utf-8")) > DIFF_INLINE_CAP:
@@ -165,17 +184,16 @@ def cmd_prepare(args, cfg):
     prompt_path = os.path.join(d, "prompt.md")
     with open(prompt_path, "w", encoding="utf-8") as fh:
         fh.write(prompt)
-    meta = {"owner_repo": orp, "pr": str(args.pr), "head_sha": sha, "prepared_at": _now()}
+    meta = {"owner_repo": orp, "pr": str(num), "head_sha": sha, "prepared_at": _now()}
     with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
         fh.write("\n")
     print("prompt: %s" % prompt_path)
     print("head: %s" % sha)
     print("review round %d" % (total + 1))
-    if changes > FIX_ROUND_LIMIT:
-        print("LIMIT REACHED: %d CHANGES verdicts already exist, so the contract's %d fix rounds "
-              "are used. Stop and report to the user instead of starting another round."
-              % (changes, FIX_ROUND_LIMIT))
+    notice = round_notice(changes)
+    if notice:
+        print(notice)
     return 0
 
 
@@ -201,16 +219,23 @@ def on_verdict_posted(owner_repo, pr, verdict, sha, url_or_none, bindir=None):
 
 
 def strip_body_verdict(text, verdict):
-    """Body without its final `VERDICT: X` line. Raises Die when X disagrees with `verdict`."""
+    """Body without its final `VERDICT: X` line.
+
+    Raises Die when the last non-empty line is not exactly `VERDICT: APPROVE` or
+    `VERDICT: CHANGES` (the reviewer's instructions require it), or when X disagrees with
+    `verdict`.
+    """
     lines = text.rstrip().split("\n")
-    if lines and lines[-1].strip():
-        m = _BODY_VERDICT.match(lines[-1].rstrip("\r"))
-        if m:
-            if m.group(1) != verdict:
-                raise wt.Die(1, "the reviewer's own final line says %s but you are posting %s; "
-                                "post only the verdict the reviewer returned" % (m.group(1), verdict))
-            lines = lines[:-1]
-    return "\n".join(lines).strip()
+    last = lines[-1].rstrip("\r") if lines else ""
+    m = _BODY_VERDICT.match(last) if last.strip() else None
+    if not m:
+        raise wt.Die(1, "the review body must end with exactly `VERDICT: %s` or `VERDICT: %s`; its "
+                        "last non-empty line is %r. Do not post a reply that lacks it"
+                        % (wt.APPROVE, wt.CHANGES, last.strip()))
+    if m.group(1) != verdict:
+        raise wt.Die(1, "the reviewer's own final line says %s but you are posting %s; "
+                        "post only the verdict the reviewer returned" % (m.group(1), verdict))
+    return "\n".join(lines[:-1]).strip()
 
 
 def cmd_post(args, cfg):
@@ -219,14 +244,15 @@ def cmd_post(args, cfg):
     view = _pr_view(gh, main, args.pr)
     owner, repo = wt._owner_repo(view.get("url"))
     orp = "%s/%s" % (owner, repo)
-    d = _review_dir(owner, repo, args.pr, cfg)
+    num = view["number"]
+    d = _review_dir(owner, repo, num, cfg)
     try:
         with open(os.path.join(d, "meta.json"), encoding="utf-8") as fh:
             meta = json.load(fh)
         prepared = meta["head_sha"]
     except (OSError, ValueError, KeyError):
         raise wt.Die(1, "no prepared review for %s#%s: run `review.py prepare %s` first"
-                        % (orp, args.pr, args.pr))
+                        % (orp, num, args.pr))
     if view["headRefOid"] != prepared:
         raise wt.Die(4, "the PR head is %s but the reviewer read %s; the head moved after "
                         "prepare. Run prepare again and get a fresh review of the new head" % (view["headRefOid"], prepared))
@@ -240,7 +266,7 @@ def cmd_post(args, cfg):
         raise wt.Die(1, "the review body is empty; post the reviewer's findings, not a bare verdict")
     comment = "%s\n\n%s\n" % (wt.verdict_line(args.verdict, prepared), body)
     if args.dry_run:
-        print("dry run, would post to %s#%s:" % (orp, args.pr))
+        print("dry run, would post to %s#%s:" % (orp, num))
         print(comment, end="")
         return 0
     os.makedirs(d, exist_ok=True)
@@ -248,7 +274,7 @@ def cmd_post(args, cfg):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(comment)
-        out = gh.run(["pr", "comment", str(args.pr), "-R", orp, "--body-file", tmp], main)
+        out = gh.run(["pr", "comment", str(num), "-R", orp, "--body-file", tmp], main)
     except wt.GhError as exc:
         raise wt.Die(1, "gh pr comment failed: %s" % exc)
     finally:
@@ -258,7 +284,19 @@ def cmd_post(args, cfg):
             pass
     url = (out or "").strip().splitlines()[-1] if (out or "").strip() else None
     print("posted %s verdict at %s%s" % (args.verdict, prepared, (" " + url) if url else ""))
-    on_verdict_posted(orp, args.pr, args.verdict, prepared, url)
+    on_verdict_posted(orp, num, args.verdict, prepared, url)
+    if args.verdict == wt.CHANGES:
+        try:
+            login = gh.run(["api", "user", "--jq", ".login"], main).strip()
+            comments = gh.json(["api", "--paginate",
+                                "repos/%s/issues/%s/comments" % (orp, num)], main)
+            _, changes = count_rounds(comments if isinstance(comments, list) else [], login)
+            notice = round_notice(changes)
+            if notice and changes > FIX_ROUND_LIMIT:
+                print(notice)
+        except wt.GhError as exc:
+            print("warning: could not count CHANGES verdicts for the fix-round limit: %s" % exc,
+                  file=sys.stderr)
     return 0
 
 
@@ -424,7 +462,7 @@ def selftest():
                           "@@ -1,1 +1,1 @@\n-x = 1\n+x = 2\n")
         run("prepare", "7")
         check("a clean diff says so",
-              "No edits to existing tests" in open(os.path.join(sdir, "prompt.md")).read())
+              "is a heuristic, not proof" in open(os.path.join(sdir, "prompt.md")).read())
         # diff spill
         big = "diff --git a/bin/a.py b/bin/a.py\n--- a/bin/a.py\n+++ b/bin/a.py\n@@ -1,1 +1,1 @@\n" \
               + "+" + "z" * (DIFF_INLINE_CAP + 10) + "\n"
@@ -449,8 +487,11 @@ def selftest():
         put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1),
                               verdict_comment("reviewer-bot", wt.CHANGES, sha1, 2)])
         rc, out, err = run("prepare", "7")
-        check("two CHANGES: round 3, no limit warning yet", "review round 3" in out
-              and "LIMIT" not in out, out)
+        check("two CHANGES: round 3 is announced as the last review allowed",
+              "review round 3" in out and "LAST REVIEW" in out and "LIMIT REACHED" not in out, out)
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1)])
+        rc, out, err = run("prepare", "7")
+        check("one CHANGES: no fix-round notice", "LAST REVIEW" not in out and "LIMIT" not in out, out)
         put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1),
                               verdict_comment("reviewer-bot", wt.CHANGES, sha1, 2),
                               verdict_comment("reviewer-bot", wt.CHANGES, sha1, 3)])
@@ -463,7 +504,34 @@ def selftest():
         check("prepare refuses a PR that is not open", rc == 1 and "not OPEN" in err, err)
         view(sha1)
 
+        # prompt order: instructions right after the contract, before the spec and the diff
+        pt = open(os.path.join(sdir, "prompt.md")).read()
+        check("instructions come after the contract and before the spec and the diff",
+              pt.find("# Review contract") < pt.find("## Your instructions")
+              < pt.find("## The spec it implements") < pt.find("## The diff"))
+        # a non-numeric PR argument: every later call uses the number gh reported
+        put("comments.json", [])
+        run("prepare", "feature-branch")
+        check("calls after pr view use view[number], not the raw argument",
+              any(c[-1] == "repos/example/proj/issues/7/comments" for c in gh_calls())
+              and os.path.exists(os.path.join(sdir, "meta.json")))
+
+        # strip_body_verdict: the reviewer's own last line must be exact
+        for bad in ("**VERDICT: CHANGES**", "`VERDICT: CHANGES`", "VERDICT: CHANGES.",
+                    "Verdict: CHANGES", " VERDICT: CHANGES", "VERDICT: CHANGES and more",
+                    "no verdict line at all"):
+            try:
+                strip_body_verdict("Finding.\n\n" + bad + "\n", wt.APPROVE)
+                got = "accepted"
+            except wt.Die as exc:
+                got = exc.msg
+            check("a final line %r is refused, naming it" % bad,
+                  got != "accepted" and repr(bad.strip()) in got, got)
+        check("an exact final line is stripped",
+              strip_body_verdict("Finding.\n\nVERDICT: APPROVE\n\n", wt.APPROVE) == "Finding.")
+
         # ---- post
+        put("comments.json", [])
         run("prepare", "7")  # fresh meta at sha1
         body = os.path.join(T, "body.md")
 
@@ -505,7 +573,7 @@ def selftest():
         write_body("   \n")
         rc, out, err = run("post", "7", wt.APPROVE, "--body-file", body)
         check("a whitespace-only body is refused", rc == 1 and not os.path.exists(posted), err)
-        write_body("Looks fine.\n")
+        write_body("Looks fine.\nVERDICT: APPROVE\n")
         view(sha2)
         rc, out, err = run("post", "7", wt.APPROVE, "--body-file", body)
         check("a stale head sha is refused", rc == 4 and "moved" in err and not os.path.exists(posted), err)
@@ -534,7 +602,29 @@ def selftest():
             on_verdict_posted("example/proj", "7", wt.CHANGES, sha1, None, bindir=lay)
         check("a failing live.py only warns", "warning" in err.getvalue() and "boom" in err.getvalue())
         # the whole post still succeeds when on_verdict_posted's writer fails
-        check("on_verdict_posted never raised above", True)
+        # a real post with a failing live.py in the directory the post path uses
+        view(sha1)
+        run("prepare", "7")
+        BINDIR = lay
+        write_body("Finding.\nVERDICT: CHANGES\n")
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1)])
+        rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
+        check("post exits 0 and warns when live.py fails",
+              rc == 0 and "warning: live-context note failed" in err and "boom" in err, (rc, err))
+        check("one CHANGES after the post: no stop line", "LIMIT REACHED" not in out, out)
+        # post CHANGES that brings the count to 3 prints the stop line; fewer does not
+        BINDIR = os.path.join(T, "emptybin")
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, i) for i in (1, 2, 3)])
+        rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
+        check("post CHANGES reaching 3 prints the stop-and-report line",
+              rc == 0 and "LIMIT REACHED" in out, out)
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, i) for i in (1, 2)])
+        rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
+        check("post CHANGES reaching 2 prints no stop line", rc == 0 and "LIMIT" not in out, out)
+        write_body("Fine.\nVERDICT: APPROVE\n")
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, i) for i in (1, 2, 3)])
+        rc, out, err = run("post", "7", wt.APPROVE, "--body-file", body)
+        check("post APPROVE never prints the stop line", rc == 0 and "LIMIT" not in out, out)
 
     BINDIR = saved_bindir
     os.chdir(saved_cwd)
