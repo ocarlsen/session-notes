@@ -19,6 +19,9 @@ for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 # A session launched by handoff_session exports SESSION_NOTES_PARENT_*, which the pane
 # registry's self-test must not see; drop those too.
 for v in $(env | sed -n 's/^\(SESSION_NOTES_PARENT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+# Same for knobs a session can inherit: a Codex shell exports SESSION_NOTES_AGENT=codex
+# (install.sh --codex), and the bus reads CLAUDE_SESSION_BUS_DELIVERIES at import.
+unset SESSION_NOTES_AGENT CLAUDE_SESSION_BUS_DELIVERIES
 fail=0
 for f in "$ROOT"/bin/*.py "$ROOT"/hooks/*.py "$ROOT"/skills/*/*.py "$ROOT"/tools/*.py "$ROOT"/tests/leak_scan.py; do
   [ -f "$f" ] || continue
