@@ -179,11 +179,16 @@ def record_blind(path, exc, scope):
         reason = "%s: %s" % (type(exc).__name__, exc.strerror)
     else:
         reason = "%s: %s" % (type(exc).__name__, exc)
-    if scope not in ("global", "user settings"):
-        # one label per scope however the caller spelled it (~, trailing slash), so the
-        # (path, scope) key dedupes a file recorded by two readers into one BLIND line
-        scope = os.path.normpath(_tilde(scope))
-    _BLIND.setdefault((str(path), scope), reason)
+    _BLIND.setdefault((str(path), blind_scope(scope)), reason)
+
+
+def blind_scope(scope):
+    """The one label a blind read is recorded under, however the caller spelled the scope
+    root (~, trailing slash). record_blind and every reader that filters blind_reads() by
+    scope call this, so the two sides cannot disagree."""
+    if scope in ("global", "user settings"):
+        return scope
+    return os.path.normpath(_tilde(scope))
 
 
 def read_bytes_or_blind(path, scope):
