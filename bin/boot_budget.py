@@ -179,7 +179,16 @@ def record_blind(path, exc, scope):
         reason = "%s: %s" % (type(exc).__name__, exc.strerror)
     else:
         reason = "%s: %s" % (type(exc).__name__, exc)
-    _BLIND.setdefault((str(path), scope), reason)
+    _BLIND.setdefault((str(path), blind_scope(scope)), reason)
+
+
+def blind_scope(scope):
+    """The one label a blind read is recorded under, however the caller spelled the scope
+    root (~, trailing slash). record_blind and every reader that filters blind_reads() by
+    scope call this, so the two sides cannot disagree."""
+    if scope in ("global", "user settings"):
+        return scope
+    return os.path.normpath(_tilde(scope))
 
 
 def read_bytes_or_blind(path, scope):
@@ -281,9 +290,9 @@ def _display(path):
     return path
 
 
-def char_count(path):
-    """Chars in the file; 0 when absent (silent) or unreadable (recorded as blind)."""
-    text = read_text_or_blind(path, "global")
+def char_count(path, scope="global"):
+    """Chars in the file; 0 when absent (silent) or unreadable (recorded as blind for `scope`)."""
+    text = read_text_or_blind(path, scope)
     return 0 if text is None else len(text)
 
 
@@ -492,7 +501,7 @@ def scope_report(root):
     for f in files:
         if not os.path.isfile(f):
             continue
-        chars = char_count(f)
+        chars = char_count(f, root)
         budget = budget_for(f)
         doubled = bool(auto_on and native_rp and os.path.realpath(f) == native_rp)
         entries.append({"path": f, "chars": chars, "budget": budget, "doubled": doubled})
@@ -1248,6 +1257,25 @@ def selftest():
             reload_config()
             check(char_count(str(widget_root / "absent.md")) == 0 and blind_reads() == [],
                   "blind: char_count on an absent file is 0 and silent")
+            # scope_report: an unreadable scope CLAUDE.md is blind for THAT scope only, one line
+            reload_config()
+            with deny_open("Widget/CLAUDE.md"):
+                scope_report(str(widget_root))
+            check([sc for _, sc, _ in blind_reads()] == [str(widget_root)],
+                  "blind: scope_report records an unreadable scope file once, under its own scope")
+            for spelling in (str(widget_root) + "/", "~/" + os.path.relpath(str(widget_root), HOME)):
+                reload_config()
+                with deny_open("Widget/CLAUDE.md"):
+                    scope_report(spelling)
+                check([sc for _, sc, _ in blind_reads()] == [os.path.normpath(str(widget_root))],
+                      "blind: scope_report spelled %r still records ONE line" % spelling[-12:])
+            reload_config()
+            with deny_open("/CLAUDE.md"):
+                scope_report("~")
+            scopes = [sc for _, sc, _ in blind_reads()]
+            check(scopes and len(scopes) == len(set(blind_reads())) and "~" not in scopes
+                  and len([1 for pth, _, _ in blind_reads()]) == len({pth for pth, _, _ in blind_reads()}),
+                  "blind: the global scope given as ~ records each unreadable file once")
 
         # --- Regression guard: WARN_AT must stay reachable below TOTAL_LIMIT ---
         check(orig_warn < orig_total, "WARN_AT stays strictly below TOTAL_LIMIT in the real config")

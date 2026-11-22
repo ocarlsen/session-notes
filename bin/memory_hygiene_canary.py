@@ -537,7 +537,7 @@ def _blind_for(boot_budget, roots, uses_settings):
     """The blind reads that bear on an orphan verdict for a store owned by `roots`: those
     for the scope itself and for a global entry point, plus user settings only when the
     verdict actually reads settings."""
-    wanted = set(roots) | {"global"}
+    wanted = {boot_budget.blind_scope(r) for r in roots} | {"global"}
     if uses_settings:
         wanted.add("user settings")
     return [(p, sc, r) for p, sc, r in boot_budget.blind_reads() if sc in wanted]
@@ -1390,6 +1390,38 @@ def selftest():
             hit = [f for f in orphan_store_findings(cfg) if store in f]
             check(len(hit) == 1 and "no CLAUDE.md entry point" in hit[0],
                   "blind: a standalone orphan_store_findings does not inherit stale entries")
+
+            # A blind read is matched to its scope by one label: a trailing-slash root
+            # still withholds its own store's verdict.
+            cfg["scopes"] = [{"name": "proj", "root": root + os.sep, "store": store}]
+            with deny_open("proj/CLAUDE.md"):
+                bb.blind_reset()
+                hit = [f for f in orphan_store_findings(cfg) if store in f]
+            check(len(hit) == 1 and "NOT made" in hit[0] and "no CLAUDE.md entry point" not in hit[0],
+                  "blind: a trailing-slash scope root still withholds its store's verdict")
+            cfg["scopes"] = [{"name": "proj", "root": root, "store": store}]
+
+            # The global "~" root, with the config dir apart from ~/.claude: ~/.claude/
+            # settings.json is that root's PROJECT settings, recorded under the home path.
+            orig_home = bb.HOME
+            bb.HOME = os.path.join(d, "home")
+            try:
+                gstore = os.path.dirname(bb.native_memory_path("~"))
+                cfg["paths"]["global_store"] = gstore
+                _write(os.path.join(gstore, "MEMORY.md"), "# Memory Index\n\n- [G](reference_g.md) -- hook\n")
+                _write(os.path.join(gstore, "reference_g.md"), _mem_file("g"))
+                _write(os.path.join(bb.HOME, ".claude", "settings.json"), '{"autoMemoryEnabled": true}')
+                bb.blind_reset()
+                check([f for f in orphan_store_findings(cfg) if gstore in f] == [],
+                      "blind control: readable ~/.claude/settings.json (on) -> global store not an orphan")
+                with deny_open(os.path.join("home", ".claude", "settings.json")):
+                    bb.blind_reset()
+                    hit = [f for f in orphan_store_findings(cfg) if gstore in f]
+                check(len(hit) == 1 and "NOT made" in hit[0] and "no CLAUDE.md entry point" not in hit[0],
+                      "blind: unreadable ~/.claude/settings.json withholds the global store's verdict "
+                      "(config dir apart from ~/.claude)")
+            finally:
+                bb.HOME = orig_home
 
         # (c) codex: warn at >= 90% of agent.codex_boot_bytes.
         with tempfile.TemporaryDirectory() as d:
