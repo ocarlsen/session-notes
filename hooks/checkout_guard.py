@@ -155,7 +155,8 @@ def all_unmerged(tree, paths):
     if not paths:
         return False
     for p in paths:
-        if p == "." or p.startswith(":") or os.path.isdir(os.path.join(d, p)):
+        if p == "." or p.startswith(":") or os.path.isdir(os.path.join(d, p)) \
+                or any(c in p for c in "*?["):
             return False
         r = _git(d, "ls-files", "-u", "--", p)
         if r.returncode != 0 or not r.stdout.strip():
@@ -387,7 +388,7 @@ def _dirty_path_operand(tree, args):
     for a in pos:
         if _git(d, "rev-parse", "--verify", "-q", a + "^{commit}").returncode == 0:
             continue
-        if not os.path.exists(os.path.join(d, a)):
+        if not os.path.exists(os.path.join(d, a)) and not any(c in a for c in "*?["):
             continue
         r = _git(d, "status", "--porcelain", "--untracked-files=no", "--", a)
         if r.returncode == 0 and r.stdout.strip():
@@ -623,7 +624,7 @@ def selftest():
         sh(devmain, "git", "checkout", "-q", "-b", "dev")
         wt_on_main = os.path.join(tmp, "wt_on_main")
         sh(devmain, "git", "worktree", "add", "-q", wt_on_main, "main")
-        conf = mkrepo("conf", ("a.txt", "b.txt"))
+        conf = mkrepo("conf", ("a.txt", "b.txt", "c.txt"))
         sh(conf, "git", "checkout", "-q", "-b", "other")
         with open(os.path.join(conf, "a.txt"), "w") as fh:
             fh.write("theirs\n")
@@ -633,8 +634,9 @@ def selftest():
             fh.write("ours\n")
         sh(conf, "git", "commit", "-q", "-am", "m")
         subprocess.run(["git", "merge", "other"], cwd=conf, env=gitenv, capture_output=True)
-        with open(os.path.join(conf, "b.txt"), "w") as fh:
-            fh.write("dirty\n")
+        for dirty_name in ("b.txt", "c.txt"):
+            with open(os.path.join(conf, dirty_name), "w") as fh:
+                fh.write("dirty\n")
         dirty_repo = mkrepo("dirty")
         with open(os.path.join(dirty_repo, "a.txt"), "w") as fh:
             fh.write("changed\n")
@@ -800,6 +802,10 @@ def selftest():
               refused(bash("git checkout --theirs b.txt", conf)))
         check("B refuse (conflict tree): git restore --theirs on a non-conflicted dirty path",
               refused(bash("git restore --theirs b.txt", conf)))
+        for cmd in ("git checkout --theirs '*.txt'", "git checkout --theirs *.txt",
+                    "git checkout --ours -- '*'", "git restore --theirs '*.txt'",
+                    "git checkout --theirs a.tx?"):
+            check("B refuse (conflict tree, glob): " + cmd, refused(bash(cmd, conf)))
         check("B refuse (conflict tree): --ours with a mix of conflicted and dirty paths",
               refused(bash("git checkout --ours a.txt b.txt", conf)))
         check("B refuse (dirty): bare git checkout a.txt",
