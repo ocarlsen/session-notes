@@ -817,7 +817,10 @@ def selftest():
                 import tomllib
             except ImportError:
                 tomllib = None
-            if tomllib:
+            if tomllib is None:
+                if label == "no comment":   # one notice per run is enough
+                    print("tomllib unavailable: TOML validity asserts skipped (run under python3.11+)")
+            else:
                 d1 = tomllib.loads(t1)
                 check("env block + defaults (%s): parses, model and sandbox_mode top-level" % label,
                       d1["model"] == DEFAULT_MODEL and d1["sandbox_mode"] == "workspace-write"

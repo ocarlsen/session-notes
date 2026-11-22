@@ -10,7 +10,7 @@ prefix. Codex has no boot-budget check yet; its AGENTS.md has its own cap.
 An agent counts as installed when its home directory exists: paths.claude_home
 for Claude, agent.codex_home for Codex.
 
-    python3 nightly_check.py               # silent + exit 0 when every check is clean
+    python3 nightly_check.py               # silent + exit 0 when every check is clean (a could-not-check note may print)
     python3 nightly_check.py status        # one line (or nothing) from the last run's record
     python3 launch_agents.py install nightly-check   # run it every night (macOS)
     python3 nightly_check.py --selftest

@@ -667,7 +667,8 @@ def linked_worktree(path):
         return False
     try:
         r = subprocess.run(["git", "-C", path, "rev-parse", "--git-dir", "--git-common-dir"],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=20,
+                           env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
     except (OSError, subprocess.SubprocessError):
         r = None
     if r is not None and r.returncode == 0 and len(r.stdout.split("\n")) >= 2:
@@ -688,18 +689,20 @@ def cmd_apply(ctx, target, yes, allow_worktree=False):
     if not entries:
         raise EnvError("%s renders to nothing (an untouched template, or all comments); "
                        "refusing to apply an empty environment" % ctx.source)
+    codex_applies = "codex" in target_list(ctx, target) and not (
+        target == "all" and not os.path.isdir(ctx.codex_home))
+    if codex_applies and not allow_worktree:      # before ANY write, Claude's included
+        for d in ctx.send_bin_dirs():
+            if linked_worktree(d):
+                raise EnvError("%s is in a linked git worktree, and the Codex allow rules "
+                               "would name it (deleted when the branch merges); apply from "
+                               "the main checkout, or pass --allow-worktree to test a "
+                               "branch" % d)
     for t in target_list(ctx, target):
         home = ctx.claude_home if t == "claude" else ctx.codex_home
         if target == "all" and not os.path.isdir(home):
             emit("%s: skipped (no %s)" % (t, home))
             continue
-        if t == "codex" and not allow_worktree:
-            for d in ctx.send_bin_dirs():
-                if linked_worktree(d):
-                    raise EnvError("%s is in a linked git worktree, and the Codex allow rules "
-                                   "would name it (deleted when the branch merges); apply from "
-                                   "the main checkout, or pass --allow-worktree to test a "
-                                   "branch" % d)
         (apply_claude if t == "claude" else apply_codex)(ctx, entries, yes)
     return 0
 
@@ -1212,7 +1215,11 @@ def selftest():
             VERSION_FN = lambda: "0.171.0"
             FETCH = lambda url: policy
 
-            # through nightly_check, with a real config in a temp HOME
+            # through nightly_check, with a real config in a temp HOME. nightly_check does its
+            # own `import environment_render`; make that resolve to THIS module so the FETCH /
+            # VERSION_FN stubs reach it (never the real codex or network).
+            saved_mod = sys.modules.get("environment_render")
+            sys.modules["environment_render"] = sys.modules[__name__]
             import nightly_check
             conf = os.path.join(d, "config.toml")
             with open(conf, "w") as fh:
@@ -1229,10 +1236,21 @@ def selftest():
             rc = nightly_check.run_all(env, NoRun(), buf)
             check("nightly_check reports the environment drift (rc 3)",
                   rc == 3 and "environment_render" in buf.getvalue())
-            run(cmd_apply, context(env), "all", True, allow_worktree=True)   # BIN may be a worktree
+            run(cmd_apply, context(env), "all", True, allow_worktree=linked_worktree(BIN))   # a worktree needs the flag
             buf = io.StringIO()
             rc = nightly_check.run_all(env, NoRun(), buf)
             check("nightly_check silent when the environment is in sync", rc == 0 and buf.getvalue() == "")
+            def failing_fetch(url):
+                raise OSError("offline")
+            FETCH = failing_fetch
+            buf = io.StringIO()
+            rc = nightly_check.run_all(env, NoRun(), buf)
+            doc = json.load(open(os.path.join(d, "state", "last-check.json")))
+            envc = [c for c in doc["checks"] if c["check"] == "environment_render"]
+            check("nightly_check: a failed upstream fetch puts the note in the report, rc 0, 0 findings",
+                  rc == 0 and "could not check" in buf.getvalue()
+                  and envc and envc[0]["findings"] == 0 and envc[0]["status"] == "clean")
+            FETCH = lambda url: policy
             os.unlink(srcf)
             buf = io.StringIO()
             rc = nightly_check.run_all(env, NoRun(), buf)
@@ -1241,6 +1259,10 @@ def selftest():
                   rc == 0 and buf.getvalue() == "" and all(c["check"] != "environment_render" for c in doc["checks"]))
         finally:
             FETCH = VERSION_FN = None
+            if saved_mod is None:
+                sys.modules.pop("environment_render", None)
+            else:
+                sys.modules["environment_render"] = saved_mod
 
     # ---- review follow-ups (PR #49)
     # a multi-line string closing on a `#` line right before the first table
@@ -1295,17 +1317,22 @@ def selftest():
         open(lookalike, "w").write("keep\n")
         run(cmd_apply, ctx2, "claude", True)
         left = [f for f in os.listdir(ch2) if f.startswith("settings.json.bak-environment-2")]
+        survivors = sorted(open(os.path.join(ch2, f)).read() for f in left)
         check("backups pruned to the newest 3; a lookalike name is never touched",
               len(baks2) <= 3 and len(left) == 3 and open(lookalike).read() == "keep\n")
+        check("the newest three backups are the ones kept",
+              all(json.loads(t)["autoMode"]["environment"][0] in ("old3", "old4", "old5") for t in survivors)
+              and len(set(survivors)) == 3)
 
     # F2: codex apply from a linked git worktree refuses unless --allow-worktree
     if shutil.which("git"):
         with tempfile.TemporaryDirectory() as d:
             main_co, wt = os.path.join(d, "main"), os.path.join(d, "wt")
+            clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
             g = lambda *a, cwd=main_co: subprocess.run(
                 ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
                  "-c", "commit.gpgsign=false", "-C", cwd] + list(a),
-                capture_output=True, text=True, check=True)
+                capture_output=True, text=True, check=True, env=clean_env)
             os.makedirs(os.path.join(main_co, "bin"))
             open(os.path.join(main_co, "bin", "x"), "w").write("x\n")
             g("init", "-q")
@@ -1315,6 +1342,17 @@ def selftest():
             check("linked_worktree: true in a worktree, false in the main checkout",
                   linked_worktree(os.path.join(wt, "bin")) and not linked_worktree(os.path.join(main_co, "bin"))
                   and not linked_worktree(os.path.join(d, "nowhere")))
+            other = os.path.join(d, "other")
+            os.makedirs(other)
+            g("init", "-q", cwd=other)
+            saved_git = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("GIT_")}
+            os.environ["GIT_DIR"] = os.path.join(other, ".git")
+            try:
+                check("linked_worktree ignores an inherited GIT_DIR pointing at another repo",
+                      linked_worktree(os.path.join(wt, "bin")) and not linked_worktree(os.path.join(main_co, "bin")))
+            finally:
+                os.environ.pop("GIT_DIR", None)
+                os.environ.update(saved_git)
             srcf3, xh3 = os.path.join(d, "environment.md"), os.path.join(d, "codex")
             os.makedirs(xh3)
             with open(srcf3, "w") as fh:
@@ -1324,8 +1362,15 @@ def selftest():
             check("apply --target codex from a worktree refuses, naming the fix, writes nothing",
                   "linked git worktree" in msg and "main checkout" in msg and "--allow-worktree" in msg
                   and not os.path.exists(ctx3.config_toml) and not os.path.exists(ctx3.rules))
-            check("apply --target all refuses the same way when the codex home exists",
-                  "linked git worktree" in (raises(cmd_apply, ctx3, "all", True) or ""))
+            os.makedirs(ctx3.claude_home)
+            with open(ctx3.settings, "w") as fh:
+                json.dump({"z": 1}, fh)
+            buf3 = io.StringIO()
+            with contextlib.redirect_stdout(buf3):
+                msg = raises(cmd_apply, ctx3, "all", True) or ""
+            check("apply --target all refuses before writing anything, Claude's settings included",
+                  "linked git worktree" in msg and json.load(open(ctx3.settings)) == {"z": 1}
+                  and not [f for f in os.listdir(ctx3.claude_home) if ".bak" in f])
             rc, out = run(cmd_diff, ctx3, "codex")
             check("diff from a worktree still runs", rc == 1 and "no session-notes block" in out)
             run(cmd_apply, ctx3, "codex", True, allow_worktree=True)
