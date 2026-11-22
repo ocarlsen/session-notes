@@ -89,6 +89,17 @@ size_cap_kb = 1024
 # Private terms for public repos, in the format tests/leak_scan.py documents.
 leak_terms = "~/.config/session-notes/leak-terms.txt"
 
+[checkout_guard]
+# hooks/checkout_guard.py: a PreToolUse guard that refuses edits to tracked files in a repo's
+# main checkout while it is on the default branch, a raw `gh pr merge`, and destructive git
+# (checkout -f, checkout -- paths, restore, reset --hard, clean -fd) on a dirty tree.
+# There is no other off switch: no environment variable or command-line comment disables it.
+# Repo roots where the guard does nothing at all (a repo with its own guards).
+exempt_repos = []
+# Extra glob patterns (matched on the absolute real path, ~ expanded) that edits may touch
+# on the default branch. Every scope's memory store below is always exempt.
+exempt_paths = []
+
 # One block per project folder that keeps its own memory store.
 # `store` is optional, and best left out: empty = the folder Claude Code
 # already keeps for that project, named after its full path, e.g.
