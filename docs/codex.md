@@ -37,16 +37,19 @@ sh install.sh --codex
 It asks `[y/N]` before each step:
 
 1. Link the three Codex skills into `~/.codex/skills/`.
-2. Register the hooks in `~/.codex/hooks.json` (see Hooks below). An existing file is
-   refreshed, not skipped: only session-notes entries are replaced (from any checkout,
-   so a moved checkout's entries do not pile up), and every other entry and event is kept. The step shows a diff first and keeps a
-   `.bak-session-notes` copy.
-3. Append two tables to `~/.codex/config.toml` (keeping a `.bak-session-notes`
+2. Write the hook launcher, `~/.local/bin/session-notes`: a small generated script with
+   this checkout's path baked in (see Hooks below). It refuses to overwrite a file at that
+   path that is not a session-notes launcher.
+3. Register the hooks in `~/.codex/hooks.json`. Every command goes through the launcher.
+   An existing file is refreshed, not skipped: only session-notes entries are replaced
+   (old-form entries from any checkout too, so they do not pile up), and every other entry
+   and event is kept. The step shows a diff first and keeps a `.bak-session-notes` copy.
+4. Append two tables to `~/.codex/config.toml` (keeping a `.bak-session-notes`
    copy). `shell_environment_policy.set` gives the skills `SESSION_NOTES` and
    `SESSION_NOTES_AGENT`. `sandbox_workspace_write.writable_roots` lets
    `$reflect` write `~/.codex/session-notes` from the CLI's default sandbox.
    If either table already exists, the text is printed instead.
-4. Write a marked block (`<!-- session-notes:begin ... -->` to
+5. Write a marked block (`<!-- session-notes:begin ... -->` to
    `<!-- session-notes:end -->`) into `~/.codex/AGENTS.md`, rewritten on every
    install so an older install gets the newer sections too. It holds
    [`AGENTS.snippet.md`](../AGENTS.snippet.md) (only `$reflect` writes the store;
@@ -55,23 +58,34 @@ It asks `[y/N]` before each step:
    `rules/review-contract.md`, and an optional private addendum (config key
    `rules.local`). The same step sets a default model and effort in `config.toml`
    only where unset, and offers `build` and `review` profiles (`codex -p build`).
-5. Add two lines to `~/.codex/rules/default.rules` that approve exactly one
+6. Add two lines to `~/.codex/rules/default.rules` that approve exactly one
    command, `python3 <repo>/bin/codex_save.py commit`, so the desktop app saves
    memory without asking (see Saving memory below).
+
+Install from the main checkout, not from a linked git worktree: `install.sh --codex` (and
+`codex_hooks.py merge` and `launcher`) refuse a worktree up front, before any step or prompt,
+because `wt merge` deletes it.
 
 Then trust the new or changed hooks (next section).
 
 ## Hooks
 
-`install.sh --codex` registers these in `~/.codex/hooks.json` (every command is prefixed
-`SESSION_NOTES_AGENT=codex`):
+`install.sh --codex` registers these in `~/.codex/hooks.json`. Every command has the form
+`SESSION_NOTES_AGENT=codex <launcher> hook <name>`, with the launcher's absolute path (the
+desktop app's PATH lacks `~/.local/bin`):
 
 | Event | Hooks |
 |---|---|
-| SessionStart | `codex_session_start.py` (boot load), `session_pane_registry.py` |
-| UserPromptSubmit | `time_sense.py`, `session_bus_hook.py` |
-| Stop | `session_bus_hook.py` |
-| PostToolUse (`apply_patch`) | `em_dash_guard.py`, which checks only the lines a patch adds |
+| SessionStart | `codex_session_start` (boot load), `session_pane_registry` |
+| UserPromptSubmit | `time_sense`, `session_bus_hook` |
+| Stop | `session_bus_hook` |
+| PostToolUse (`apply_patch`) | `em_dash_guard`, which checks only the lines a patch adds |
+
+**The launcher.** `python3 bin/codex_hooks.py launcher --repo <checkout>` writes the script
+(`--path FILE` to put it elsewhere, `--dry-run` to print it). It runs
+`<checkout>/hooks/<name>.py` with stdin, environment and arguments passed through;
+`session-notes repo` prints the checkout it points at. Rewriting it with the same checkout
+changes nothing.
 
 The output shape is Claude's (`hookSpecificOutput.additionalContext`), so the same scripts
 serve both. The differences are small: Codex has no Notification event, so there is no
@@ -80,23 +94,28 @@ idle-prompt hook; `time_sense.py` tells Codex to run `$refresh` where it tells C
 
 **Refresh.** Rerunning the install updates the file in place through `bin/codex_hooks.py`.
 It replaces only this repo's entries: a command with the `SESSION_NOTES_AGENT=codex` prefix
-that runs one of the five scripts above from a `hooks/<script>` path (so entries from a moved
-or removed checkout are cleaned up too). Everything else, including your private hooks, is
-kept, and nothing is written when nothing changed, so a second run is a no-op. A file whose
-`hooks` shape is unexpected is refused untouched. `python3 bin/codex_hooks.py merge --repo <checkout> --file
-~/.codex/hooks.json --dry-run` shows the diff.
+that runs `<launcher> hook <name>` for one of the five hooks above (the launcher may be at any
+path), or the older form that ran `python3 <checkout>/hooks/<script>.py` (so entries from a
+moved or removed checkout are migrated, not duplicated). Everything else, including your
+private hooks, is kept, and nothing is written when nothing changed, so a second run is a
+no-op. A file whose `hooks` shape is unexpected is refused untouched.
+`python3 bin/codex_hooks.py merge --repo <checkout> --file ~/.codex/hooks.json --dry-run`
+shows the diff.
 
 **Trust.** Codex runs a hook only after you trust it, and it trusts the exact hook
 definition: a new hook, or any change to an entry (the command, the timeout, a limit),
 may need trusting again, and until then the hook is silently skipped. Open `/hooks` in the
 CLI, or Settings > Hooks in the desktop app, after every install that changed something.
 
-**Moving or removing a checkout.** A hook whose script file is missing BLOCKS every
-prompt ("can't open file"), and a running Codex session keeps the hooks it loaded at
-start. So never delete a checkout that `hooks.json` points at, including a test worktree:
-run `install.sh --codex` from the checkout that stays, restart every open Codex session
-(and trust the changed hooks), then delete the old one. `codex_hooks.py merge` warns about
-any entry, ours or not, whose script is missing.
+**Moving or removing a checkout.** hooks.json does not name a checkout, so its bytes are the
+same whichever checkout installs: run `install.sh --codex` from the checkout that stays and
+only the launcher is rewritten. Codex sees no change to any hook, so nothing needs trusting
+again. (A running Codex session needs no restart either: the launcher is read on each hook
+run.) Until you do, a missing checkout is survivable: an informational hook prints one
+warning line and passes, so prompts keep working, and a guard hook (`em_dash_guard`) fails
+closed with exit 2, which blocks only that tool call. `codex_hooks.py merge` warns about
+any entry, ours or not, whose script or launcher is missing, or whose launcher's checkout
+lacks the script.
 
 ## Sessions and the bus
 
@@ -179,7 +198,7 @@ So the skills save in two steps with `bin/codex_save.py`:
 1. `stage` queues each change (a memory file, an index line, or a new
    RESUME.md) in `/tmp/session-notes-<uid>/<thread>/`. It writes only `/tmp`,
    so it runs in the sandbox without asking.
-2. `commit` is always the same text, so the rule from step 5 of the install
+2. `commit` is always the same text, so the rule from step 6 of the install
    approves it. It takes the lock, applies the queue through the same helpers
    as before (`append_memory_index.py` for index lines), and releases the lock.
 
@@ -210,7 +229,7 @@ match the rule and falls back to an approval prompt.
 - `nightly_check.py` runs the canary once per installed agent, each against its
   own stores, plus `boot_budget.py check` for Claude. On macOS,
   `launch_agents.py install nightly-check` runs it every night.
-- Without the rule from install step 5, the desktop app asks once per save,
+- Without the rule from install step 6, the desktop app asks once per save,
   for `codex_save.py commit`. "Allow similar commands" on that prompt saves
   the same rule.
 - The boot load happens once per session, the same as on the Claude side. A

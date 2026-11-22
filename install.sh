@@ -15,6 +15,9 @@
 #   - offers the standing rules (rules/core.md, plus an optional private addendum): in
 #     CLAUDE.md as @import lines; for Codex as a marked block in ~/.codex/AGENTS.md that
 #     every install rewrites (bin/rules_block.py)
+#   - with --codex, writes one small launcher (~/.local/bin/session-notes) that every Codex
+#     hook runs through, so hooks.json never names a checkout; refuses to run from a linked
+#     git worktree (install from the main checkout)
 #   - with --codex, also sets Codex's default model and reasoning effort when unset, and
 #     offers build and review profiles (codex -p build, codex -p review)
 #   - on macOS, offers two background jobs: the nightly memory checks and the bus_nudge loop
@@ -30,9 +33,10 @@
 #   sh install.sh --git-hooks <repo>  install the session-notes pre-commit into a git repo
 #                                    (chains any hook already there; see docs/tools.md, wt)
 #   sh install.sh --codex            set up OpenAI Codex instead (docs/codex.md): link the
-#                                    Codex skills into ~/.codex/skills, refresh hooks.json
-#                                    and config.toml edits, the rules block, the model
-#                                    defaults and profiles; never touches ~/.claude
+#                                    Codex skills into ~/.codex/skills, write the hook
+#                                    launcher, refresh hooks.json and config.toml edits,
+#                                    the rules block, the model defaults and profiles;
+#                                    never touches ~/.claude
 set -eu
 
 REPO=$(cd "$(dirname "$0")" && pwd)
@@ -56,7 +60,7 @@ while [ $# -gt 0 ]; do
                  [ -n "$2" ] || { echo "install.sh: --git-hooks needs a non-empty repo path" >&2; exit 2; }
                  GITHOOKS="$2"; GITHOOKS_SET=1; shift 2 ;;
     --codex) CODEX=1; shift ;;
-    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -64,6 +68,12 @@ done
 if [ "$GITHOOKS_SET" = 1 ]; then
   if [ "$DRY" = 1 ]; then exec python3 "$REPO/bin/wt.py" install-hooks --dry-run "$GITHOOKS"; fi
   exec python3 "$REPO/bin/wt.py" install-hooks "$GITHOOKS"
+fi
+
+# A linked git worktree is deleted when its change merges: never install Codex hooks from one.
+# The check lives in codex_hooks.py (one source of truth); it prints the message and exits 1.
+if [ "$CODEX" = 1 ]; then
+  python3 "$REPO/bin/codex_hooks.py" check-repo --repo "$REPO" || exit 1
 fi
 
 # A path under $HOME prints as ~/...: shorter, and the hook commands, which run in a shell,
@@ -184,14 +194,38 @@ TOML
   # A refusal (corrupt or unexpected hooks.json) skips this step only; the rest still runs.
   ch() { python3 "$CH" "$@"; }
   hooks_skipped() { echo "Hooks step skipped: $(tilde "$HJ") was left untouched (see above)."; }
+  # Every hook command runs through one generated launcher, so hooks.json never names a
+  # checkout: reinstalling from another checkout rewrites only the launcher (no re-trust).
+  LAUNCHER="$HOME/.local/bin/session-notes"
+  LAUNCHER_OK=1
+  echo "Launcher for the hooks, $(tilde "$LAUNCHER") (a small script that runs this checkout's hooks):"
+  if [ "$DRY" = 1 ]; then
+    ch launcher --repo "$REPO" --path "$LAUNCHER" --dry-run || LAUNCHER_OK=0
+  elif [ "$ASK" = 1 ]; then
+    if ch launcher --repo "$REPO" --path "$LAUNCHER" --dry-run; then
+      if ask "Write it?"; then
+        ch launcher --repo "$REPO" --path "$LAUNCHER" | tail -n 1
+      else
+        echo "Skipped the launcher."; LAUNCHER_OK=0
+      fi
+    else
+      LAUNCHER_OK=0
+    fi
+  else
+    echo "Write it by hand with:"
+    echo "  python3 '$CH' launcher --repo '$REPO' --path '$LAUNCHER'"
+  fi
+  echo
   echo "Hooks for $(tilde "$HJ"): boot load, time sense, bus mail, pane registry, em-dash guard."
   echo "An existing file is refreshed: only this repo's hook entries change, yours are kept."
-  if [ "$DRY" = 1 ]; then
-    ch merge --repo "$REPO" --file "$HJ" --dry-run || hooks_skipped
+  if [ "$LAUNCHER_OK" = 0 ]; then
+    echo "Hooks step skipped: no launcher for them to run through."
+  elif [ "$DRY" = 1 ]; then
+    ch merge --repo "$REPO" --file "$HJ" --launcher "$LAUNCHER" --dry-run || hooks_skipped
   elif [ "$ASK" = 1 ]; then
-    if ch merge --repo "$REPO" --file "$HJ" --dry-run; then
+    if ch merge --repo "$REPO" --file "$HJ" --launcher "$LAUNCHER" --dry-run; then
       if ask "Write it (keeping a .bak-session-notes copy)?"; then
-        ch merge --repo "$REPO" --file "$HJ" | tail -n 1
+        ch merge --repo "$REPO" --file "$HJ" --launcher "$LAUNCHER" | tail -n 1
       else
         echo "Skipped hooks.json."
       fi
@@ -200,8 +234,8 @@ TOML
     fi
   else
     echo "Merge into $(tilde "$HJ") by hand, or run:"
-    echo "  python3 '$CH' merge --repo '$REPO' --file '$HJ'"
-    ch show --repo "$REPO"
+    echo "  python3 '$CH' merge --repo '$REPO' --file '$HJ' --launcher '$LAUNCHER'"
+    ch show --launcher "$LAUNCHER"
   fi
   echo
   if [ "$ASK" = 1 ] && ! grep -q -E '^\[(shell_environment_policy|sandbox_workspace_write)\]' "$CT" 2>/dev/null; then
