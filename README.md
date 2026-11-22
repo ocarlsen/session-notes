@@ -38,6 +38,9 @@ plain Python 3.9+ with no dependencies.
   ledger under your Claude home; `bin/skill_feedback.py propose` prints the evidence and a HELD
   note, so the model drafts the SKILL.md change and you approve it, rather than a habit you keep
   correcting by hand. Detail: docs/tools.md.
+- **`bin/environment_render.py`** turns one private Markdown description of your environment into
+  Claude Code's `autoMode.environment` and Codex's `[auto_review]` policy, with a diff before any
+  write. Detail: docs/tools.md, docs/codex.md.
 
 A project's store defaults to the folder Claude Code already keeps for it,
 `~/.claude/projects/<project>/memory/`, so auto memory loads its index at

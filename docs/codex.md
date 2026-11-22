@@ -155,20 +155,56 @@ pane, so it needs both:
   has no `TMUX_PANE` and cannot say which session is sending. With `--no-daemon`, commands
   run from the pane and keep it.
 - **Approval outside the sandbox:** the sandbox refuses the tmux socket, so the lookup fails
-  inside it. Approve the send when Codex asks, or add an allow rule for
-  `<bin>/session_bus.py send` if you want Codex to send without asking. That rule also
-  covers `send --all --broadcast-confirm`, which reaches every session at once.
+  inside it. Approve the send when Codex asks, or let `environment_render.py apply --target
+  codex` add the allow rule for `<bin>/session_bus.py send` (see Auto-review below). That rule
+  also covers `send --all --broadcast-confirm`, which reaches every session at once.
 
 To let the read-only session tools run without an approval prompt each time, add rules
 like these to `~/.codex/rules/default.rules` (replace `<bin>` with the directory holding
 `session_bus.py`, as an absolute path). Nothing that types into a pane is allowed:
-`send-keys` and `session_bus.py send` still ask.
+`send-keys` still asks, and `session_bus.py send` is allowed only by the marked rule that
+`environment_render.py apply --target codex` writes.
 
 ```
 prefix_rule(pattern=["tmux", ["list-sessions","list-panes","display-message"]], decision="allow")
 prefix_rule(pattern=["tmux", "capture-pane", "-p"], decision="allow")
 prefix_rule(pattern=["python3", "<bin>/session_bus.py", ["inbox","peers"]], decision="allow")
 ```
+
+## Auto-review
+
+Codex can route approval prompts to an automatic reviewer instead of you. Its `[auto_review]
+policy` value is Markdown that REPLACES the whole bundled reviewer policy ("omitted rules drop
+out of the replacement"; a blank value is ignored), so it cannot hold just your environment.
+`bin/environment_render.py` builds the full policy: the bundled one, byte for byte, with the
+entries of your environment file added at the end of its `## Environment Profile` section.
+
+- **Source:** one private Markdown file (`environment.source`, default `environment.md` beside
+  the config; start from `templates/environment.md`). The same file becomes Claude Code's
+  `autoMode.environment`. Each non-blank line outside HTML comments is one entry.
+- **Pinned policy:** `templates/codex-auto-review-policy.md` is Codex's
+  `codex-rs/prompts/templates/guardian/policy.md` at tag `rust-v0.171.0` (Apache-2.0, OpenAI;
+  see `NOTICE`). The script holds the tag and sha256 as constants and refuses to run if the
+  file's hash differs.
+- **What `apply --target codex` writes:** one marked block in `<codex_home>/config.toml`,
+  placed after the leading top-level keys and before the first `[table]`:
+  `sandbox_mode = "workspace-write"`, `approval_policy = "on-request"`,
+  `approvals_reviewer = "auto_review"` and `auto_review.policy = """..."""`. It refuses, naming
+  the line, if the file already sets any of those keys (or has an `[auto_review]` table)
+  outside the block; resolve that by hand. It also keeps one marked block in
+  `<codex_home>/rules/default.rules` with `prefix_rule(pattern=["python3",
+  "<bin>/session_bus.py", "send"], decision="allow")` for this repo's `bin` (and
+  `<claude_home>/bin` when it resolves to the same file). Lines outside the blocks are never
+  touched. Every write takes a `.bak-environment-<timestamp>` copy first.
+- **Day to day:** `environment_render.py diff` shows what would change (silent when equal),
+  `apply` asks and writes. `nightly_check.py` runs the same comparison for each installed
+  target and reports drift.
+- **Updating the pin:** `environment_render.py upstream` fetches the bundled policy at the
+  installed Codex version's tag and reports when it differs from the vendored copy; the
+  nightly check runs it too. To move to a newer policy: copy the new
+  `policy.md` over `templates/codex-auto-review-policy.md`, review the diff, then set
+  `POLICY_TAG` and `POLICY_SHA256` in `bin/environment_render.py` (`shasum -a 256` the file)
+  and `apply` again.
 
 ## How the pieces map
 

@@ -57,6 +57,12 @@ build_note = ""
 # file is fine; an unreadable one is an error. Empty = no addendum.
 local = "~/.config/session-notes/rules.local.md"
 
+[environment]
+# The private Markdown file bin/environment_render.py renders into Claude Code's
+# autoMode.environment and Codex's [auto_review] policy. Empty = environment.md in the
+# same folder as this config file. Start from templates/environment.md.
+source = ""
+
 [budgets]
 # Boot-prefix budgets, checked by boot_budget.py. Measured in characters,
 # which is what the boot prefix counts.
