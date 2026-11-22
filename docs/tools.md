@@ -191,6 +191,16 @@ comment that turns the guard off.
 `checkout_guard: <error>` line on stderr. A config file that fails to parse also fails open, and
 the line names the file and says the guard is off for that call.
 
+**Conflict resolution passes.** `git checkout --ours/--theirs/--merge/-m <paths>` and
+`git restore --ours/--theirs/--merge <paths>` are allowed when every named path is unmerged. `git
+checkout -- <paths>` and `git restore <paths>` are judged by the named paths only (`.` or a magic
+pathspec falls back to the whole tree). `git clean -X` (ignored files only) passes. A repo with
+no `origin` remote is never refused by Arm A, since there is no PR flow and `wt new` needs one.
+
+**Known limits.** Arm A does not see shell writes (`sed -i`, redirects). A `-C "$VAR"` or
+`cd "$VAR"` that cannot be resolved is judged against the nearest existing parent directory. The
+`gh pr merge` exemption is keyed on the current directory's repo. `gh api` merges are not covered.
+
 **Codex.** The hook already understands Codex `apply_patch` and shell payloads, but the shell
 tool's name is not verified: the accepted names live in one constant (`SHELL_TOOLS`) and are
 guesses until a live Codex run. For that reason `install.sh --codex` does not register the hook

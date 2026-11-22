@@ -54,8 +54,11 @@ PATCH_TOOLS = ("apply_patch",)
 SHELL_TOOLS = ("shell", "exec_command", "local_shell", "container.exec", "Bash")
 
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
-WRAPPERS = ("command", "env", "sudo", "time", "nohup", "exec")
-_WRAPPER_VALUE_FLAGS = ("-u", "-g", "-h", "-p", "-U", "-C", "-D", "-R", "-T")
+# wrapper -> the flags that take a separate value
+WRAPPERS = {"command": (), "env": ("-u", "-C", "-S"), "time": (), "nohup": (), "exec": ("-a",),
+            "sudo": ("-u", "-g", "-h", "-p", "-U", "-C", "-D", "-R", "-T")}
+# shell keywords that can sit in front of a command
+KEYWORDS = ("if", "then", "else", "elif", "do", "while", "until", "!", "{", "(")
 _PATCH_RE = re.compile(r"^\*\*\* (?:Update File|Add File|Delete File|Move to): (.+?)\s*$", re.M)
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _HEREDOC_RE = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
@@ -119,17 +122,45 @@ def on_default_branch(top, branch):
     return branch in ("main", "master")
 
 
+def has_origin(top):
+    return _git(top, "config", "--get", "remote.origin.url").returncode == 0
+
+
 def is_tracked(top, real):
     return _git(top, "ls-files", "--error-unmatch", "--", real).returncode == 0
 
 
-def dirty(tree, untracked):
-    """True when `tree` has uncommitted changes. None when it is not a git repo."""
+def dirty(tree, untracked, paths=None):
+    """True when `tree` has uncommitted changes (only under `paths` when given; "." and magic
+    pathspecs fall back to the whole tree). None when it is not a git repo."""
     d = _nearest_dir(tree)
-    r = _git(d, "status", "--porcelain", "--untracked-files=" + ("normal" if untracked else "no"))
+    mode = "--untracked-files=" + ("normal" if untracked else "no")
+    if paths and not any(p == "." or p.startswith(":") for p in paths):
+        seen = False
+        for p in paths:
+            r = _git(d, "status", "--porcelain", mode, "--", p)
+            if r.returncode != 0:
+                return None
+            seen = seen or bool(r.stdout.strip())
+        return seen
+    r = _git(d, "status", "--porcelain", mode)
     if r.returncode != 0:
         return None
     return bool(r.stdout.strip())
+
+
+def all_unmerged(tree, paths):
+    """True when every path is an unmerged (conflicted) file. Unknown state = False."""
+    d = _nearest_dir(tree)
+    if not paths:
+        return False
+    for p in paths:
+        if p == "." or p.startswith(":") or os.path.isdir(os.path.join(d, p)):
+            return False
+        r = _git(d, "ls-files", "-u", "--", p)
+        if r.returncode != 0 or not r.stdout.strip():
+            return False
+    return True
 
 
 def wt_command():
@@ -167,8 +198,8 @@ def check_edit(paths, cwd, cfg):
         top, common = info
         if repo_exempt(cfg, top) or path_exempt(cfg, real):
             continue
-        if not is_main_checkout(top, common):
-            continue
+        if not is_main_checkout(top, common) or not has_origin(top):
+            continue  # no origin = no PR flow, and `wt new` needs one
         branch = current_branch(top)
         if not branch or not on_default_branch(top, branch):
             continue
@@ -250,12 +281,13 @@ def strip_prefix(argv):
     """Drop env assignments and wrapper commands in front of the real command."""
     while argv:
         tok = argv[0]
-        if _ASSIGN_RE.match(tok) or tok == "{":
+        if _ASSIGN_RE.match(tok) or tok in KEYWORDS:
             argv = argv[1:]
         elif tok in WRAPPERS:
+            valued = WRAPPERS[tok]
             argv = argv[1:]
             while argv and (argv[0].startswith("-") or _ASSIGN_RE.match(argv[0])):
-                skip = 2 if argv[0] in _WRAPPER_VALUE_FLAGS else 1
+                skip = 2 if argv[0] in valued else 1
                 argv = argv[skip:]
         else:
             break
@@ -303,28 +335,46 @@ def _flags(args):
 
 
 def destructive_verb(sub, args):
-    """(verb text, needs untracked in the dirty check) when this git call can destroy
-    uncommitted work, else None."""
+    """(verb text, needs untracked in the dirty check, paths or None for the whole tree) when
+    this git call can destroy uncommitted work, else None."""
     longs, shorts, pos, dd = _flags(args)
     if sub == "checkout":
         if "--force" in longs or "f" in shorts:
-            return "git checkout -f", False
-        if dd or pos == ["."]:
-            return "git checkout (paths)", False
+            return "git checkout -f", False, None
+        if dd:
+            return "git checkout (paths)", False, _after_dd(args)
+        if pos == ["."]:
+            return "git checkout .", False, None
+    elif sub == "switch":
+        if "--force" in longs or "--discard-changes" in longs or "f" in shorts:
+            return "git switch -f", False, None
     elif sub == "restore":
         staged = "--staged" in longs or "S" in shorts
         worktree = "--worktree" in longs or "W" in shorts
         if not (staged and not worktree):
-            return "git restore", False
+            return "git restore", False, pos
     elif sub == "reset":
         if "--hard" in longs:
-            return "git reset --hard", False
+            return "git reset --hard", False, None
     elif sub == "clean":
         force = "--force" in longs or "f" in shorts
         dryrun = "--dry-run" in longs or "n" in shorts
-        if force and "d" in shorts and not dryrun:
-            return "git clean -fd", True
+        ignored_only = "X" in shorts and "x" not in shorts
+        if force and "d" in shorts and not dryrun and not ignored_only:
+            return "git clean -fd", True, None
     return None
+
+
+def _after_dd(args):
+    return args[args.index("--") + 1:] if "--" in args else []
+
+
+def _resolving_conflict(sub, args, tree):
+    """`--ours/--theirs/--merge` (checkout also `-m`) naming only unmerged paths."""
+    longs, shorts, pos, dd = _flags(args)
+    if not (longs & {"--ours", "--theirs", "--merge"} or (sub == "checkout" and "m" in shorts)):
+        return False
+    return all_unmerged(tree, pos)
 
 
 def _dirty_path_operand(tree, args):
@@ -404,13 +454,15 @@ def check_command(cmd, cwd, cfg, depth=0):
                 return _merge_msg(wt)
         elif name == "git":
             sub, args, tree = _git_target(argv, cwd)
+            if sub in ("checkout", "restore") and _resolving_conflict(sub, args, tree):
+                continue
             hit = destructive_verb(sub, args) if sub else None
             if not hit and sub == "checkout" and _dirty_path_operand(tree, args):
-                hit = ("git checkout <path>", False)
+                hit = ("git checkout <path>", False, None)
             if not hit:
                 continue
-            verb, untracked = hit
-            if _exempt_cwd(cfg, tree) or not dirty(tree, untracked):
+            verb, untracked, paths = hit
+            if _exempt_cwd(cfg, tree) or not dirty(tree, untracked, paths):
                 continue
             return ("checkout_guard: `%s` would destroy uncommitted changes: the tree at %s has "
                     "%s. Commit them first (a WIP commit is fine) or save a copy, then retry."
@@ -540,7 +592,7 @@ def selftest():
         def sh(cwd, *args):
             subprocess.run(args, cwd=cwd, env=gitenv, check=True, capture_output=True)
 
-        def mkrepo(name, files=("a.txt",), branch="main"):
+        def mkrepo(name, files=("a.txt",), branch="main", origin=True):
             d = os.path.join(tmp, name)
             os.makedirs(d)
             sh(d, "git", "init", "-q", "-b", branch)
@@ -550,14 +602,39 @@ def selftest():
                     fh.write("x\n")
             sh(d, "git", "add", "-A")
             sh(d, "git", "commit", "-q", "-m", "init")
+            if origin:
+                bare = os.path.join(tmp, "origins", name + ".git")
+                os.makedirs(bare)
+                sh(bare, "git", "init", "-q", "--bare", "-b", branch)
+                sh(d, "git", "remote", "add", "origin", bare)
+                sh(d, "git", "push", "-q", "-u", "origin", branch)
+                sh(d, "git", "remote", "set-head", "origin", "-a")
             return d
 
-        main_repo = mkrepo("main_repo", ("a.txt", "docs/g.txt"))
+        main_repo = mkrepo("main_repo", ("a.txt", "docs/g.txt", "pkg/inner/m.py"))
         wt1 = os.path.join(tmp, "wt1")
         sh(main_repo, "git", "worktree", "add", "-q", "-b", "feat", wt1)
         memrepo = mkrepo("memrepo", ("mem/note.md",))
         exrepo = mkrepo("exrepo", ("b.txt",))
-        devrepo = mkrepo("devrepo", ("a.txt",), branch="dev")
+        devrepo = mkrepo("devrepo", ("a.txt",))
+        sh(devrepo, "git", "checkout", "-q", "-b", "dev")
+        noorigin = mkrepo("noorigin", ("a.txt",), origin=False)
+        devmain = mkrepo("devmain", ("a.txt",))
+        sh(devmain, "git", "checkout", "-q", "-b", "dev")
+        wt_on_main = os.path.join(tmp, "wt_on_main")
+        sh(devmain, "git", "worktree", "add", "-q", wt_on_main, "main")
+        conf = mkrepo("conf", ("a.txt", "b.txt"))
+        sh(conf, "git", "checkout", "-q", "-b", "other")
+        with open(os.path.join(conf, "a.txt"), "w") as fh:
+            fh.write("theirs\n")
+        sh(conf, "git", "commit", "-q", "-am", "o")
+        sh(conf, "git", "checkout", "-q", "main")
+        with open(os.path.join(conf, "a.txt"), "w") as fh:
+            fh.write("ours\n")
+        sh(conf, "git", "commit", "-q", "-am", "m")
+        subprocess.run(["git", "merge", "other"], cwd=conf, env=gitenv, capture_output=True)
+        with open(os.path.join(conf, "b.txt"), "w") as fh:
+            fh.write("dirty\n")
         dirty_repo = mkrepo("dirty")
         with open(os.path.join(dirty_repo, "a.txt"), "w") as fh:
             fh.write("changed\n")
@@ -637,6 +714,24 @@ def selftest():
         check("A pass: exempt_repos repo", passed(edit("Edit", os.path.join(exrepo, "b.txt"))))
         check("A pass: main checkout on a non-default branch",
               passed(edit("Edit", os.path.join(devrepo, "a.txt"))))
+        check("A pass: repo with no origin remote (no PR flow)",
+              passed(edit("Edit", os.path.join(noorigin, "a.txt"))))
+        check("A pass: tracked file in a linked worktree on main while the main checkout is on dev",
+              passed(edit("Edit", os.path.join(wt_on_main, "a.txt"))))
+        check("A pass: main checkout on dev (not the default branch)",
+              passed(edit("Edit", os.path.join(devmain, "a.txt"))))
+        check("A refuse: tracked file in a non-exempt subdirectory",
+              refused(edit("Edit", os.path.join(main_repo, "pkg", "inner", "m.py"))))
+        wtrepo = mkrepo("wtrepo", ("a.txt",))
+        r = edit("Edit", os.path.join(wtrepo, "a.txt"))
+        m = re.search(r"run (.+?) new <name>", r.stderr)
+        check("A refuse: wtrepo (origin-backed) refused with a command", refused(r) and m, r.stderr)
+        wt_py = os.path.join(BIN, "wt.py")
+        r2 = subprocess.run([sys.executable, wt_py, "new", "probe"], cwd=wtrepo, env=env,
+                            capture_output=True, text=True, timeout=60)
+        check("A refuse: the printed `wt new` actually works in that repo (rc 0)",
+              r2.returncode == 0 and os.path.isdir(r2.stdout.strip() or "/nonexistent"),
+              r2.stdout + r2.stderr)
         check("A pass: unknown tool name", passed(run({"tool_name": "Read",
               "tool_input": {"file_path": os.path.join(main_repo, "a.txt")}, "cwd": tmp})))
 
@@ -680,6 +775,33 @@ def selftest():
               passed(bash("git restore --staged a.txt", dirty_repo)))
         check("B pass (dirty): git checkout otherbranch",
               passed(bash("git checkout otherbranch", dirty_repo)))
+        for cmd in ("if gh pr checks 1; then gh pr merge 1; fi",
+                    "while ! gh pr merge 1; do sleep 5; done", "time -p gh pr merge 1",
+                    "for x in a b; do gh pr merge $x; done"):
+            check("B refuse (keywords): " + cmd, refused(bash(cmd, nongit)))
+        for cmd in ("if true; then git reset --hard; fi", "for x in 1; do git checkout .; done",
+                    "! git reset --hard", "time -p git reset --hard",
+                    "git switch -f main", "git switch --force main",
+                    "git switch --discard-changes main"):
+            check("B refuse (dirty, keywords/switch): " + cmd, refused(bash(cmd, dirty_repo)))
+        check("B pass (keywords): for loop with a harmless body",
+              passed(bash("for x in a b; do echo $x; done", dirty_repo)))
+        check("B pass (dirty): git switch otherbranch / -c",
+              passed(bash("git switch -c nb", dirty_repo)) and passed(bash("git switch o", dirty_repo)))
+        check("B pass (dirty): git clean -fdX (ignored files only)",
+              passed(bash("git clean -fdX", dirty_repo)))
+        check("B refuse (dirty): git clean -fdxX is not ignored-only",
+              refused(bash("git clean -fdxX", dirty_repo)))
+        for cmd in ("git checkout --ours a.txt", "git checkout --theirs -- a.txt",
+                    "git checkout -m a.txt", "git checkout --merge a.txt",
+                    "git restore --theirs a.txt", "git restore --ours --merge a.txt"):
+            check("B pass (conflict): " + cmd, passed(bash(cmd, conf)))
+        check("B refuse (conflict tree): --theirs on a non-conflicted dirty path",
+              refused(bash("git checkout --theirs b.txt", conf)))
+        check("B refuse (conflict tree): git restore --theirs on a non-conflicted dirty path",
+              refused(bash("git restore --theirs b.txt", conf)))
+        check("B refuse (conflict tree): --ours with a mix of conflicted and dirty paths",
+              refused(bash("git checkout --ours a.txt b.txt", conf)))
         check("B refuse (dirty): bare git checkout a.txt",
               refused(bash("git checkout a.txt", dirty_repo)))
         sh(clean_repo, "git", "branch", "otherbranch")
@@ -693,6 +815,14 @@ def selftest():
               passed(bash("git checkout a.txt", clean_repo)))
         check("B pass: bare git checkout of a branch name on a dirty tree",
               passed(bash("git checkout otherbranch", clean_repo)))
+        check("B pass: git checkout -- a.txt when only b.txt is dirty (scoped to operands)",
+              passed(bash("git checkout -- a.txt", clean_repo)))
+        check("B pass: git restore a.txt when only b.txt is dirty",
+              passed(bash("git restore a.txt", clean_repo)))
+        check("B refuse: git checkout -- b.txt names the dirty file",
+              refused(bash("git checkout -- b.txt", clean_repo)))
+        check("B refuse: git checkout -- . falls back to the whole tree",
+              refused(bash("git checkout -- .", clean_repo)))
         check("B pass (dirty): git checkout -b newbranch",
               passed(bash("git checkout -b newbranch", dirty_repo)))
         check("B pass (dirty): git clean -n -d -f (dry run)",
