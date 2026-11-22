@@ -143,6 +143,13 @@ DEFAULTS = {
         # may touch on the default branch. Each scope's memory store is always exempt.
         "exempt_paths": [],
     },
+    # bin/environment_render.py: one private Markdown file describing your environment,
+    # rendered into both agents' auto-approval reviewer settings.
+    "environment": {
+        # The source file. Empty = environment.md beside the config file
+        # (~/.config/session-notes/environment.md by default).
+        "source": "",
+    },
     # Each scope is a project folder with its own memory store. `store` may be
     # empty, meaning ~/.claude/projects/<encoded root>/memory.
     "scopes": [],
@@ -368,6 +375,12 @@ def _resolve(cfg, base=None, env=None):
                               % (k, g[k]))
     g["exempt_repos"] = [_abs(x, base) for x in g["exempt_repos"]]
     g["exempt_paths"] = [os.path.expanduser(x) for x in g["exempt_paths"]]
+    src = cfg["environment"]["source"]
+    if not isinstance(src, str):
+        raise ConfigError("environment.source must be a path string, got %r" % (src,))
+    cfg["environment"]["source"] = (
+        _abs(src, base) if src.strip()
+        else os.path.join(base or os.path.dirname(config_path(env)), "environment.md"))
     # Empty means no addendum, like handoff.build_note.
     local = cfg["rules"]["local"]
     cfg["rules"]["local"] = _abs(local, base) if local.strip() else ""

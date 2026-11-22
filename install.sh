@@ -165,6 +165,40 @@ offer_jobs() {
   done
 }
 
+# The private environment description that drives both agents' auto-approval reviewers
+# (bin/environment_render.py). Offers the blank template; never writes settings.json or
+# config.toml itself: `environment_render.py apply` does that, after showing a diff.
+offer_environment() {
+  ENV_SRC=$(python3 "$REPO/bin/notes_config.py" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["environment"]["source"])' 2>/dev/null) \
+    || ENV_SRC="$HOME/.config/session-notes/environment.md"
+  [ -n "$ENV_SRC" ] || ENV_SRC="$HOME/.config/session-notes/environment.md"
+  echo
+  if [ -e "$ENV_SRC" ]; then
+    echo "Environment file $(tilde "$ENV_SRC") exists. Preview what it renders to, then apply:"
+  elif [ "$ASK" = 1 ]; then
+    echo "Your environment (what the auto-approval reviewers should trust) is described in $(tilde "$ENV_SRC")."
+    if ask "Copy the blank template there (mode 600)?"; then
+      mkdir -p "$(dirname "$ENV_SRC")"
+      cp "$REPO/templates/environment.md" "$ENV_SRC"; chmod 600 "$ENV_SRC"
+      echo "wrote $(tilde "$ENV_SRC"). Fill it in, then:"
+    else
+      echo "Skipped the environment file. When you want it: cp templates/environment.md $(tilde "$ENV_SRC")"
+      return 0
+    fi
+  else
+    echo "To describe your environment: cp $SHOWN/templates/environment.md $(tilde "$ENV_SRC")"
+    echo "Fill it in, then:"
+  fi
+  echo "  python3 $SHOWN/bin/environment_render.py diff     # what would change"
+  echo "  python3 $SHOWN/bin/environment_render.py apply    # asks, backs up, then writes"
+  if [ "$CODEX" = 1 ]; then
+    echo "For Codex, apply --target codex writes sandbox_mode, approval_policy and approvals_reviewer"
+    echo "(auto_review) plus the reviewer policy into $(tilde "$CODEX_DIR/config.toml"), and an allow rule for"
+    echo "session_bus.py send into $(tilde "$CODEX_DIR/rules/default.rules") (docs/codex.md, Auto-review)."
+  fi
+}
+
 if [ "$CODEX" = 1 ]; then
   # Codex keeps its own memory under <codex home>/session-notes; nothing here touches ~/.claude.
   CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
@@ -302,6 +336,7 @@ Bus mail rides the next prompt when the hook runs inside the pane (`codex --no-d
 otherwise bus_nudge falls back to the pull line.
 Details: docs/codex.md
 TXT
+  offer_environment
   offer_jobs
   exit 0
 fi
@@ -385,6 +420,7 @@ if [ "$ASK" = 1 ]; then
 
 Check, inside tmux: $CHECK
 EOF
+  offer_environment
   offer_jobs
   exit 0
 fi
@@ -406,4 +442,5 @@ $(python3 "$REPO/bin/rules_block.py" claude-lines 2>&1)
 
 Optional: config.example.toml lists project scopes. Check, inside tmux: python3 $SHOWN/bin/session_peers.py
 EOF
+offer_environment
 offer_jobs

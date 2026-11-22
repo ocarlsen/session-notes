@@ -177,7 +177,39 @@ def _run_checks(env, run, out, checks):
                 worst = 1
             elif worst != 1:
                 worst = EXIT_FINDINGS
-    return worst
+    return max_rc(worst, _environment_check(env, out, checks))
+
+
+def max_rc(a, b):
+    """The worse of two exit codes: a crash (1) outranks findings (3) outranks clean (0)."""
+    if 1 in (a, b):
+        return 1
+    return max(a, b)
+
+
+def _environment_check(env, out, checks):
+    """environment_render.py's drift check, run in-process. It covers both agents' targets
+    at once, so it runs once, not per agent, and only when an environment source file exists
+    (nothing is recorded or printed when the feature is not set up). Returns 0, 1 or 3."""
+    try:
+        import environment_render
+        ran, rc, text = environment_render.check(dict(env))
+    except Exception as exc:  # a crash of THIS check; the others already ran
+        checks.append({"agent": "all", "check": "environment_render", "status": "crashed",
+                       "findings": 0})
+        out.write("== all: environment_render (CRASHED %s: %s) ==\n" % (type(exc).__name__, exc))
+        return 1
+    if not ran:
+        return 0
+    if rc == 0:
+        checks.append({"agent": "all", "check": "environment_render", "status": "clean",
+                       "findings": 0})
+        return 0
+    findings = sum(1 for ln in text.splitlines() if ln.startswith(("claude: ", "codex: ", "upstream ")))
+    checks.append({"agent": "all", "check": "environment_render", "status": "findings",
+                   "findings": findings})
+    out.write("== all: environment_render (findings) ==\n%s\n" % text.rstrip())
+    return EXIT_FINDINGS
 
 
 def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):

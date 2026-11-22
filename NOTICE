@@ -1,2 +1,8 @@
 session-notes
 Copyright 2026 Owen Carlsen
+
+templates/codex-auto-review-policy.md is a copy of the bundled guardian policy from
+OpenAI Codex (codex-rs/prompts/templates/guardian/policy.md at tag rust-v0.171.0),
+Copyright OpenAI, licensed under the Apache License 2.0
+(https://github.com/openai/codex/blob/main/LICENSE). It is unmodified; see
+templates/README.md.
