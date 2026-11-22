@@ -40,16 +40,19 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 SRC_REPO = os.path.dirname(os.path.dirname(HERE))
 
-KEY_RE = re.compile(r"sk-[A-Za-z0-9_*-]+")
+KEY_RE = re.compile(r"sk-[A-Za-z0-9_*-]{20,}")
+_SECRETS = []  # exact key values this run fetched; redacted wherever they appear
 EM = chr(0x2014)
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
@@ -75,7 +78,11 @@ FEATURES = [
 
 
 def redact(s):
-    return KEY_RE.sub("sk-REDACTED", s or "")
+    s = KEY_RE.sub("sk-REDACTED", s or "")
+    for secret in _SECRETS:
+        if secret and len(secret) >= 8:
+            s = s.replace(secret, "REDACTED")
+    return s
 
 
 # ---------------------------------------------------------------------------- pure logic
@@ -103,8 +110,9 @@ def check_hook_paths(commands, home, run_launcher=None):
         try:
             toks = shlex.split(cmd)
         except ValueError:
-            problems.append("unparseable command: %s" % cmd)
+            problems.append("cannot resolve hook path: %s" % cmd)
             continue
+        resolved = False
         for i, t in enumerate(toks):
             if t.startswith("~/"):
                 t = os.path.join(home, t[2:])
@@ -113,9 +121,11 @@ def check_hook_paths(commands, home, run_launcher=None):
             if not t.startswith("/"):
                 continue
             if t.endswith(".py"):
+                resolved = True
                 if not os.path.isfile(t):
                     problems.append("missing script %s (in: %s)" % (t, cmd))
             elif i + 2 < len(toks) and toks[i + 1] == "hook" and os.path.basename(t) == "session-notes":
+                resolved = True
                 if not os.path.isfile(t):
                     problems.append("missing launcher %s (in: %s)" % (t, cmd))
                 elif run_launcher:
@@ -125,6 +135,8 @@ def check_hook_paths(commands, home, run_launcher=None):
                         problems.append("launcher %s did not name a checkout" % t)
                     elif not os.path.isfile(os.path.join(checkout, "hooks", name + ".py")):
                         problems.append("launcher %s -> %s has no hooks/%s.py" % (t, checkout, name))
+        if not resolved:
+            problems.append("cannot resolve hook path: %s" % cmd)
     return problems
 
 
@@ -160,6 +172,61 @@ def transcript_text(root, assistant_only=True):
         except OSError:
             pass
     return "\n".join(chunks)
+
+
+def clock_ok(text, now=None, slack_min=5):
+    """True when `text` has NOW=<...YYYY-MM-DD HH:MM...> within `slack_min` minutes of `now`
+    (the stamp time_sense.py emits: [now: Sun 2026-11-22 14:51 PST]). A bare date is not enough."""
+    m = re.search(r"NOW=[^\n]*?(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})", text or "")
+    if not m:
+        return False
+    try:
+        stamp = datetime.strptime("%s %s:%s" % m.groups(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return abs((stamp - (now or datetime.now())).total_seconds()) <= slack_min * 60
+
+
+def executed_commands(root):
+    """Text of every EXECUTED tool/command item in transcripts under root (function-call and exec
+    items, never user or assistant message text, so a prompt that merely names a script cannot match)."""
+    out = []
+
+    def strings(o):
+        if isinstance(o, dict):
+            for v in o.values():
+                yield from strings(v)
+        elif isinstance(o, list):
+            for v in o:
+                yield from strings(v)
+        elif isinstance(o, str):
+            yield o
+
+    def walk(o):
+        if isinstance(o, dict):
+            t = str(o.get("type", ""))
+            if o.get("role") in ("user", "assistant") or t in ("message", "user", "assistant", "text"):
+                return
+            if any(k in t for k in ("call", "exec")) or t == "tool_use":
+                out.append("\n".join(strings(o)))
+                return
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for f in sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    try:
+                        walk(json.loads(ln))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+    return "\n".join(out)
 
 
 def seen(token, text):
@@ -208,8 +275,8 @@ def real_targets(real_home):
     files = [j(real_home, ".claude", "settings.json"), j(real_home, ".claude", "CLAUDE.md"),
              j(real_home, ".codex", "hooks.json"), j(real_home, ".codex", "config.toml"),
              j(real_home, ".codex", "AGENTS.md"), j(real_home, ".local", "bin", "session-notes")]
-    dirs = [j(real_home, ".claude", "skills"), j(real_home, "Library", "LaunchAgents"),
-            j(real_home, ".config", "session-notes")]
+    dirs = [j(real_home, ".claude", "skills"), j(real_home, ".codex", "skills"),
+            j(real_home, "Library", "LaunchAgents"), j(real_home, ".config", "session-notes")]
     return files, dirs
 
 
@@ -234,34 +301,62 @@ def compare_snapshots(before, after):
     return ["%s changed" % k for k in before if before[k] != after.get(k)]
 
 
-# Logs and transcripts record whatever a parent session printed (a sandbox path included), so they
-# are not install state; everything else under the real dirs is.
-_SCAN_SKIP_DIRS = {"debug", "shell-snapshots", "session-env", "todos", "file-history", "telemetry",
-                   "statsig", "cache", "paste-cache", "sessions", "log", "logs", "projects",
-                   "ide", "tasks", "plans", "backups", "downloads", "image-cache", "state"}
+def fatal_diffs(before, after, needles):
+    """compare_snapshots, minus hashed FILES whose new content does not mention the sandbox or run
+    token: a real settings.json churns under other live sessions, while an install that leaked
+    into it would name the sandbox. Directory listings stay fatal. -> (fatal, benign)."""
+    fatal, benign = [], []
+    for k in before:
+        if before[k] == after.get(k):
+            continue
+        if isinstance(before[k], list) or isinstance(after.get(k), list):
+            fatal.append("%s changed" % k)
+            continue
+        try:
+            with open(k, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            data = b""
+        (fatal if any(n.encode() in data for n in needles if n) else benign).append("%s changed" % k)
+    return fatal, benign
 
 
-def scan_for_sandbox(real_home, needle, since, max_bytes=20_000_000):
-    """Files under the real dirs, modified at or after `since`, that mention `needle`."""
+def scan_roots(real_home):
+    """Where a leak from the sandbox would land: install targets, the session-notes state and
+    stores (the bus and bcast ledgers are .jsonl), memory stores, skills. Whole transcript trees
+    (~/.claude/projects/*/*.jsonl, ~/.codex/sessions) are left out because the parent session's own
+    transcript legitimately prints sandbox paths; the memory stores under projects/ are in."""
+    j = os.path.join
+    roots = [j(real_home, ".claude", n) for n in ("settings.json", "CLAUDE.md", "skills", "session-notes",
+                                                    "state", "skill-feedback")]
+    roots += glob.glob(j(real_home, ".claude", "projects", "*", "memory"))
+    roots += [j(real_home, ".codex", n) for n in ("hooks.json", "config.toml", "AGENTS.md", "rules",
+                                                    "skills", "session-notes")]
+    roots += [j(real_home, ".config", "session-notes"), j(real_home, ".local", "bin"),
+              j(real_home, "Library", "LaunchAgents")]
+    return roots
+
+
+def scan_for_sandbox(real_home, needles, since, max_bytes=20_000_000):
+    """Files under scan_roots, modified at or after `since`, that mention any of `needles`
+    (.jsonl included: the bus and bcast ledgers are the likeliest leak targets)."""
+    if isinstance(needles, str):
+        needles = [needles]
+    pats = [n.encode() for n in needles if n]
     hits = []
-    for top in (".claude", ".codex", ".config/session-notes", ".local/bin", "Library/LaunchAgents"):
-        base = os.path.join(real_home, top)
-        for dirpath, dirnames, files in os.walk(base):
-            if top in (".claude", ".codex") and dirpath == base:
-                dirnames[:] = [d for d in dirnames if d not in _SCAN_SKIP_DIRS]
-            for fn in files:
-                if fn.endswith((".jsonl", ".sqlite", ".sqlite-wal", ".sqlite-shm", ".db")):
+    for root in scan_roots(real_home):
+        files = [root] if os.path.isfile(root) else [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs]
+        for p in files:
+            try:
+                st = os.stat(p)
+                if st.st_mtime < since or st.st_size > max_bytes or not os.path.isfile(p):
                     continue
-                p = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(p)
-                    if st.st_mtime < since or st.st_size > max_bytes or not os.path.isfile(p):
-                        continue
-                    with open(p, "rb") as fh:
-                        if needle.encode() in fh.read():
-                            hits.append(p)
-                except OSError:
-                    pass
+                with open(p, "rb") as fh:
+                    data = fh.read()
+                if any(x in data for x in pats):
+                    hits.append(p)
+            except OSError:
+                pass
     return hits
 
 
@@ -375,8 +470,12 @@ def wt_row(wt_py, tmp):
 
         scenario([])
         r1 = sh(wt + ["merge", "feat"], path, env, check=False)
+        if r1.returncode != 6:  # stop here: a merge that went through may have removed the worktree
+            return FAIL, "merge with no verdict: rc=%d (want 6): %s" % (r1.returncode, (r1.stderr or r1.stdout)[-160:])
         scenario([comment("APPROVE", "0" * 40)])
         r2 = sh(wt + ["merge", "feat"], path, env, check=False)
+        if r2.returncode != 6:
+            return FAIL, "merge with a stale-sha verdict: rc=%d (want 6)" % r2.returncode
         scenario([comment("APPROVE", head)])
         r3 = sh(wt + ["merge", "feat", "--dry-run"], path, env, check=False)
         with open(os.path.join(stubdir, "gh-calls.jsonl")) as fh:
@@ -408,7 +507,32 @@ def selftest():
         if not cond:
             fails.append(name)
 
-    check("redact keys", "sk-abc" not in redact("key sk-abc_DEF-123*x here") and "sk-REDACTED" in redact("sk-abc"))
+    longkey = "sk-" + "ant-api03-abcDEF_123-456*xyzXYZ789"
+    check("redact: key-shaped string", longkey not in redact("key %s here" % longkey) and "sk-REDACTED" in redact(longkey))
+    check("redact: task-list and ask-me survive", redact("task-list ask-me risk-free") == "task-list ask-me risk-free")
+    _SECRETS.append("opaqueSecretValue99")
+    check("redact: the exact fetched key value", "opaqueSecretValue99" not in redact("x opaqueSecretValue99 y"))
+    _SECRETS.pop()
+
+    # boot: the clock must be a real, current [now: ...] stamp
+    nowdt = datetime(2026, 11, 22, 14, 51)
+    check("clock: current stamp passes", clock_ok("RULES=x NOW=now: Sun 2026-11-22 14:53 PST", nowdt))
+    check("clock: NEGATIVE control, bare date fails", not clock_ok("NOW=Sun 2026-11-22", nowdt))
+    check("clock: NEGATIVE control, stale time fails", not clock_ok("NOW=Sun 2026-11-22 13:00 PST", nowdt))
+    check("clock: NEGATIVE control, no NOW fails", not clock_ok("2026-11-22 14:51", nowdt))
+
+    # reflect (codex): only an EXECUTED command counts, never prompt text that names the script
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "a.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user",
+                                 "content": [{"type": "input_text", "text": "run codex_save.py commit"}]}}) + "\n")
+        check("executed: NEGATIVE control, a prompt naming codex_save.py is not execution",
+              "codex_save" not in executed_commands(d))
+        with open(os.path.join(d, "b.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "shell",
+                                 "arguments": json.dumps({"command": ["python3", "x/codex_save.py", "commit"]})}}) + "\n")
+        check("executed: a function_call running codex_save.py commit is seen",
+              re.search(r"codex_save\.py[^\n]*commit", executed_commands(d)) is not None)
 
     # hook-path check: positive control, and NEGATIVE control (a copy naming a missing file goes red)
     with tempfile.TemporaryDirectory() as d:
@@ -435,6 +559,10 @@ def selftest():
               len(check_hook_paths(cx("zzz"), d, lambda p: os.path.join(d, "repo"))) == 1)
         check("hookpath: launcher pointing at a deleted checkout is reported",
               len(check_hook_paths(cx("a"), d, lambda p: os.path.join(d, "gone"))) == 1)
+        check("hookpath: NEGATIVE control, unparseable command is a problem",
+              check_hook_paths(["python3 'unterminated"], d) == ["cannot resolve hook path: python3 'unterminated"])
+        check("hookpath: NEGATIVE control, a command naming no path is a problem",
+              len(check_hook_paths(["echo hi"], d)) == 1)
         check("hookpath: missing launcher is reported",
               len(check_hook_paths(["SESSION_NOTES_AGENT=codex %s/nope/session-notes hook a" % d], d)) == 1)
 
@@ -468,16 +596,61 @@ def selftest():
         t0 = time.time() - 1
         s0 = snapshot(h)
         check("realdirs: unchanged -> no diff", compare_snapshots(s0, snapshot(h)) == [])
-        check("realdirs: no mention -> clean", scan_for_sandbox(h, "sn-live-ZZZ", t0) == [])
+        needles = ["sn-live-ZZZ", "TOK12345"]
+        check("realdirs: no mention -> clean", scan_for_sandbox(h, needles, t0) == [])
         with open(os.path.join(h, ".claude", "settings.json"), "w") as fh:
             fh.write('{"x":1}')
         os.makedirs(os.path.join(h, ".claude", "skills", "new"))
-        check("realdirs: NEGATIVE control, changed file and new skill reported",
-              len(compare_snapshots(s0, snapshot(h))) == 2)
-        with open(os.path.join(h, ".claude", "stray.txt"), "w") as fh:
-            fh.write("wrote /private/tmp/sn-live-ZZZ/home")
-        check("realdirs: NEGATIVE control, mention reported", len(scan_for_sandbox(h, "sn-live-ZZZ", t0)) == 1)
-        check("realdirs: files older than the run are ignored", scan_for_sandbox(h, "sn-live-ZZZ", time.time() + 100) == [])
+        os.makedirs(os.path.join(h, ".codex", "skills", "newx"))
+        check("realdirs: NEGATIVE control, changed file and new skills (claude, codex) reported",
+              len(compare_snapshots(s0, snapshot(h))) == 3)
+        fat, ben = fatal_diffs(s0, snapshot(h), needles)
+        check("realdirs: a changed file without a sandbox mention is benign, new skill dirs are fatal",
+              len(fat) == 2 and len(ben) == 1, str((fat, ben)))
+        with open(os.path.join(h, ".claude", "settings.json"), "w") as fh:
+            fh.write('{"x":"/private/tmp/sn-live-ZZZ/home"}')
+        fat, ben = fatal_diffs(s0, snapshot(h), needles)
+        check("realdirs: NEGATIVE control, a changed file that names the sandbox is fatal",
+              len(fat) == 3 and not ben, str((fat, ben)))
+        with open(os.path.join(h, ".claude", "settings.json"), "w") as fh:
+            fh.write('{"x":2}')
+        bus = os.path.join(h, ".claude", "session-notes", "state", "session-bus")
+        os.makedirs(bus)
+        with open(os.path.join(bus, "bus.jsonl"), "w") as fh:
+            fh.write(json.dumps({"from": "x", "text": "sent TOK12345"}) + "\n")
+        check("realdirs: NEGATIVE control, a planted bus.jsonl line with the run token is found",
+              scan_for_sandbox(h, needles, t0) == [os.path.join(bus, "bus.jsonl")])
+        mem = os.path.join(h, ".claude", "projects", "-x", "memory")
+        os.makedirs(mem)
+        with open(os.path.join(mem, "m.md"), "w") as fh:
+            fh.write("/private/tmp/sn-live-ZZZ/home")
+        check("realdirs: NEGATIVE control, a memory-store file naming the sandbox is found",
+              len(scan_for_sandbox(h, needles, t0)) == 2)
+        tr = os.path.join(h, ".claude", "projects", "-x")
+        with open(os.path.join(tr, "t.jsonl"), "w") as fh:
+            fh.write("TOK12345 in a parent transcript")
+        check("realdirs: a transcript outside the stores is not scanned", len(scan_for_sandbox(h, needles, t0)) == 2)
+        check("realdirs: files older than the run are ignored", scan_for_sandbox(h, needles, time.time() + 100) == [])
+
+    # teardown always runs: interrupted go() must still wipe the Codex auth.json
+    ns = argparse.Namespace(only=None, feature=None, keep=False, selftest=False)
+    live = Live(ns)
+    try:
+        auth = os.path.join(live.codex_dir, "auth.json")
+        with open(auth, "w") as fh:
+            fh.write("{}")
+
+        def boom():
+            raise KeyboardInterrupt()
+
+        live.go = boom
+        root = live.root
+        _res, _lines, _kept = execute(live)
+        check("teardown: auth.json removed when go() raises KeyboardInterrupt", not os.path.exists(auth))
+        check("teardown: sandbox removed after an interrupt", not os.path.exists(root) or _kept == root)
+        check("teardown: an interrupted run is reported FAIL", any(r["status"] == FAIL for r in _res))
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
 
     # table
     res = [{"feature": "boot", "title": "boot", "cli": "claude", "status": PASS, "detail": ""},
@@ -506,7 +679,8 @@ def selftest():
         r2 = os.path.join(d, "r2")
         os.makedirs(r2)
         st2, detail2 = wt_row(os.path.join(d, "binc", "wt.py"), os.path.realpath(r2))
-        check("wt: NEGATIVE control, a gate that always passes is reported FAIL", st2 == FAIL, detail2)
+        check("wt: NEGATIVE control, a gate that always passes is reported FAIL at the merge gate",
+              st2 == FAIL and "merge with no verdict" in detail2 and "rc=0" in detail2, detail2)
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
@@ -531,10 +705,21 @@ def find_real_binary(name, override):
     return None
 
 
-def keychain_key(service, keychain):
-    r = subprocess.run(["security", "find-generic-password", "-s", service, "-w", keychain],
-                       capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+def keychain_key(service, keychain, timeout=20):
+    """(key, why). why is "" on success, else "keychain item missing" or "keychain locked or
+    unreachable" (so a locked keychain is not mistaken for an unconfigured one)."""
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-s", service, "-w", keychain],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "keychain locked or unreachable"
+    key = r.stdout.strip()
+    if r.returncode == 0 and key:
+        _SECRETS.append(key)
+        return key, ""
+    if r.returncode == 44:
+        return None, "keychain item missing"
+    return None, "keychain locked or unreachable (security rc=%d)" % r.returncode
 
 
 class Abort(Exception):
@@ -569,6 +754,8 @@ class Live:
         self.tok = hashlib.sha256(os.urandom(8)).hexdigest()[:8].upper()
         self.have = {"claude": False, "codex": False}
         self.why = {}
+        self.installed = False
+        self.before = None
 
     # -- environment ----------------------------------------------------------------------
     def env(self, **extra):
@@ -722,6 +909,9 @@ class Live:
         head = subprocess.run(["git", "-C", SRC_REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         self.run(["git", "clone", "-q", "--no-hardlinks", SRC_REPO, self.repo], "clone.txt", check=True)
         self.run(["git", "-C", self.repo, "checkout", "-q", head], "clone.txt", check=True)
+        # No remote: nothing in the sandbox clone can push or fetch anywhere.
+        self.run(["git", "-C", self.repo, "remote", "remove", "origin"], "clone.txt", check=True)
+        self.installed = True  # from here on a stray write could reach the real dirs: always check
         self.run(["sh", "install.sh", "--all", "--yes", "--bin-dir", self.bin], "install-claude.txt",
                  cwd=self.repo, check=True)
         self.run(["sh", "install.sh", "--codex", "--yes"], "install-codex.txt", cwd=self.repo, check=True)
@@ -734,10 +924,11 @@ class Live:
         except (OSError, ValueError):
             doc = {}
         doc["apiKeyHelper"] = "security find-generic-password -s %s -w %s" % (
-            os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest"), shlex.quote(self.keychain))
+            shlex.quote(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest")),
+            shlex.quote(self.keychain))
         perm = doc.setdefault("permissions", {})
         perm["deny"] = list(perm.get("deny", [])) + [
-            "Read(%s/.config/secrets/**)" % self.real_home, "Bash(security:*)"]
+            "Read(%s/.config/secrets/**)" % self.real_home, "Bash(security:*)", "Bash(/usr/bin/security:*)"]
         doc.setdefault("env", {})["DISABLE_AUTOUPDATER"] = "1"
         with open(sp, "w") as fh:
             json.dump(doc, fh, indent=2)
@@ -754,8 +945,8 @@ class Live:
         os.makedirs(gstore, exist_ok=True)
         with open(os.path.join(gstore, "MEMORY.md"), "w") as fh:
             fh.write("# Memory Index\n\n- [Marker](marker.md) - the selftest marker word is CLAUDEMARK%s\n" % self.tok)
-        with open(os.path.join(self.claude_dir, "CLAUDE.md"), "a") as fh:
-            fh.write("\n@%s/MEMORY.md\n" % gstore)
+        # No store @import is written here: what reaches a Claude session at boot is judged only
+        # through what install.sh wired (the standing-rules import and the hooks).
 
     def seed_codex(self):
         _, gstore = self.store_dirs()
@@ -795,6 +986,31 @@ class Live:
         root = os.path.join(self.claude_dir, "projects") if cli == "claude" else os.path.join(self.codex_dir, "sessions")
         return transcript_text(root, assistant_only)
 
+    def scoped(self, cli, tok):
+        """A temp dir of symlinks to only those transcripts that contain `tok` (this row's own
+        sessions: the token is in their prompt). Caller removes it."""
+        root = os.path.join(self.claude_dir, "projects") if cli == "claude" else os.path.join(self.codex_dir, "sessions")
+        d = tempfile.mkdtemp(dir=self.root)
+        for n, f in enumerate(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)):
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    if tok in fh.read():
+                        os.symlink(f, os.path.join(d, "t%d.jsonl" % n))
+            except OSError:
+                pass
+        return d
+
+    def hook_injected(self, cli, tok):
+        root = os.path.join(self.claude_dir, "projects") if cli == "claude" else os.path.join(self.codex_dir, "sessions")
+        for f in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    if any(tok in ln and "VERBATIM PEER TEXT" in ln for ln in fh):
+                        return True
+            except OSError:
+                pass
+        return False
+
     def count_answers(self, cli, tok):
         """How many distinct transcripts hold `tok` in an assistant message."""
         root = os.path.join(self.claude_dir, "projects") if cli == "claude" else os.path.join(self.codex_dir, "sessions")
@@ -814,20 +1030,32 @@ class Live:
 
     # -- rows -------------------------------------------------------------------------------
     def row_boot(self, cli):
-        p = ("Reply with exactly one line of the form MARK=<word> NOW=<stamp>. <word> is the selftest marker "
-             "word from your memory index. <stamp> is the timestamp from the line in your context that "
-             "starts with a square bracket and the word now (copy its date and time).")
+        now_part = ("NOW=<the text inside the square brackets of the line in your context that starts with "
+                    "[now: (copy its weekday, date, time and zone)>")
         if cli == "claude":
+            # What reaches Claude through session-notes: install.sh's standing-rules @import in
+            # CLAUDE.md (heading below) and the time_sense hook. No runner-written import is judged.
+            p = ("Reply with exactly one line of the form RULES=<heading> %s. <heading> is the text of the "
+                 "first heading of the standing rules in your instructions." % now_part)
             r = self.run(self.claude_argv(p, headless=True), "boot-claude.txt", timeout=180)
-            text, mark = r.stdout, "CLAUDEMARK" + self.tok
+            text = r.stdout
+            if r.returncode != 0:
+                return FAIL, "claude -p rc=%d" % r.returncode, "boot-claude.txt"
+            if "Standing rules (session-notes)" not in text:
+                return FAIL, "the install-wired standing rules did not reach the model", "boot-claude.txt"
         else:
+            p = ("Reply with exactly one line of the form MARK=<word> %s. <word> is the selftest marker word "
+                 "from your session memory." % now_part)
             r = self.codex_headless(p, "boot-codex.txt")
-            text, mark = r.stdout + "\n" + self.ctext("codex"), "CODEXMARK" + self.tok
-        if mark not in text:
-            return FAIL, "marker %s not in the reply (SessionStart/boot context did not reach the model)" % mark, "boot-%s.txt" % cli
-        if not re.search(r"NOW=\W*\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", text):
-            return FAIL, "marker seen but no clock stamp (time_sense did not reach the model)", "boot-%s.txt" % cli
-        return PASS, "marker and clock stamp in the reply", None
+            text, mark = r.stdout, "CODEXMARK" + self.tok
+            if r.returncode != 0:
+                return FAIL, "codex exec rc=%d" % r.returncode, "boot-codex.txt"
+            if mark not in text:
+                return FAIL, "marker %s not in the reply (the SessionStart hook did not deliver it)" % mark, "boot-codex.txt"
+        if not clock_ok(text):
+            return FAIL, "no [now: ...] stamp within 5 minutes of the wall clock in the reply (time_sense hook dead or stale): %r" % text.strip()[-120:], "boot-%s.txt" % cli
+        return PASS, "%s and a [now: ...] stamp within 5 minutes of the wall clock" % (
+            "install-wired standing rules" if cli == "claude" else "SessionStart marker"), None
 
     @staticmethod
     def pane_pair(cli):
@@ -869,14 +1097,17 @@ class Live:
         self.wait_idle(a)
         # session_bus send needs $TMUX_PANE (the sender's address), so it runs from its own pane.
         out = self.pane_run("busSend" + cli[:2], [sys.executable, os.path.join(self.repo, "bin", "session_bus.py"),
-                            "send", "--to", a, "Reply with only the word %s" % tok], "bus-%s.txt" % cli)
+                            "send", "--to", a, "Include the word %s in your next reply." % tok], "bus-%s.txt" % cli)
         if out is None or "cannot send" in out or "error" in out.lower():
             return FAIL, "session_bus send failed: %s" % (out or "timeout").strip()[-160:], "bus-%s.txt" % cli
         time.sleep(2)
-        self.send(a, "Check for new session mail and do what it says.")
-        if not self.wait_for(lambda: seen(tok, self.ctext(cli)), 120):
-            return FAIL, "recipient never produced %s after its next prompt" % tok, "bus-%s.txt" % cli
-        return PASS, "mail delivered on the next prompt and acted on", None
+        self.send(a, "What is 2+2? Answer in one short line.")  # neutral: the token can only come via the hook
+        # Proof is the hook's own injection in the recipient's transcript (the fenced peer-text frame
+        # carrying the token). The typed prompt is neutral and never mentions mail; a model may
+        # rightly decline to act on peer text, so obedience is not the test.
+        if not self.wait_for(lambda: self.hook_injected(cli, tok), 120):
+            return FAIL, "the bus hook never put %s into the recipient's context on its next prompt" % tok, "bus-%s.txt" % cli
+        return PASS, "mail injected into the recipient's context by the hook on its next prompt", None
 
     def row_handoff(self, cli):
         if cli == "codex":
@@ -908,16 +1139,16 @@ class Live:
     def row_reflect(self, cli):
         tok = "REFLECT%s%s" % (self.tok, cli[:2].upper())
         g = self.store_dirs()[0 if cli == "claude" else 1]
-        ask = ("Save exactly one memory and nothing else: a feedback memory file named feedback_selftest.md "
-               "whose body says 'the reflect token is %s', with its MEMORY.md index line, in the GLOBAL "
-               "session-notes store (the path `python3 $SESSION_NOTES/bin/notes_config.py --stores` prints "
-               "as global, not your built-in per-project memory directory). Skip every other step and do not "
-               "ask questions." % tok)
+        ask = ("Remember this durable fact for future sessions: the selftest codename is %s. Save only that, "
+               "in the GLOBAL session-notes store (the path `python3 $SESSION_NOTES/bin/notes_config.py "
+               "--stores` prints as global, not your built-in per-project memory directory). Skip every "
+               "other step and do not ask questions." % tok)
         if cli == "claude":
-            self.run(self.claude_argv("/reflect  " + ask, headless=True), "reflect-claude.txt", timeout=420)
+            r = self.run(self.claude_argv("/reflect  " + ask, headless=True), "reflect-claude.txt", timeout=420)
         else:
-            self.codex_headless("$reflect  " + ask + " Write it only through codex_save.py stage and commit.",
-                                "reflect-codex.txt", timeout=420)
+            r = self.codex_headless("$reflect  " + ask, "reflect-codex.txt", timeout=420)
+        if r.returncode != 0:
+            return FAIL, "%s rc=%d" % (cli, r.returncode), "reflect-%s.txt" % cli
         hit = None
         for f in glob.glob(os.path.join(g, "*.md")):
             try:
@@ -928,9 +1159,16 @@ class Live:
                 pass
         if not hit:
             return FAIL, "no store file under %s holds %s" % (g, tok), "reflect-%s.txt" % cli
-        if cli == "codex" and "codex_save" not in self.ctext("codex", assistant_only=False):
-            return FAIL, "file appeared but the codex_save.py path was not used", "reflect-codex.txt"
-        return PASS, "store file %s written" % os.path.basename(hit), None
+        if cli == "codex":
+            d = self.scoped("codex", tok)
+            try:
+                ran = executed_commands(d)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+            if not re.search(r"codex_save\.py[^\n]*commit|commit[^\n]*codex_save\.py", ran):
+                return FAIL, "store gained the fact but no executed `codex_save.py commit` is in the rollout", "reflect-codex.txt"
+        return PASS, "store file %s gained the fact%s" % (os.path.basename(hit),
+                                                         "; codex_save.py commit was executed" if cli == "codex" else ""), None
 
     def row_emdash(self, cli):
         tok = "EMD%s%s" % (self.tok, cli[:2].upper())
@@ -938,30 +1176,51 @@ class Live:
         tail = ("containing two lines: the word %s, and a second line made of the word one, the Unicode "
                 "character U+2014 (decimal 8212), and the word two. Then reply DONE." % tok)
         if cli == "claude":
-            self.run(self.claude_argv("Use the Write tool to create the file %s %s" % (note, tail), headless=True),
-                     "emdash-claude.txt", timeout=180)
+            r = self.run(self.claude_argv("Use the Write tool to create the file %s %s" % (note, tail), headless=True),
+                         "emdash-claude.txt", timeout=180)
         else:
-            self.codex_headless("Use apply_patch to add a file %s %s" % (note, tail), "emdash-codex.txt")
-        if not os.path.isfile(note):
-            return FAIL, "the model never wrote the probe file (cannot judge the guard)", "emdash-%s.txt" % cli
-        if "EM-DASH GUARD" not in self.ctext(cli, assistant_only=False):
-            return FAIL, "an em dash was written but the guard's message never reached the session", "emdash-%s.txt" % cli
-        return PASS, "write flagged and the guard's text reached the session (advisory: the file stays)", None
+            r = self.codex_headless("Use apply_patch to add a file %s %s" % (note, tail), "emdash-codex.txt")
+        if r.returncode != 0:
+            return FAIL, "%s rc=%d" % (cli, r.returncode), "emdash-%s.txt" % cli
+        try:
+            with open(note, encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError:
+            body = None
+        if body is None or EM not in body:
+            return FAIL, "the probe file has no U+2014 (cannot judge the guard)", "emdash-%s.txt" % cli
+        d = self.scoped(cli, tok)
+        try:
+            raw = transcript_text(d, assistant_only=False)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        if "EM-DASH GUARD" not in raw:
+            return FAIL, "an em dash was written but the guard's message never reached this session", "emdash-%s.txt" % cli
+        return PASS, "write flagged and the guard's text reached this session (advisory: the file stays)", None
 
     def row_checkout(self, cli):
         if cli == "codex":
             return SKIP, "checkout_guard is not registered for Codex", None
+        tok = "CHK%s" % self.tok
         tracked = os.path.join(self.guard_repo, "tracked.txt")
-        self.run(self.claude_argv("Use the Edit tool to replace the text 'original' with 'changed' in %s. If a "
-                                  "hook refuses, say REFUSED and stop; do not try another way." % tracked,
-                                  headless=True), "checkout-claude.txt", cwd=self.guard_repo, timeout=180)
+        r = self.run(self.claude_argv("Use the Edit tool to replace the text 'original' with 'changed-%s' in %s. "
+                                      "Make exactly that one Edit call on exactly that path: this is a test of the edit guard, so do not "
+                                      "create a worktree, do not run wt, do not edit any other path. If the "
+                                      "call is refused, reply REFUSED and stop." % (tok, tracked),
+                                      headless=True), "checkout-claude.txt", cwd=self.guard_repo, timeout=180)
+        if r.returncode != 0:
+            return FAIL, "claude -p rc=%d (the session did not run)" % r.returncode, "checkout-claude.txt"
         with open(tracked) as fh:
             if fh.read() != "original\n":
                 return FAIL, "the tracked file on the default branch was edited", "checkout-claude.txt"
-        raw = self.ctext("claude", assistant_only=False)
-        if "wt new" not in raw and "worktree" not in raw.lower():
-            return FAIL, "file untouched but no sign the guard (not the model) refused", "checkout-claude.txt"
-        return PASS, "edit refused, file unchanged", None
+        d = self.scoped("claude", tok)
+        try:
+            raw = transcript_text(d, assistant_only=False)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        if not re.search(r"checkout_guard: \S*tracked\.txt is tracked on", raw):
+            return FAIL, "file untouched but this session never received the guard's own refusal message", "checkout-claude.txt"
+        return PASS, "edit refused with the guard's message, file unchanged", None
 
     def row_wave2(self, feature, rel):
         path = os.path.join(self.repo, rel)
@@ -980,30 +1239,40 @@ class Live:
         if os.path.isfile(hj_path):
             with open(hj_path) as fh:
                 hj = json.load(fh)
-        cmds = hook_commands(sj, hj)
-        if not cmds:
-            return FAIL, "no hooks registered at all", None
+        ccmds, xcmds = hook_commands(sj, None), hook_commands(None, hj)
+        if not ccmds:
+            return FAIL, "no hook commands in the Claude settings.json", None
+        if not xcmds:
+            return FAIL, "no hook commands in the Codex hooks.json", None
 
         def launcher_repo(p):
             r = subprocess.run([p, "repo"], env=self.env(), capture_output=True, text=True, timeout=20)
             return r.stdout.strip() if r.returncode == 0 else None
 
-        problems = check_hook_paths(cmds, self.home, launcher_repo)
-        # negative control: a copy naming a deleted worktree must be reported red
-        ghost = "python3 %s/deleted-worktree/hooks/x.py" % self.root
-        if not check_hook_paths([ghost], self.home, launcher_repo):
-            return FAIL, "negative control: a hook naming a deleted worktree was NOT reported", None
+        problems = check_hook_paths(ccmds + xcmds, self.home, launcher_repo)
+        # negative controls: a copy of the INSTALLED commands with one path broken must go red
+        ghost = os.path.join(self.root, "deleted-worktree")
+        c1 = [c.replace(self.repo, ghost) for c in ccmds if self.repo in c][:1]
+        c2 = [c.replace(os.path.join(self.home, ".local", "bin"), os.path.join(ghost, "bin")) for c in xcmds
+              if os.path.join(self.home, ".local", "bin") in c][:1]
+        if not c1 or not check_hook_paths(c1, self.home, launcher_repo):
+            return FAIL, "negative control: a Claude hook naming a deleted worktree was NOT reported", None
+        if not c2 or not check_hook_paths(c2, self.home, launcher_repo):
+            return FAIL, "negative control: a Codex hook through a missing launcher was NOT reported", None
         if problems:
             return FAIL, "; ".join(problems[:3]), None
-        return PASS, "%d hook commands resolve; negative control reported red" % len(cmds), None
+        return PASS, "%d Claude + %d Codex hook commands resolve; both negative controls reported red" % (
+            len(ccmds), len(xcmds)), None
 
-    def row_realdirs(self, before):
+    def row_realdirs(self):
         after = snapshot(self.real_home)
-        diffs = compare_snapshots(before, after)
-        hits = scan_for_sandbox(self.real_home, os.path.basename(self.root), self.t0)
+        needles = [os.path.basename(self.root), self.tok]
+        diffs, benign = fatal_diffs(self.before, after, needles)
+        hits = scan_for_sandbox(self.real_home, needles, self.t0)
         if diffs or hits:
-            return FAIL, "; ".join(diffs + ["mentions the sandbox: %s" % h for h in hits])[:300], None
-        return PASS, "%d install targets unchanged; nothing written to the real dirs mentions the sandbox" % len(before), None
+            return FAIL, "; ".join(diffs + ["mentions the sandbox or run token: %s" % h for h in hits])[:300], None
+        note = "" if not benign else " (%d file(s) changed by other sessions, none mention the sandbox)" % len(benign)
+        return PASS, "%d install targets checked; nothing written to the real dirs mentions the sandbox or run token%s" % (len(self.before), note), None
 
     # -- orchestration ----------------------------------------------------------------------
     def want(self, fid):
@@ -1024,18 +1293,21 @@ class Live:
         self.record(fid, cli, status, detail, self.evid(ev) if ev else None)
 
     def go(self):
-        before = snapshot(self.real_home)
-        ck = keychain_key(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest"), self.keychain)
-        ok = keychain_key(os.environ.get("SELFTEST_OPENAI_KEYCHAIN_SERVICE", "session-notes-selftest-openai"), self.keychain)
-        for cli, key, binp in (("claude", ck, self.claude_bin), ("codex", ok, self.codex_bin)):
+        self.before = snapshot(self.real_home)
+        ck, ck_why = keychain_key(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest"), self.keychain)
+        ok, ok_why = keychain_key(os.environ.get("SELFTEST_OPENAI_KEYCHAIN_SERVICE", "session-notes-selftest-openai"), self.keychain)
+        for cli, key, why, binp in (("claude", ck, ck_why, self.claude_bin), ("codex", ok, ok_why, self.codex_bin)):
             if self.a.only and self.a.only != cli:
                 self.why[cli] = "--only %s" % self.a.only
             elif not binp:
                 self.why[cli] = "no %s binary" % cli
             elif not key:
-                self.why[cli] = "no keychain key"
+                self.why[cli] = why
             else:
                 self.have[cli] = True
+        if not any(self.have.values()) and any(self.want(f) for f, _, sc in FEATURES if sc == "cli"):
+            raise Abort("nothing live ran: no CLI was usable (%s)" % "; ".join(
+                "%s: %s" % kv for kv in sorted(self.why.items())))
         self.stub_bins()
         self.clone_and_install()
         self.seed_claude()
@@ -1067,13 +1339,27 @@ class Live:
         for fid, rel in (("review", "bin/review.py"), ("live", "bin/live.py"), ("env", "bin/environment_render.py")):
             self.do(fid, "both", self.row_wave2, fid, rel)
         self.stop_tmux()
-        self.do("realdirs", "both", self.row_realdirs, before)
+
+    def finish_realdirs(self):
+        """The real-dirs row runs whenever install.sh ran, under any --feature filter and even
+        when go() aborted or was interrupted: a leak is likeliest exactly then."""
+        if not self.installed or self.before is None:
+            return
+        self.stop_tmux()
+        try:
+            status, detail, ev = self.row_realdirs()
+        except Exception as exc:
+            status, detail = FAIL, "real-dirs check crashed: %r" % (exc,)
+        self.record("realdirs", "both", status, detail)
 
     def teardown(self, failed):
-        self.stop_tmux()
         try:
             os.remove(os.path.join(self.codex_dir, "auth.json"))
         except OSError:
+            pass
+        try:
+            self.stop_tmux()
+        except Exception:
             pass
         if self.a.keep or failed:
             return self.root
@@ -1095,25 +1381,57 @@ def main():
         print("unknown feature(s): %s" % ", ".join(sorted(a.feature - known)), file=sys.stderr)
         return 2
     live = Live(a)
-    err = None
-    try:
-        live.go()
-    except Abort as exc:
-        err = str(exc)
-    except Exception as exc:  # setup crashed: report it, never hide it
-        err = "run crashed: %r" % (exc,)
-    results = live.results
-    if err:
-        results.append({"feature": "realdirs", "title": dict((f, t) for f, t, _ in FEATURES)["realdirs"],
-                        "cli": "both", "status": FAIL, "detail": "run aborted: " + err, "evidence": None})
-    print(render_table(results))
-    lines = fail_lines(results)
-    kept = live.teardown(bool(lines))
-    for ln in lines:
-        print(redact(ln))
+    results, lines, kept = execute(live)
+    out = [render_table(results)] + [redact(ln) for ln in lines]
     if kept:
-        print("sandbox kept: %s" % kept)
+        out.append("sandbox kept: %s" % kept)
+    try:
+        print("\n".join(out))
+        sys.stdout.flush()
+    except OSError:  # BrokenPipe: the verdict is still the exit code
+        pass
     return 1 if lines else 0
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt("signal %d" % signum)
+
+
+def execute(live):
+    """Run the suite. Whatever happens (an exception, Ctrl-C, SIGTERM, SIGHUP), teardown runs:
+    the sandbox Codex auth.json is wiped and the sandbox tmux server is killed."""
+    old = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            old[sig] = signal.signal(sig, _raise_interrupt)
+        except (ValueError, OSError):
+            pass
+    err, lines, kept = None, [], None
+    try:
+        try:
+            live.go()
+        except Abort as exc:
+            err = str(exc)
+        except KeyboardInterrupt:
+            err = "interrupted"
+        except Exception as exc:  # setup crashed: report it, never hide it
+            err = "run crashed: %r" % (exc,)
+        try:
+            live.finish_realdirs()
+        except KeyboardInterrupt:
+            err = err or "interrupted"
+        if err:
+            live.results.append({"feature": "realdirs", "title": dict((f, t) for f, t, _ in FEATURES)["realdirs"],
+                                 "cli": "both", "status": FAIL, "detail": "run aborted: " + err, "evidence": None})
+        lines = fail_lines(live.results)
+    finally:
+        kept = live.teardown(bool(lines) or bool(err))
+        for sig, h in old.items():
+            try:
+                signal.signal(sig, h)
+            except (ValueError, OSError):
+                pass
+    return live.results, lines, kept
 
 
 if __name__ == "__main__":

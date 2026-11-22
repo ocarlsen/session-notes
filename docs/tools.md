@@ -399,7 +399,7 @@ It costs API credits (Claude `--model haiku`, Codex `gpt-6.2-sol` at low effort,
 and is not part of `make check`. Setup: store one Anthropic and one OpenAI API key in the macOS
 Keychain (services `session-notes-selftest` and `session-notes-selftest-openai`, overridable with
 `SELFTEST_CLAUDE_KEYCHAIN_SERVICE` and `SELFTEST_OPENAI_KEYCHAIN_SERVICE`). A CLI with no key
-has its rows reported SKIP; the seat login is never used. Flags: `--only claude|codex`,
+has its rows reported SKIP; the seat login is never used. The pane models can technically read the test keys (the helper command in the sandbox settings, the Codex sandbox `auth.json`), so use dedicated keys with a spend cap. Flags: `--only claude|codex`,
 `--feature boot,bus,...`, `--keep` (keep the sandbox; a run with a FAIL keeps it anyway, with the
 evidence files under `logs/`). `python3 tests/live/selftest_live.py --selftest` checks the runner's
 own logic (hook-path check, table, real-dir guard, the `wt` gate, each with a red control) without
