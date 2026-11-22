@@ -51,6 +51,12 @@ nudge_session = "bus-nudge"
 # Empty = none. --no-build omits it.
 build_note = ""
 
+[rules]
+# A private addendum to rules/core.md (your own standing rules). install.sh writes it into the
+# Codex AGENTS.md block, and adds an @import line for it to ~/.claude/CLAUDE.md. A missing
+# file is fine; an unreadable one is an error. Empty = no addendum.
+local = "~/.config/session-notes/rules.local.md"
+
 [budgets]
 # Boot-prefix budgets, checked by boot_budget.py. Measured in characters,
 # which is what the boot prefix counts.

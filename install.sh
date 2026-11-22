@@ -12,6 +12,11 @@
 #     (it shows what it would add and keeps a .bak-session-notes copy first);
 #     not in a terminal, or with --dry-run, it prints both for you to paste
 #   - with --all: every skill in skills/, every tool, and the optional hooks
+#   - offers the standing rules (rules/core.md, plus an optional private addendum): in
+#     CLAUDE.md as @import lines; for Codex as a marked block in ~/.codex/AGENTS.md that
+#     every install rewrites (bin/rules_block.py)
+#   - with --codex, also sets Codex's default model and reasoning effort when unset, and
+#     offers build and review profiles (codex -p build, codex -p review)
 #   - on macOS, offers two background jobs: the nightly memory checks and the bus_nudge loop
 #
 # What it never does: change settings.json or a CLAUDE.md without a yes, touch
@@ -26,7 +31,8 @@
 #                                    (chains any hook already there; see docs/tools.md, wt)
 #   sh install.sh --codex            set up OpenAI Codex instead (docs/codex.md): link the
 #                                    Codex skills into ~/.codex/skills, offer the hooks.json
-#                                    and config.toml edits; never touches ~/.claude
+#                                    and config.toml edits, the rules block, the model
+#                                    defaults and profiles; never touches ~/.claude
 set -eu
 
 REPO=$(cd "$(dirname "$0")" && pwd)
@@ -50,7 +56,7 @@ while [ $# -gt 0 ]; do
                  [ -n "$2" ] || { echo "install.sh: --git-hooks needs a non-empty repo path" >&2; exit 2; }
                  GITHOOKS="$2"; GITHOOKS_SET=1; shift 2 ;;
     --codex) CODEX=1; shift ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -101,6 +107,29 @@ ask() {  # ask QUESTION: 0 on a yes. --yes answers yes; no answer means no.
   printf '%s [y/N] ' "$1"
   read -r answer || answer=""
   case "$answer" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# shq WORD: WORD quoted so it pastes back into a shell, spaces and all.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# offer QUESTION ARGS...: run `rules_block.py ARGS --dry-run`, show it, and (when asking)
+# apply it on a yes. Not asking: print the command to run. "unchanged" needs no question.
+# Warnings go to stderr and print as they come.
+offer() {
+  q=$1; shift
+  if ! out=$(python3 "$REPO/bin/rules_block.py" "$@" --dry-run); then
+    echo "$out"; echo "Skipped (see above)."; return 0
+  fi
+  echo "$out"
+  if printf '%s\n' "$out" | grep -q '^unchanged:'; then return 0; fi
+  if [ "$ASK" = 1 ]; then
+    if ask "$q"; then python3 "$REPO/bin/rules_block.py" "$@" || echo "Failed (see above)."
+    else echo "Skipped."; fi
+  else
+    cmd="python3 $(shq "$REPO/bin/rules_block.py")"
+    for a in "$@"; do cmd="$cmd $(shq "$a")"; done
+    echo "To apply: $cmd"
+  fi
 }
 
 # Background jobs as macOS LaunchAgents (bin/launch_agents.py), one [y/N] each:
@@ -215,22 +244,20 @@ RULE
   else
     echo "Add to $(tilde "$RULES") by hand:"; echo "$CODEX_RULES"
   fi
-  # Without this, a "remember X" turn makes Codex hand-write the store before any skill loads.
+  # The standing rules and the memory lines live in one marked block, rewritten on every
+  # install, so an older install gets the newer sections too. Without the memory lines, a
+  # "remember X" turn makes Codex hand-write the store before any skill loads.
   AG="$CODEX_DIR/AGENTS.md"
   echo
-  if grep -q '^## session-notes memory' "$AG" 2>/dev/null; then
-    echo "$(tilde "$AG") already has the session-notes lines."
-  elif [ "$ASK" = 1 ]; then
-    echo "Would add to $(tilde "$AG") (read by Codex at every session start):"; cat "$REPO/AGENTS.snippet.md"
-    if ask "Add it (keeping a .bak-session-notes copy)?"; then
-      if [ -e "$AG" ]; then cp "$AG" "$AG.bak-session-notes"; printf '\n' >> "$AG"; fi
-      cat "$REPO/AGENTS.snippet.md" >> "$AG"; echo "added to $(tilde "$AG")"
-    else
-      echo "Skipped AGENTS.md."
-    fi
-  else
-    echo "Add to $(tilde "$AG") by hand:"; cat "$REPO/AGENTS.snippet.md"
-  fi
+  echo "Standing rules and session-notes lines for $(tilde "$AG") (read by Codex at every session start):"
+  offer "Write the block (keeping a .bak-session-notes copy)?" apply --file "$AG"
+  # Models are set once, in rules_block.py. Top-level keys go before the first [table].
+  echo
+  echo "Default model and effort for $(tilde "$CT"), only where unset:"
+  offer "Set them (keeping a .bak-session-notes copy)?" codex-defaults --config "$CT"
+  echo
+  echo "Profiles for sub-agent roles in $(tilde "$CODEX_DIR") (codex -p build, codex -p review; never overwritten):"
+  offer "Create the missing ones?" profiles --dir "$CODEX_DIR"
   cat <<TXT
 
 Then trust the hook: /hooks in the Codex CLI, or Settings > Hooks in the desktop app.
@@ -304,9 +331,12 @@ if [ "$ASK" = 1 ]; then
   set -- ; [ "$YES" = 1 ] && set -- --yes
   echo
   python3 "$REPO/bin/setup_claude.py" hooks --settings "$CLAUDE_DIR/settings.json" --json "$HOOKS_JSON" \
-    --env "SESSION_NOTES=$REPO" "$@"
+    --env "SESSION_NOTES=$REPO" --env "CLAUDE_CODE_SUBAGENT_EFFORT=medium" "$@"
   echo
   python3 "$REPO/bin/setup_claude.py" claude-md --file "$CLAUDE_DIR/CLAUDE.md" --snippet "$REPO/CLAUDE.snippet.md" "$@"
+  echo
+  echo "Standing rules for $(tilde "$CLAUDE_DIR/CLAUDE.md") (@import lines):"
+  offer "Add them (keeping a .bak-session-notes copy)?" claude-apply --file "$CLAUDE_DIR/CLAUDE.md"
   CHECK="python3 $SHOWN/bin/session_peers.py"
   [ -n "$BIN_DIR" ] && [ -L "$BIN_DIR/session_peers" ] && CHECK="session_peers"
   cat <<EOF
@@ -321,12 +351,16 @@ cat <<EOF
 
 Next steps (by hand, on purpose):
 1. In ~/.claude/settings.json, so the skills find the tools, add to "env":  "SESSION_NOTES": "$REPO"
+   and, unless it already has a value, "CLAUDE_CODE_SUBAGENT_EFFORT": "medium" (the default effort for sub-agents)
 
 2. Merge into the "hooks" object of ~/.claude/settings.json:
 $HOOKS_JSON
 
 3. Paste into a CLAUDE.md (~/.claude/CLAUDE.md, or one project's), so Claude knows the commands:
 $(cat "$REPO/CLAUDE.snippet.md")
+
+4. Add the standing rules to the same CLAUDE.md (or run: python3 $SHOWN/bin/rules_block.py claude-apply --file ~/.claude/CLAUDE.md):
+$(python3 "$REPO/bin/rules_block.py" claude-lines 2>&1)
 
 Optional: config.example.toml lists project scopes. Check, inside tmux: python3 $SHOWN/bin/session_peers.py
 EOF
