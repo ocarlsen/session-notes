@@ -84,6 +84,7 @@ fixed line (never the message) into its empty input box.
 | Session coordination | `bin/session_peers.py`, `session_lineage.py`, `handoff_session.py`, `bcast.py`; `hooks/session_pane_registry.py` | List and peek at sibling sessions, launch a worker session and record who launched it, show the lineage tree, broadcast a line you type to every session. |
 | Bus | `bin/session_bus.py`, `bus_nudge.py`; `hooks/session_bus_hook.py` | Staged specs and mail from scripts, addressed by tmux session name, delivered at least once; wake idle recipients. |
 | Worktrees | `bin/wt.py`, `githooks/pre-commit` | A worktree per change, a PR that merges only on a review verdict, and a staged-content pre-commit. See the `wt` section below. |
+| Review | `bin/review.py`, `bin/test_edit_check.py`, `skills/review` | Prepares a fresh-context reviewer's prompt for a PR and posts its verdict as the comment `wt merge` reads. See the `review` section below. |
 | Standing rules | `rules/core.md`, `rules/review-contract.md`, `bin/rules_block.py` | The rules every session follows, for both agents. `rules_block.py apply` writes them, with `AGENTS.snippet.md` and an optional private addendum (`rules.local` in the config), into a marked block in `~/.codex/AGENTS.md` that every `install.sh --codex` rewrites (a file with an older install of the snippet is migrated, and anything outside the markers is kept); `claude-apply` adds `@import` lines to `~/.claude/CLAUDE.md`. `codex-defaults` and `profiles` set Codex's model and effort where unset and create `build` and `review` profiles. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
 | Example guard | `hooks/em_dash_guard.py` | A harmless PostToolUse hook showing the pattern: it flags em dashes in text the model just wrote and asks for a rewrite. |
@@ -141,6 +142,27 @@ is not trusted: the gate refuses, and you post a fresh verdict comment and delet
 **What the gate does and does not protect.** It stops other GitHub accounts from approving. It
 does not stop you: one login can author the code and post the APPROVE, and `$WT_GH` and
 `token_command` are trusted local configuration, so anyone who can change them can bypass it.
+
+## review: the reviewer's prompt, and the verdict comment
+
+`bin/review.py` implements `rules/review-contract.md`. Run it inside a checkout of the PR's repo;
+it reuses `wt.py`'s GitHub access (`[wt].token_command`, `$WT_GH`) and its verdict format.
+
+| Command | What it does |
+| --- | --- |
+| `review.py prepare <PR>` | Fetches the PR's head sha, title, body and diff, runs the test-edit check on the diff, and writes `prompt.md` and `meta.json` under `<state_dir>/review/<owner>-<repo>-<PR>/`. The prompt has the test-edit output first, then the contract, the PR title and body as the spec, the repo path and head sha, the diff (a file beside the prompt when over about 200 KB), and the reviewer's instructions. Prints the prompt path, the head sha and the review round; warns, without failing, when the contract's 2 fix rounds are already used. |
+| `review.py post <PR> APPROVE\|CHANGES --body-file F [--dry-run]` | Posts the reviewer's reply as `Review verdict: <V> <sha>` plus the body. Refuses when `prepare` was never run, when the PR head moved since `prepare` (exit 4), when the body is empty, or when the body's final `VERDICT: X` line disagrees with the argument. `--dry-run` posts nothing. After a post it calls `on_verdict_posted`, which records a short note through `bin/live.py` when that file exists and does nothing otherwise. |
+
+Exit codes: 1 usage, fatal or a refusal, 3 token command failed, 4 the head moved since `prepare`.
+The `/review` skill (and `$review` in Codex) is the procedure: checks and rebase, `prepare`, a
+reviewer sub-agent at high effort, `post`, then `wt merge`.
+
+`bin/test_edit_check.py` reads a unified diff on stdin (or `--diff-file`) and reports every
+removed or changed line in a test, fixture or guard file, every deleted test file, and every
+removed assertion in any Python file. Test-shaped files are the built-in path rules (`tests/`,
+`test_*.py`, `*_test.py`, `*.spec.ts`, `fixtures/`, `evals/`, canary and leak-term names) plus
+the fnmatch globs in `[review].test_globs`. It only reports: exit 0 with or without hits, 1 for a
+usage error or a malformed config value (the message names the key).
 
 **Ignored files go too.** `rm`, `gc` and `merge` remove the worktree directory, including
 gitignored files in it (a local `.env`, build output). Copy out anything you want to keep first.

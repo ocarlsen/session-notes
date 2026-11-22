@@ -89,6 +89,11 @@ size_cap_kb = 1024
 # Private terms for public repos, in the format tests/leak_scan.py documents.
 leak_terms = "~/.config/session-notes/leak-terms.txt"
 
+[review]
+# Extra fnmatch globs for files test_edit_check.py treats as tests, fixtures or guards, in
+# addition to its built-in path rules (tests/, test_*.py, fixtures/, evals/, canary and leak files).
+test_globs = []
+
 # One block per project folder that keeps its own memory store.
 # `store` is optional, and best left out: empty = the folder Claude Code
 # already keeps for that project, named after its full path, e.g.

@@ -134,6 +134,11 @@ DEFAULTS = {
         # Private terms file for public repos (format: tests/leak_scan.py docstring).
         "leak_terms": "~/.config/session-notes/leak-terms.txt",
     },
+    # bin/test_edit_check.py and bin/review.py.
+    "review": {
+        # Extra fnmatch globs for files the test-edit check treats as tests/fixtures/guards.
+        "test_globs": [],
+    },
     # Each scope is a project folder with its own memory store. `store` may be
     # empty, meaning ~/.claude/projects/<encoded root>/memory.
     "scopes": [],
@@ -349,6 +354,9 @@ def _resolve(cfg, base=None, env=None):
         raise ConfigError("wt.size_cap_kb must be a positive integer, got %r" % (w["size_cap_kb"],))
     if not all(isinstance(x, str) and x.strip() for x in w["public_repos"]):
         raise ConfigError("wt.public_repos must be a list of path strings")
+    tg = cfg["review"]["test_globs"]
+    if not isinstance(tg, list) or not all(isinstance(x, str) and x.strip() for x in tg):
+        raise ConfigError("review.test_globs must be a list of glob strings, got %r" % (tg,))
     w["root"] = _abs(w["root"], base) if w["root"].strip() else ""
     w["public_repos"] = [_abs(x, base) for x in w["public_repos"]]
     w["leak_terms"] = _abs(w["leak_terms"], base)
@@ -701,6 +709,21 @@ store = "/tmp/beta-store"
             check("wt.size_cap_kb 0 refused", False)
         except ConfigError:
             check("wt.size_cap_kb 0 refused", True)
+    # [review].test_globs: default empty, a list is kept, a non-list names the key.
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "r.toml")
+        check("review.test_globs defaults empty",
+              load(os.path.join(d, "none.toml"))["review"]["test_globs"] == [])
+        with open(f, "w") as fh:
+            fh.write('[review]\ntest_globs = ["data/*.json"]\n')
+        check("review.test_globs kept", load(f)["review"]["test_globs"] == ["data/*.json"])
+        with open(f, "w") as fh:
+            fh.write('[review]\ntest_globs = "data/*.json"\n')
+        try:
+            load(f)
+            check("review.test_globs non-list refused", False)
+        except ConfigError as exc:
+            check("review.test_globs non-list refused", "review.test_globs" in str(exc))
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)
