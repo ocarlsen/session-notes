@@ -124,12 +124,14 @@ review verdict (also in docs/tools.md).
 
 The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
 `sh install.sh --codex` links `$refresh`, `$reflect` and `$rnr` into
-`~/.codex/skills` and adds a SessionStart hook that loads the index and
-RESUME at startup, on resume and after compaction. Codex keeps its own store
+`~/.codex/skills` and registers hooks in `~/.codex/hooks.json`: the boot load of the index
+and RESUME (startup, resume, compaction) plus the per-prompt hooks Claude Code gets (time
+sense, pane registry, bus mail, em-dash guard). Trust them once in `/hooks`. Codex keeps its own store
 under `~/.codex/session-notes`, separate from Claude's, and the tools refuse a
 Codex path under `~/.claude`. The three tmux commands are Claude Code only for now, but
-`bcast` and the bus reach Codex panes too: an idle Codex pane gets bus mail by pulling
-its inbox when `bus_nudge` asks it to.
+`bcast` and the bus reach Codex panes too: under `codex --no-daemon` bus mail arrives on the
+next prompt like it does in Claude Code; otherwise `bus_nudge` asks the idle pane to pull
+its inbox.
 Setup and limits are in [docs/codex.md](docs/codex.md).
 
 ## Honest limits

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""em_dash_guard.py -- example PostToolUse(Write|Edit) hook: flag em dashes in prose just written.
+"""em_dash_guard.py -- example PostToolUse(Write|Edit|apply_patch) hook: flag em dashes in prose just written.
 
 An example of turning a style rule into a forcing function. A rule that lives only in
 memory ("no em dashes in prose") is self-policed and keeps slipping, mostly in what the
@@ -16,7 +16,7 @@ Scope by design:
   * NOT flagged: code (.py/.js/.sh/.json/.css/...), where an em dash in a comment is
     harmless, and internal memory files (CLAUDE.md, MEMORY.md, RESUME.md, anything under
     a .claude/ or memory/ directory), where dashes are historical record, not output.
-  * Only the text of the CURRENT write is scanned (Write.content / Edit.new_string), so a
+  * Only the text of the CURRENT write is scanned (Write.content / Edit.new_string / the `+` lines of an apply_patch), so a
     file's pre-existing dashes the model didn't touch never re-nag.
 
 Advisory, not blocking: it never undoes the write and never rewrites prose (a justified
@@ -63,22 +63,57 @@ def _written_text(tool_name, tool_input):
     return ""
 
 
-def check_payload(payload):
-    """The hook's output dict for one PostToolUse payload, or None."""
-    if not isinstance(payload, dict):
-        return None
-    tool_name = payload.get("tool_name", "")
-    if tool_name not in ("Write", "Edit"):
-        return None
-    tool_input = payload.get("tool_input") or {}
-    path = tool_input.get("file_path") or ""
-    if not _in_scope(path):
-        return None
-    text = _written_text(tool_name, tool_input)
-    if EM_DASH not in text:
-        return None
+def parse_patch(text):
+    """Codex apply_patch text -> [(path, added_text)]: only the `+` lines, per target file.
 
-    # Collect the offending lines so the rewrite is one-shot.
+    Handles `*** Add File:`, `*** Update File:` (and `*** Move to:`, which retargets the
+    file being updated), and ignores `*** Delete File:` and context/removed lines."""
+    out = []
+    path, lines = None, []
+
+    def flush():
+        if path is not None and lines:
+            out.append((path, "\n".join(lines)))
+
+    for ln in (text or "").splitlines():
+        if ln.startswith("*** "):
+            head, _, rest = ln[4:].partition(":")
+            rest = rest.strip()
+            if head in ("Add File", "Update File"):
+                flush()
+                path, lines = rest, []
+            elif head == "Move to":
+                path = rest
+            elif head == "Delete File":
+                flush()
+                path, lines = None, []
+            else:  # Begin Patch / End Patch / End of File
+                continue
+        elif path is not None and ln.startswith("+"):
+            lines.append(ln[1:])
+    flush()
+    return out
+
+
+def _writes(payload):
+    """[(path, text)] this tool call introduced, or []."""
+    tool_name = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input") or {}
+    if tool_name in ("Write", "Edit"):
+        return [(tool_input.get("file_path") or "", _written_text(tool_name, tool_input))]
+    if tool_name == "apply_patch":
+        cmd = tool_input.get("command")
+        if isinstance(cmd, list):  # some shells pass argv; the patch is the last item
+            cmd = cmd[-1] if cmd else ""
+        base = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
+        base = base or os.getcwd()
+        # Patch paths are relative to the session cwd; the skip rules need the full path.
+        return [(p if os.path.isabs(p) else os.path.join(base, p), t)
+                for p, t in parse_patch(cmd if isinstance(cmd, str) else "")]
+    return []
+
+
+def _report(path, text):
     offenders = [
         (i, ln.strip())
         for i, ln in enumerate(text.splitlines(), 1)
@@ -89,11 +124,9 @@ def check_payload(payload):
     home = os.path.expanduser("~")
     if rel.startswith(home + os.sep):
         rel = "~" + rel[len(home):]
-
     snippet = "\n".join("  L%d: %s" % (i, s[:160]) for i, s in offenders[:12])
     if len(offenders) > 12:
         snippet += "\n  ... (%d more lines)" % (len(offenders) - 12)
-
     ctx = (
         "EM-DASH GUARD: %d em dash(es) in the text just written to %s.\n"
         "House rule: no em dashes in prose by default. Rewrite each one out now (split into "
@@ -101,12 +134,25 @@ def check_payload(payload):
         "construction that works, in which case say why. Do not leave it for the user to "
         "catch.\n%s" % (n, rel, snippet)
     )
+    return n, rel, ctx
+
+
+def check_payload(payload):
+    """The hook's output dict for one PostToolUse payload, or None."""
+    if not isinstance(payload, dict):
+        return None
+    hits = [(p, t) for p, t in _writes(payload) if _in_scope(p) and EM_DASH in t]
+    if not hits:
+        return None
+    reports = [_report(p, t) for p, t in hits]
+    total = sum(r[0] for r in reports)
+    where = ", ".join(r[1] for r in reports)
     return {
         "systemMessage": "em-dash guard: %d em dash(es) in %s; asking the model to rewrite them."
-        % (n, rel),
+        % (total, where),
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": ctx,
+            "additionalContext": "\n\n".join(r[2] for r in reports),
         },
     }
 
@@ -161,6 +207,33 @@ def selftest():
         check("other tool ignored", check_payload(
             {"tool_name": "Read", "tool_input": {"file_path": page}}) is None)
         check("junk payload ignored", check_payload(["x"]) is None)
+        patch = ("*** Begin Patch\n*** Add File: " + page + "\n+ok\n+" + dash + "\n"
+                 "*** Update File: /tmp/code.py\n@@\n-old\n+" + dash + "\n"
+                 "*** Update File: /tmp/notes.md\n@@\n ctx " + EM_DASH + " line\n-gone " + EM_DASH
+                 + "\n+clean\n*** Delete File: /tmp/d.md\n*** End Patch")
+        pp = check_payload({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        pctx = pp["hookSpecificOutput"]["additionalContext"] if pp else ""
+        check("apply_patch added line flagged", pp is not None and "L2:" in pctx)
+        check("apply_patch only in-scope path", "code.py" not in pctx and "notes.md" not in pctx)
+        check("apply_patch context/removed lines ignored", check_payload(
+            {"tool_name": "apply_patch", "tool_input": {"command": patch.split("*** Update File: /tmp/code.py")[0].replace("+" + dash, "+x") + "*** Update File: /tmp/notes.md\n@@\n ctx " + EM_DASH + "\n-gone " + EM_DASH + "\n+clean\n*** End Patch"}}) is None)
+        mv = "*** Begin Patch\n*** Update File: /tmp/a.txt\n*** Move to: /tmp/b.md\n@@\n+" + dash + "\n*** End Patch"
+        mh = check_payload({"tool_name": "apply_patch", "tool_input": {"command": mv}})
+        check("apply_patch move targets new path", mh is not None
+              and "/tmp/b.md" in mh["hookSpecificOutput"]["additionalContext"])
+        check("apply_patch bad command ignored", check_payload(
+            {"tool_name": "apply_patch", "tool_input": {"command": None}}) is None)
+        check("apply_patch memory path skipped", check_payload(
+            {"tool_name": "apply_patch", "tool_input": {"command":
+             "*** Begin Patch\n*** Add File: /tmp/memory/n.md\n+" + dash + "\n*** End Patch"}}) is None)
+        rel = check_payload({"tool_name": "apply_patch", "cwd": "/work/proj", "tool_input": {"command":
+            "*** Begin Patch\n*** Add File: memory/n.md\n+" + dash + "\n*** Add File: .claude/x.md\n+"
+            + dash + "\n*** Add File: logs/a.txt\n+" + dash + "\n*** End Patch"}})
+        check("apply_patch relative memory/, .claude/, logs/ paths skipped", rel is None)
+        rel = check_payload({"tool_name": "apply_patch", "cwd": "/work/proj", "tool_input": {"command":
+            "*** Begin Patch\n*** Add File: docs/a.md\n+" + dash + "\n*** End Patch"}})
+        check("apply_patch relative prose path resolved and flagged", rel is not None
+              and "/work/proj/docs/a.md" in rel["hookSpecificOutput"]["additionalContext"])
         many = "\n".join([dash] * 15)
         big = check_payload({"tool_name": "Write",
                              "tool_input": {"file_path": page, "content": many}})

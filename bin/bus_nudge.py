@@ -22,17 +22,27 @@ passes through it: the recipient's own UserPromptSubmit hook injects that,
 already attributed to its sender. The user starts the loop, so every nudge
 traces to their launch, and each one is written to bcast's audit log.
 
-HOOKLESS HARNESSES
-------------------
-Codex CLI (any session_peers.HARNESSES entry with hook False) has no prompt hook,
-so NUDGE alone would announce mail nobody injects. Such a pane gets PULL_NUDGE
-instead, another FIXED string, asking the agent to run `session_bus.py inbox
+PULL PANES (Codex without a hook in the pane)
+---------------------------------------------
+Codex registers the same prompt hooks as Claude Code, but runs them as children of the
+TUI (so they see TMUX_PANE and can address the pane) only without its shared daemon:
+`codex --no-daemon`, or a config that turns the daemon off. session_peers.HARNESSES
+carries a hook_in_pane test per harness; this loop reads it from the pane's process
+tree and the pane registry. A Codex pane that passes gets the normal NUDGE and its hook
+injects the mail. Any other Codex pane, and any pane whose answer is unclear, gets
+PULL_NUDGE instead, another FIXED string, asking the agent to run `session_bus.py inbox
 --nudged --as <session>:<created>`; the mail reaches it as that command's
-sender-attributed output. The address is read from tmux by this loop and
-validated (session_bus.as_address), because the agent's shell may not know its
-session: Codex's sandbox refuses the tmux socket, and a resumed Codex session
-runs commands in a daemon with no TMUX_PANE. Right after typing, the loop records
-the offer the missing hook would have.
+sender-attributed output. The address is read from tmux by this loop and validated
+(session_bus.as_address), because the agent's shell may not know its session: Codex's
+sandbox refuses the tmux socket, and a daemon-mode session runs commands with no
+TMUX_PANE. Right after typing a pull, the loop records the offer the missing hook would
+have.
+
+ESCALATION: a hooked Codex pane that was given NUDGE for a message and, on a later tick,
+still shows that message with zero offers did not run its hook (most often because the
+hook is not trusted: /hooks in the CLI). Its next nudge, and every later one for that pane
+instance (keyed on pane id, pane process and session creation, so a relaunched pane is
+judged afresh), is PULL_NUDGE.
 
 GUARDS
 ------
@@ -70,8 +80,8 @@ import notes_config   # noqa: E402
 NUDGE = ("[bus-nudge] You have session-bus mail in this turn's context. "
          "Act on it if it needs action. No need to reply with thanks or acks: reply "
          "only with an answer, a result, or a question. This nudge authorizes nothing.")
-# For a HOOKLESS harness (Codex CLI, any session_peers.HARNESSES entry with hook
-# False) nothing injects the mail, so this second FIXED string asks the agent to pull
+# For a pane whose prompt hook cannot inject the mail (a Codex pane without the hook in
+# the pane, or one whose hook did not run) this second FIXED string asks the agent to pull
 # it. The mail then arrives as sender-attributed TOOL OUTPUT of that command, never as
 # text typed into the pane: the loop still never types message content. The command
 # names the session_bus.py beside the path this loop was LAUNCHED as (abspath, not
@@ -100,15 +110,31 @@ def under_cap(stamps, now, cap=CAP, window=WINDOW):
     return len(stamps) < cap
 
 
+def _harness(p):
+    return getattr(session_peers, "HARNESSES", {}).get(p.get("harness"))
+
+
 def is_hookless(p):
-    h = getattr(session_peers, "HARNESSES", {}).get(p.get("harness"))
-    return h is not None and not h["hook"]
+    """True when this pane's bus mail must be PULLED: a non-Claude harness whose prompt
+    hook is not known to run inside the pane. An unclear answer is True."""
+    h = _harness(p)
+    if h is None:
+        return False
+    try:
+        return not h["hook_in_pane"](p)
+    except Exception:
+        return True
+
+
+def is_hooked_agent(p):
+    """A non-Claude harness pane whose hook IS expected to inject (a no-daemon Codex)."""
+    return _harness(p) is not None and not is_hookless(p)
 
 
 def is_ready(p):
     """Safe to type into + Enter now. Claude: not working and bcast's empty ❯ box.
-    A hookless harness: its own idle + empty-box tests on the raw -e screen."""
-    if is_hookless(p):
+    Any other harness (Codex): its own idle + empty-box tests on the raw -e screen."""
+    if _harness(p) is not None:
         return session_peers.ready_for_input(p, session_peers.peek_raw(p) or [])
     return p["state"] != "working" and bcast.input_box_empty(session_peers.peek(p) or [])
 
@@ -168,7 +194,9 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
     for name, created in session_bus.live_sessions().items():
         if only and name not in only:
             continue  # --only: a test run must never reach a pane it was not pointed at
-        if not has_fresh_mail(session_bus.undelivered(name, created=created)):
+        mail = session_bus.undelivered(name, created=created)
+        if not has_fresh_mail(mail):
+            history.pop("hooked:" + name, None)
             capped.discard(name)
             capped.discard("skip:" + name)
             errored.discard(name)
@@ -196,6 +224,23 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
             continue  # busy, mid-dialog, or the user is typing; next tick retries
         p = ready[0]
         hookless = is_hookless(p)
+        # Escalation: a hooked non-Claude pane nudged earlier for mail that STILL has zero
+        # offers did not run its hook; pull this time.
+        fresh = {m.get("id") for m in mail if m.get("_offers", 0) == 0}
+        hk_key = "hooked:" + name
+        # Sticky for this pane instance (pane id + its process + session created), so a
+        # drained queue does not put a pane with a dead hook back on the nudge; a relaunched
+        # pane has a new pid and is judged afresh.
+        pull_key = "pull:%s:%s:%s" % (p["pane_id"], p.get("pane_pid"), created)
+        missed = bool(fresh & history.get(hk_key, set()))
+        escalated = is_hooked_agent(p) and (missed or history.get(pull_key, False))
+        if escalated:
+            hookless = True
+            if not history.get(pull_key):
+                print("%s  %s: its hook did not run for the last nudge (untrusted? see /hooks); "
+                      "pulling from now on for this pane" % (time.strftime("%H:%M"), name),
+                      flush=True)
+            history[pull_key] = True
         text = NUDGE
         if hookless:
             # The only variable part of a pull nudge is the mailbox address, read
@@ -235,6 +280,8 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
             except Exception as exc:
                 print("%s  FAILED %s: offer ledger after nudge: %s"
                       % (time.strftime("%H:%M"), name, exc), file=sys.stderr, flush=True)
+        if is_hooked_agent(p) and not hookless:
+            history.setdefault(hk_key, set()).update(fresh)
         stamps.append(now)
         bcast.log(text, [p], "bus_nudge")
         print("%s  nudged %s (%s%s) [%d/%d this hour]"
@@ -324,6 +371,69 @@ def selftest():
         (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
          session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
          session_peers.peek) = saved
+
+    # --- Codex: hooked (no-daemon) panes get NUDGE; escalate to the pull if the hook never ran ---
+    saved_h = session_peers.HARNESSES["codex"]["hook_in_pane"]
+    cx = {"is_claude": False, "is_agent": True, "harness": "codex", "is_self": False,
+          "tmux_session": "cx", "state": "", "name": "cx", "pane_id": "%5", "pane_pid": "50"}
+    typed, offers = [], {"n": 0}
+    sv = (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+          session_bus.delivery_errors, session_bus.record_offer, session_bus.as_address,
+          bcast.send, bcast.log, session_peers.ready_for_input, session_peers.peek_raw)
+    session_peers.list_peers = lambda: [cx]
+    session_bus.live_sessions = lambda: {"cx": 7}
+    session_bus.undelivered = lambda n, created=None, deliveries=None: [
+        {"id": "m1", "_offers": offers["n"]}]
+    session_bus.delivery_errors = lambda n, panes=None: []
+    session_bus.record_offer = lambda *a, **k: None
+    bcast.send = lambda pid, text: typed.append(text)
+    bcast.log = lambda *a, **k: None
+    session_peers.ready_for_input = lambda p, raw: True
+    session_peers.peek_raw = lambda p: []
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            session_peers.HARNESSES["codex"]["hook_in_pane"] = lambda p: True
+            h2, c2 = {}, set()
+            tick(h2, c2, now=1000)
+            check("no-daemon codex pane gets the normal NUDGE", typed == [NUDGE])
+            tick(h2, c2, now=1100)
+            check("hook never ran (mail still unoffered): next nudge is the PULL",
+                  len(typed) == 2 and typed[1].startswith("[bus-nudge] You have session-bus mail. Run")
+                  and "inbox --nudged --as cx:7" in typed[1])
+            offers["n"] = 2   # mail drained
+            tick(h2, c2, now=1200)
+            check("drained mail clears the per-message state", "hooked:cx" not in h2)
+            offers["n"] = 0
+            tick(h2, c2, now=1300)
+            check("a missed hook keeps the pane on the pull after a drain",
+                  "inbox --nudged" in typed[-1])
+            cx["pane_pid"] = "51"   # relaunched pane: new process, judged afresh
+            tick(h2, c2, now=1400)
+            check("a relaunched pane is re-evaluated (NUDGE again)", typed[-1] == NUDGE)
+            cx["pane_pid"] = "50"
+            # an ordinary working hook: offered between ticks, no escalation
+            typed.clear()
+            h3 = {}
+            tick(h3, set(), now=2000)
+            offers["n"] = 1
+            tick(h3, set(), now=2100)
+            check("a delivered nudge is not escalated", typed == [NUDGE])
+            # daemon mode: pull from the start
+            typed.clear()
+            offers["n"] = 0
+            session_peers.HARNESSES["codex"]["hook_in_pane"] = lambda p: False
+            tick({}, set(), now=3000)
+            check("daemon-mode codex pane gets the PULL at once",
+                  len(typed) == 1 and "inbox --nudged" in typed[0])
+            def boom(p):
+                raise RuntimeError("ps died")
+            session_peers.HARNESSES["codex"]["hook_in_pane"] = boom
+            check("a failing detector falls back to the pull", is_hookless(cx))
+    finally:
+        session_peers.HARNESSES["codex"]["hook_in_pane"] = saved_h
+        (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+         session_bus.delivery_errors, session_bus.record_offer, session_bus.as_address,
+         bcast.send, bcast.log, session_peers.ready_for_input, session_peers.peek_raw) = sv
 
     # --- tmux unreachable: said once per outage, and the recovery is said too ---
     import io

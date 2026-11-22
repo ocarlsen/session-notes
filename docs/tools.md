@@ -72,7 +72,9 @@ not cover:
 
 Bus mail lands on the recipient's next prompt, through a hook, fenced and
 tagged with the sender. `bus_nudge.py` wakes an idle recipient by typing one
-fixed line (never the message) into its empty input box.
+fixed line (never the message) into its empty input box. Codex panes started with
+`codex --no-daemon` work the same way; otherwise the nudge asks the pane to pull its inbox
+([docs/codex.md](codex.md)).
 
 ## What is in the box
 

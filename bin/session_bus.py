@@ -155,7 +155,7 @@ MAX_BODY = 4000
 # interrupted turn gets the second offer it exists for. If Stop ever fired on an
 # interrupt anyway, the cost would be that one lost re-offer, never a duplicate.
 DELIVERIES = int(os.environ.get("CLAUDE_SESSION_BUS_DELIVERIES", "2"))
-# A hookless harness (Codex) is offered mail by bus_nudge, one offer per
+# A pane whose hook cannot inject (Codex without its hook in the pane) is offered mail by bus_nudge, one offer per
 # nudge, and nothing confirms it was pulled. Retiring at DELIVERIES would make each
 # message pullable for exactly one nudge window, so a missed pull loses it silently.
 # One window more: the next nudge's pull shows it again, labeled [RE-DELIVERY].
@@ -203,7 +203,7 @@ def session_info(env=None):
     return parts[0].strip(), created
 
 
-# A hookless agent's shell often cannot say which session it is in. Codex's
+# A pulling agent's shell (Codex in daemon mode) often cannot say which session it is in. Codex's
 # sandbox refuses the tmux socket, and a RESUMED Codex session runs its commands in
 # the app-server daemon, whose environment has no TMUX/TMUX_PANE at all (observed
 # 2026-11-20: fresh `codex` saw TMUX_PANE, `codex resume` saw it empty). So bus_nudge,
@@ -762,7 +762,7 @@ def cmd_peers(args):
         mark = "*" if name == me else " "
         errs = delivery_errors(name, panes)
         h = harness.get(name)
-        note = f"  ({h}: no hook; bus_nudge prompts it to pull `inbox --nudged`)" if h else ""
+        note = f"  ({h}: mail rides its prompt hook when one runs in the pane, else bus_nudge prompts it to pull `inbox --nudged`)" if h else ""
         if errs:
             bad += 1
             print(f" {mark} {name:<8} !! DELIVERY HOOK ERRORED -> {errs[0]}")
@@ -1249,7 +1249,7 @@ def main():
 
     s = sub.add_parser("inbox", help="peek undelivered mail (non-destructive)")
     s.add_argument("--nudged", action="store_true",
-                   help="the pull bus_nudge asks a hookless harness (Codex) to run: show "
+                   help="the pull bus_nudge asks a Codex session without a prompt hook in its pane to run: show "
                         "only the batch the nudge announced")
     s.add_argument("--as", dest="as_addr", metavar="SESSION:CREATED",
                    help="read this mailbox instead of asking tmux which session this is "
