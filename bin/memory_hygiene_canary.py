@@ -77,6 +77,7 @@ Behavior:
 import argparse
 import os
 import re
+import shutil
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -98,6 +99,10 @@ DEFAULT_SCOPE_INDEX_THRESHOLD = 30_000
 # the store happens to live in a git repo. Never load-bearing: if git is unavailable or
 # the file has no history, the finding still fires on size alone.
 GROWTH_LOOKBACK_DAYS = 30
+
+# Codex only: warn when the files the SessionStart hook loads reach this share of
+# agent.codex_boot_bytes, before the hook starts dropping files past the cap.
+CODEX_BOOT_WARN_FRACTION = 0.9
 
 # Files that are structural, not indexed memory entries. RESUME-archive.md is where
 # /reflect Step 5b hand-trims finished RESUME narrative.
@@ -148,25 +153,34 @@ def configured_stores(cfg):
     return out
 
 
+def _entry_points_scoped(cfg):
+    """[(entry point, scope it speaks for)]: the scope root, or "global"."""
+    home = os.path.expanduser("~")
+    pts = [(os.path.join(cfg["paths"]["claude_home"], "CLAUDE.md"), "global"),
+           (os.path.join(home, "CLAUDE.md"), "global")]
+    for s in cfg.get("scopes", []):
+        # Claude Code boots from either <root>/CLAUDE.md or <root>/.claude/CLAUDE.md.
+        pts.append((os.path.join(s["root"], "CLAUDE.md"), s["root"]))
+        pts.append((os.path.join(s["root"], ".claude", "CLAUDE.md"), s["root"]))
+    return pts
+
+
 def entry_points(cfg):
     """CLAUDE.md files Claude Code may boot from, as far as the config knows."""
-    home = os.path.expanduser("~")
-    pts = [os.path.join(cfg["paths"]["claude_home"], "CLAUDE.md"),
-           os.path.join(home, "CLAUDE.md")]
-    pts += [os.path.join(s["root"], "CLAUDE.md") for s in cfg.get("scopes", [])]
-    return pts
+    return [p for p, _ in _entry_points_scoped(cfg)]
 
 
 def reached_files(cfg):
     """{realpath: entry point that reached it} for every file the entry points
-    @import, recursively. Import rules come from boot_budget (see module docstring)."""
+    @import, recursively. Import rules come from boot_budget (see module docstring).
+    An entry point (or imported file) that exists but cannot be read is recorded in
+    boot_budget's blind reads, never skipped silently."""
     import boot_budget  # lazy: only checks 9/10 need it
 
     reached = {}
-    for ep in entry_points(cfg):
-        if not os.path.isfile(ep):
-            continue
-        for f in boot_budget.resolve_imports(ep):
+    for ep, scope in _entry_points_scoped(cfg):
+        # resolve_imports is silent on an absent file and records an unreadable one.
+        for f in boot_budget.resolve_imports(ep, scope=scope):
             reached.setdefault(os.path.realpath(f), ep)
     return reached
 
@@ -519,6 +533,16 @@ def _decode_slug_dir(slug):
     return walk(os.sep)
 
 
+def _blind_for(boot_budget, roots, uses_settings):
+    """The blind reads that bear on an orphan verdict for a store owned by `roots`: those
+    for the scope itself and for a global entry point, plus user settings only when the
+    verdict actually reads settings."""
+    wanted = set(roots) | {"global"}
+    if uses_settings:
+        wanted.add("user settings")
+    return [(p, sc, r) for p, sc, r in boot_budget.blind_reads() if sc in wanted]
+
+
 def orphan_store_findings(cfg, reached=None):
     """One finding per non-empty store whose MEMORY.md no entry point reaches, so the
     whole store loads nowhere. When a store has a MEMORY.md, ONLY that file is checked:
@@ -535,7 +559,10 @@ def orphan_store_findings(cfg, reached=None):
     <claude_home>/projects/<slug>/memory whose slug names a real project folder: with
     auto memory on (the default), Claude Code itself wrote it and loads it there, so it
     is not an orphan even though no config entry names the project. [] when clean."""
-    reached = reached_files(cfg) if reached is None else reached
+    if reached is None:
+        import boot_budget
+        boot_budget.blind_reset()  # a standalone call starts from a clean record
+        reached = reached_files(cfg)
     known = {os.path.realpath(str(s)) for _, s, _ in configured_stores(cfg)}
     findings = []
     for store_dir, md_files, content_files in non_empty_stores(cfg):
@@ -543,10 +570,34 @@ def orphan_store_findings(cfg, reached=None):
         check_files = [memory_md] if memory_md.is_file() else md_files
         if any(os.path.realpath(str(p)) in reached for p in check_files):
             continue
+        import boot_budget
+        roots = _scope_roots_for_store(cfg, store_dir)
+        scope_roots = list(roots)  # whose entry points and settings bear on the verdict
+        settings_roots = []        # whose settings the native pass below reads
         if memory_md.is_file():
-            import boot_budget
             memory_rp = os.path.realpath(str(memory_md))
-            roots = _scope_roots_for_store(cfg, store_dir)
+            settings_roots = [r for r in roots
+                              if memory_rp == os.path.realpath(boot_budget.native_memory_path(r))]
+            if not roots:
+                projects_rp = os.path.realpath(str(Path(cfg["paths"]["claude_home"]) / "projects"))
+                if (os.path.dirname(os.path.dirname(os.path.realpath(str(store_dir)))) == projects_rp
+                        and os.path.basename(str(store_dir)) == "memory"):
+                    proj_root = _decode_slug_dir(os.path.basename(os.path.dirname(str(store_dir))))
+                    if proj_root:
+                        scope_roots = settings_roots = [proj_root]
+        # Populate the blind-read record for every settings file the verdict below leans
+        # on, then refuse to judge from a file we could not read.
+        for root in settings_roots:
+            boot_budget.is_auto_memory_enabled(root)
+        blind = _blind_for(boot_budget, scope_roots, bool(settings_roots))
+        if blind:
+            findings.append(
+                "STORE %s: orphan judgment NOT made, the check is blind for scope %s: %s"
+                % (store_dir, ", ".join(sorted({sc for _, sc, _ in blind})),
+                   "; ".join("cannot read %s (%s)" % (p, r) for p, _, r in blind)))
+            continue
+        if memory_md.is_file():
+            memory_rp = os.path.realpath(str(memory_md))
             if any(memory_rp == os.path.realpath(boot_budget.native_memory_path(root))
                    and boot_budget.is_auto_memory_enabled(root)
                    for root in roots):
@@ -623,9 +674,36 @@ _EMPTY_SUMMARY = {"disk_count": 0, "index_count": 0, "index_lines": 0,
                   "count_mismatch": False, "index_size": 0}
 
 
+def codex_boot_findings(cfg):
+    """Codex only. The SessionStart hook loads the global MEMORY.md + RESUME.md, then the
+    project's MEMORY.md + RESUME.md, and drops any file past agent.codex_boot_bytes. One
+    finding per label (the global store alone, then each scope with the global files) whose
+    files total >= CODEX_BOOT_WARN_FRACTION of that cap."""
+    import boot_budget
+    cap = cfg.get("agent", {}).get(
+        "codex_boot_bytes", notes_config.DEFAULTS["agent"]["codex_boot_bytes"])
+
+    def size(store, scope):
+        total = 0
+        for name in ("MEMORY.md", "RESUME.md"):
+            data = boot_budget.read_bytes_or_blind(os.path.join(str(store), name), scope)
+            total += len(data) if data is not None else 0
+        return total
+
+    g_size = size(cfg["paths"]["global_store"], "global")
+    rows = [("global", g_size)]
+    for s in cfg.get("scopes", []):
+        rows.append((s["name"], g_size + size(s["store"], s["root"])))
+    return ["CODEX BOOT %s: %d of %d bytes (>= %d%%); the SessionStart hook drops files "
+            "past the cap" % (label, n, cap, round(CODEX_BOOT_WARN_FRACTION * 100))
+            for label, n in rows if n >= CODEX_BOOT_WARN_FRACTION * cap]
+
+
 def report_mode(cfg, out=None):
     """Run every check. Silent + 0 when clean; report on `out` + EXIT_FINDINGS otherwise."""
     out = sys.stdout if out is None else out
+    import boot_budget
+    boot_budget.blind_reset()
     results = []
     any_found = False
     skip = manifest_paths(cfg)
@@ -661,7 +739,12 @@ def report_mode(cfg, out=None):
         reached = reached_files(cfg)
         ref_imported = reference_imported_findings(cfg, reached)
         orphan_stores = orphan_store_findings(cfg, reached)
-    if ref_imported or orphan_stores:
+    codex_boot = codex_boot_findings(cfg) if kind == "codex" else []
+    # Every file we found but could not read: the checks above are blind to it, so it is
+    # a finding in its own right (an orphan verdict that leaned on one is withheld above).
+    blind = ["BLIND %s: cannot read (%s); the check is blind for scope %s"
+             % (p, r, sc) for p, sc, r in boot_budget.blind_reads()]
+    if ref_imported or orphan_stores or codex_boot or blind:
         any_found = True
 
     if not any_found:
@@ -675,6 +758,12 @@ def report_mode(cfg, out=None):
     if orphan_stores:
         report += "\n## Orphan STOREs (every store on disk)\n\n"
         report += "\n".join("- " + f for f in orphan_stores) + "\n"
+    if codex_boot:
+        report += "\n## Codex boot size\n\n"
+        report += "\n".join("- " + f for f in codex_boot) + "\n"
+    if blind:
+        report += "\n## Unreadable files (present but cannot be read; the check is blind)\n\n"
+        report += "\n".join("- " + f for f in blind) + "\n"
     out.write(report)
     return EXIT_FINDINGS
 
@@ -1134,6 +1223,221 @@ def selftest():
               "codex mode: the store checks run and report a dangling entry")
         check(not called, "codex mode: the Claude-only @import checks are skipped")
         check("(codex)" in cap.text(), "the report names the agent kind")
+
+    # --- .claude/CLAUDE.md entry points; unreadable files are loud, never a silent skip ---
+    import builtins
+    import contextlib
+    import boot_budget as bb
+
+    @contextlib.contextmanager
+    def deny_open(*suffixes):
+        """open() raises PermissionError(1, ...) for paths ending in a suffix, as macOS
+        privacy (TCC) does under launchd for a file stat() can see."""
+        real_open = builtins.open
+
+        def fake_open(f, *a, **k):
+            if str(f).endswith(suffixes):
+                raise PermissionError(1, "Operation not permitted")
+            return real_open(f, *a, **k)
+        builtins.open = fake_open
+        try:
+            yield
+        finally:
+            builtins.open = real_open
+
+    orig_ovr = bb.CONFIG_DIR_OVERRIDE
+    orig_dis = os.environ.pop("CLAUDE_CODE_DISABLE_AUTO_MEMORY", None)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _test_cfg(d)
+            claude_home = cfg["paths"]["claude_home"]
+            bb.CONFIG_DIR_OVERRIDE = claude_home
+            root = os.path.join(d, "proj")
+            store = os.path.join(claude_home, "elsewhere", "proj-store")
+            _write(os.path.join(store, "MEMORY.md"), "# Memory Index\n\n- [A](reference_a.md) -- hook\n")
+            _write(os.path.join(store, "reference_a.md"), _mem_file("a"))
+            cfg["scopes"] = [{"name": "proj", "root": root, "store": store}]
+            os.makedirs(root, exist_ok=True)
+
+            # (a) CLAUDE.md at <root>/.claude/CLAUDE.md is an entry point.
+            _write(os.path.join(root, ".claude", "CLAUDE.md"),
+                   "# proj\n@%s\n" % os.path.join(store, "MEMORY.md"))
+            check(os.path.join(root, ".claude", "CLAUDE.md") in entry_points(cfg)
+                  and os.path.join(root, "CLAUDE.md") in entry_points(cfg),
+                  "entry_points: <root>/.claude/CLAUDE.md is included beside <root>/CLAUDE.md")
+            bb.blind_reset()
+            check([f for f in orphan_store_findings(cfg) if store in f] == [],
+                  "a scope whose only CLAUDE.md is <root>/.claude/CLAUDE.md is not an orphan store")
+
+            # (b) the TCC false positive: the project's settings turn auto memory ON over a
+            # user-level OFF, but cannot be read. The store sits at its native path.
+            os.remove(os.path.join(root, ".claude", "CLAUDE.md"))
+            _write(os.path.join(root, "CLAUDE.md"), "# proj: no memory import\n")
+            native = bb.native_memory_path(root)
+            cfg["scopes"] = [{"name": "proj", "root": root, "store": os.path.dirname(native)}]
+            _write(native, "# Memory Index\n\n- [A](reference_a.md) -- hook\n")
+            _write(os.path.join(os.path.dirname(native), "reference_a.md"), _mem_file("a"))
+            nstore = os.path.dirname(native)
+            _write(os.path.join(claude_home, "settings.json"), '{"autoMemoryEnabled": false}')
+            psettings = os.path.join(root, ".claude", "settings.json")
+            _write(psettings, '{"autoMemoryEnabled": true}')
+            bb.blind_reset()
+            check([f for f in orphan_store_findings(cfg) if nstore in f] == [],
+                  "blind control: readable project settings (on) -> native store is not an orphan")
+            with deny_open("proj/.claude/settings.json"):
+                bb.blind_reset()
+                hit = [f for f in orphan_store_findings(cfg) if nstore in f]
+            check(len(hit) == 1 and "orphan judgment NOT made" in hit[0] and "blind" in hit[0]
+                  and psettings in hit[0] and "no CLAUDE.md entry point" not in hit[0],
+                  "blind: unreadable project settings -> a blind finding naming the file, "
+                  "NOT an orphan verdict")
+            cap = _Capture()
+            with deny_open("proj/.claude/settings.json"):
+                rc = report_mode(cfg, cap)
+            check(rc == EXIT_FINDINGS and "NOT made" in cap.text() and psettings in cap.text()
+                  and "no CLAUDE.md entry point" not in cap.text(),
+                  "blind: report_mode exits %d with the blind finding and no orphan line" % EXIT_FINDINGS)
+            # absent settings stay silent; malformed JSON is blind
+            os.remove(psettings)
+            _write(os.path.join(claude_home, "settings.json"), '{}')
+            bb.blind_reset()
+            check(orphan_store_findings(cfg) == [] and bb.blind_reads() == [],
+                  "blind: an absent project settings file is silent (auto memory defaults on)")
+            _write(psettings, "{not json")
+            bb.blind_reset()
+            hit = [f for f in orphan_store_findings(cfg) if nstore in f]
+            check(len(hit) == 1 and "NOT made" in hit[0] and "JSONDecodeError" in hit[0],
+                  "blind: malformed project settings JSON is a blind finding")
+            os.remove(psettings)
+
+            # An unreadable entry point: the store it may import is not judged, and the file
+            # is reported even when no store depends on it.
+            cfg["scopes"] = [{"name": "proj", "root": root, "store": store}]
+            with deny_open("proj/CLAUDE.md"):
+                bb.blind_reset()
+                hit = [f for f in orphan_store_findings(cfg) if store in f]
+            check(len(hit) == 1 and "NOT made" in hit[0] and "CLAUDE.md" in hit[0],
+                  "blind: an unreadable entry point withholds the orphan verdict for its store")
+            cap = _Capture()
+            with deny_open("proj/CLAUDE.md"):
+                rc = report_mode(cfg, cap)
+            check(rc == EXIT_FINDINGS and "Unreadable files" in cap.text()
+                  and "BLIND" in cap.text(),
+                  "blind: report_mode lists the unreadable entry point")
+            bb.blind_reset()
+            check([f for f in orphan_store_findings(cfg) if store in f]
+                  and "no CLAUDE.md entry point" in [f for f in orphan_store_findings(cfg)
+                                                       if store in f][0],
+                  "blind control: readable and not imported -> the ordinary orphan verdict")
+
+            # --- fix round 1 ---
+            # An unreadable GLOBAL entry point withholds the verdict for every store.
+            gclaude = os.path.join(claude_home, "CLAUDE.md")
+            _write(gclaude, "# global\n")
+            with deny_open(os.sep + os.path.join("claude", "CLAUDE.md")):
+                bb.blind_reset()
+                hit = [f for f in orphan_store_findings(cfg) if store in f]
+            check(len(hit) == 1 and "NOT made" in hit[0] and gclaude in hit[0],
+                  "blind: an unreadable GLOBAL entry point withholds the orphan verdict")
+            os.remove(gclaude)
+
+            # An unrelated user-settings blind read must not withhold a verdict that never
+            # reads settings (custom store path), whatever order the stores come in; the
+            # store that does depend on settings is withheld.
+            nstore2 = os.path.dirname(bb.native_memory_path(os.path.join(d, "proj2")))
+            root2 = os.path.join(d, "proj2")
+            os.makedirs(root2, exist_ok=True)
+            _write(os.path.join(root2, "CLAUDE.md"), "# proj2: no import\n")
+            _write(os.path.join(nstore2, "MEMORY.md"), "# Memory Index\n\n- [B](reference_b.md) -- hook\n")
+            _write(os.path.join(nstore2, "reference_b.md"), _mem_file("b"))
+            two = [{"name": "proj", "root": root, "store": store},
+                   {"name": "proj2", "root": root2, "store": nstore2}]
+            for order in (two, list(reversed(two))):
+                cfg["scopes"] = [dict(x) for x in order]
+                reached = reached_files(cfg)
+                bb.blind_reset()
+                with deny_open(os.sep + os.path.join("claude", "settings.json")):
+                    found = orphan_store_findings(cfg, reached)
+                mine = [f for f in found if store in f]
+                theirs = [f for f in found if nstore2 in f]
+                check(len(mine) == 1 and "no CLAUDE.md entry point" in mine[0]
+                      and len(theirs) == 1 and "NOT made" in theirs[0],
+                      "blind: user settings withhold only the store whose verdict reads settings "
+                      "(order %s first)" % order[0]["name"])
+            cfg["scopes"] = [{"name": "proj", "root": root, "store": store}]
+            shutil.rmtree(nstore2)
+            shutil.rmtree(nstore)  # leftover native-path stores of earlier cases
+            os.makedirs(cfg["paths"]["global_store"], exist_ok=True)
+
+            # Blind-only: nothing depends on the unreadable file, still a finding, still listed.
+            _write(os.path.join(root, "CLAUDE.md"),
+                   "# proj\n@%s\n" % os.path.join(store, "MEMORY.md"))
+            _write(os.path.join(root, ".claude", "CLAUDE.md"), "# other entry point\n")
+            cap = _Capture()
+            with deny_open(os.path.join("proj", ".claude", "CLAUDE.md")):
+                rc = report_mode(cfg, cap)
+            check(rc == EXIT_FINDINGS and "Unreadable files" in cap.text()
+                  and "NOT made" not in cap.text() and "no CLAUDE.md entry point" not in cap.text(),
+                  "blind: an unreadable file no verdict depends on is still a finding (rc 3, listed)")
+            # report_mode and a standalone orphan_store_findings start from a clean record.
+            os.remove(os.path.join(root, ".claude", "CLAUDE.md"))
+            bb.record_blind("/stale/entry.md", PermissionError(1, "Operation not permitted"), "global")
+            cap = _Capture()
+            rc = report_mode(cfg, cap)
+            check(rc == 0 and cap.text() == "", "blind: report_mode starts from a clean record (no stale entry)")
+            _write(os.path.join(root, "CLAUDE.md"), "# proj: no import\n")
+            bb.record_blind("/stale/entry.md", PermissionError(1, "Operation not permitted"), "global")
+            hit = [f for f in orphan_store_findings(cfg) if store in f]
+            check(len(hit) == 1 and "no CLAUDE.md entry point" in hit[0],
+                  "blind: a standalone orphan_store_findings does not inherit stale entries")
+
+        # (c) codex: warn at >= 90% of agent.codex_boot_bytes.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _test_cfg(d)
+            cfg["agent"] = {"kind": "codex", "codex_boot_bytes": 1000}
+            root = os.path.join(d, "proj")
+            os.makedirs(root)
+            g = cfg["paths"]["global_store"]
+            sstore = os.path.join(d, "cx", "proj")
+            cfg["scopes"] = [{"name": "proj", "root": root, "store": sstore}]
+            _write(os.path.join(g, "MEMORY.md"), "g" * 300)
+            _write(os.path.join(g, "RESUME.md"), "r" * 100)
+            _write(os.path.join(sstore, "MEMORY.md"), "m" * 300)
+            _write(os.path.join(sstore, "RESUME.md"), "s" * 199)
+            check(codex_boot_findings(cfg) == [], "codex boot: 899 of 1000 bytes is under 90%")
+            _write(os.path.join(sstore, "RESUME.md"), "s" * 200)
+            got = codex_boot_findings(cfg)
+            check(got == ["CODEX BOOT proj: 900 of 1000 bytes (>= 90%); the SessionStart hook "
+                          "drops files past the cap"],
+                  "codex boot: exactly 90% fires, naming label, size and cap")
+            _write(os.path.join(g, "MEMORY.md"), "g" * 900)
+            got = codex_boot_findings(cfg)
+            check(len(got) == 2 and got[0].startswith("CODEX BOOT global: 1000 of 1000")
+                  and got[1].startswith("CODEX BOOT proj: 1500 of 1000"),
+                  "codex boot: the global store alone and each scope are judged, over the cap too")
+            cap = _Capture()
+            rc = report_mode(cfg, cap)
+            check(rc == EXIT_FINDINGS and "CODEX BOOT global" in cap.text(),
+                  "codex boot: report_mode reports it in codex mode")
+            with deny_open("cx/proj/RESUME.md"):
+                bb.blind_reset()
+                codex_boot_findings(cfg)
+                blind = bb.blind_reads()
+            check(len(blind) == 1 and blind[0][0].endswith("RESUME.md"),
+                  "codex boot: an unreadable file is a blind read, not size 0 silently")
+            cfg["agent"] = {"kind": "codex"}  # no codex_boot_bytes: the notes_config default
+            _write(os.path.join(g, "MEMORY.md"), "g" * 10800)
+            check(codex_boot_findings(cfg)[0].startswith("CODEX BOOT global: 10900 of %d"
+                  % notes_config.DEFAULTS["agent"]["codex_boot_bytes"]),
+                  "codex boot: the cap's default lives in notes_config only")
+            cfg["agent"] = {"kind": "claude", "codex_boot_bytes": 1000}
+            cap = _Capture()
+            report_mode(cfg, cap)
+            check("CODEX BOOT" not in cap.text(), "codex boot: never fires in claude mode")
+    finally:
+        bb.CONFIG_DIR_OVERRIDE = orig_ovr
+        if orig_dis is not None:
+            os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = orig_dis
 
     print("\nSELFTEST:", "PASS" if ok[0] else "FAIL")
     return 0 if ok[0] else 1

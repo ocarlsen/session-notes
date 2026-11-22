@@ -46,11 +46,13 @@ equal, and a char count is what Claude Code's own warning measures.)
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -141,9 +143,68 @@ def _cfg():
 
 
 def reload_config():
-    """Forget the cached config so the next lookup re-reads it (selftests use this)."""
+    """Forget the cached config so the next lookup re-reads it (selftests use this).
+    Also forgets the blind reads recorded so far."""
     global _CFG
     _CFG = None
+    blind_reset()
+
+
+# --- Blind reads: present but unreadable is loud, never a silent skip ------------------
+# Under macOS launchd the privacy layer (TCC) lets stat succeed on a file under
+# ~/Documents while open() raises PermissionError. A read that fails that way (or a
+# settings file that is malformed JSON) must not be treated as "the file says nothing":
+# every verdict that depended on it is blind. Read sites record (path, scope) -> reason
+# here; `check` prints one BLIND line each and the canary refuses to judge from them.
+# A file that is simply absent (FileNotFoundError / NotADirectoryError) stays silent.
+_ABSENT = (FileNotFoundError, NotADirectoryError)
+# A path the OS cannot even look up (an over-long or malformed "@token") names nothing.
+_NOT_A_PATH = (errno.ENAMETOOLONG, errno.EINVAL)
+_BLIND = {}
+
+
+def blind_reset():
+    _BLIND.clear()
+
+
+def blind_reads():
+    """[(path, scope, reason)] recorded since the last reset, in first-seen order."""
+    return [(p, sc, r) for (p, sc), r in _BLIND.items()]
+
+
+def record_blind(path, exc, scope):
+    """Note that `path` exists but could not be read; `scope` is the scope root the
+    verdict is blind for, or "user settings" / "global"."""
+    if isinstance(exc, OSError) and exc.strerror:
+        reason = "%s: %s" % (type(exc).__name__, exc.strerror)
+    else:
+        reason = "%s: %s" % (type(exc).__name__, exc)
+    _BLIND.setdefault((str(path), scope), reason)
+
+
+def read_bytes_or_blind(path, scope):
+    """The file's bytes, or None when it is absent (silent) or unreadable (recorded)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except _ABSENT:
+        return None
+    except OSError as exc:
+        if exc.errno not in _NOT_A_PATH:
+            record_blind(path, exc, scope)
+        return None
+
+
+def read_text_or_blind(path, scope):
+    data = read_bytes_or_blind(path, scope)
+    return None if data is None else data.decode("utf-8", errors="replace")
+
+
+def blind_lines():
+    """The `check` report lines for every recorded blind read."""
+    return ["BLIND %s: cannot read (%s); the check is blind for scope %s"
+            % (_display(p), r, _display(sc) if os.path.isabs(sc) else sc)
+            for p, sc, r in blind_reads()]
 
 
 def _budget_setting(key):
@@ -221,19 +282,19 @@ def _display(path):
 
 
 def char_count(path):
-    try:
-        return len(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except OSError:
-        return 0
+    """Chars in the file; 0 when absent (silent) or unreadable (recorded as blind)."""
+    text = read_text_or_blind(path, "global")
+    return 0 if text is None else len(text)
 
 
 # --- Import resolution ---------------------------------------------------------------
-def resolve_imports(path, visited=None, order=None):
+def resolve_imports(path, visited=None, order=None, scope="global"):
     """Recursively resolve @imports starting at `path`. Dedupe by realpath.
 
     `visited` / `order` are shared across a whole scope's chain resolution so the same
     file reached via two different CLAUDE.md files in the chain is only counted once.
     Returns `order` (list of the original path strings, in first-visit order).
+    A file that exists but cannot be read is recorded as a blind read for `scope`.
     """
     if visited is None:
         visited = set()
@@ -243,12 +304,19 @@ def resolve_imports(path, visited=None, order=None):
     if rp in visited:
         return order
     visited.add(rp)
-    if not os.path.isfile(path):
+    try:
+        st = os.stat(path)
+    except _ABSENT:
+        return order
+    except OSError as exc:
+        if exc.errno not in _NOT_A_PATH:
+            record_blind(path, exc, scope)
+        return order
+    if not stat.S_ISREG(st.st_mode):
         return order
     order.append(path)
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    text = read_text_or_blind(path, scope)
+    if text is None:
         return order
     base_dir = os.path.dirname(os.path.abspath(path))
     in_fence = False
@@ -270,7 +338,7 @@ def resolve_imports(path, visited=None, order=None):
             if not os.path.isabs(expanded):
                 expanded = os.path.join(base_dir, expanded)
             expanded = os.path.normpath(expanded)
-            resolve_imports(expanded, visited, order)
+            resolve_imports(expanded, visited, order, scope)
     return order
 
 
@@ -321,7 +389,7 @@ def boot_files_for_scope(root):
     visited = set()
     order = []
     for f in chain:
-        resolve_imports(f, visited, order)
+        resolve_imports(f, visited, order, root)
     return order
 
 
@@ -337,19 +405,32 @@ def native_memory_path(root):
 _DISABLE_ENV_TRUE = {"1", "true", "yes"}
 
 
+def _read_settings(path, scope):
+    """A settings file's JSON object. None when the file is absent (silent) or when it is
+    present but unreadable or malformed (recorded as a blind read for `scope`)."""
+    text = read_text_or_blind(path, scope)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        record_blind(path, exc, scope)
+        return None
+    if not isinstance(data, dict):
+        record_blind(path, ValueError("not a JSON object"), scope)
+        return None
+    return data
+
+
 def _settings_value(key):
     """Merge <config_dir>/settings.json and settings.local.json for `key`, with
     settings.local.json (checked second, so it wins) overriding the shared file.
-    Returns None if neither file sets the key (or neither is readable)."""
+    Returns None if neither file sets the key (an unreadable one is recorded as blind)."""
     value = None
     for name in ("settings.json", "settings.local.json"):
         p = os.path.join(_config_dir(), name)
-        try:
-            with open(p, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if key in data:
+        data = _read_settings(p, "user settings")
+        if data is not None and key in data:
             value = data[key]
     return value
 
@@ -361,12 +442,8 @@ def _project_settings_value(root, key):
     value = None
     for name in ("settings.json", "settings.local.json"):
         p = os.path.join(_tilde(root), ".claude", name)
-        try:
-            with open(p, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if key in data:
+        data = _read_settings(p, root)
+        if data is not None and key in data:
             value = data[key]
     return value
 
@@ -578,6 +655,7 @@ def report_mode():
 
 
 def check_mode():
+    blind_reset()
     reports = all_scope_reports()
     violations = []
     for rep in reports:
@@ -589,6 +667,7 @@ def check_mode():
     for path, chars, budget in file_violations():
         violations.append(f"FILE {_display(path)}: {chars:,} chars over budget {budget:,}")
     violations.extend(unlisted_claude_md_findings())
+    violations.extend(blind_lines())
     if not violations:
         return 0  # silent when clean
     for v in violations:
@@ -1060,6 +1139,115 @@ def selftest():
             check(len(unlisted_claude_md_findings()) == 1,
                   "unlisted sweep: a dir within DISCOVERY_MAX_DEPTH is walked (positive control for the line above)")
             (proj / "a" / "b" / "CLAUDE.md").unlink()
+
+            # --- present but unreadable is loud; absent stays silent ---
+            import builtins
+
+            @contextlib.contextmanager
+            def deny_open(suffix):
+                """open() raises PermissionError(1, ...) for paths ending in `suffix`, as macOS
+                privacy (TCC) does under launchd for a file stat() can see."""
+                real_open = builtins.open
+
+                def fake_open(f, *a, **k):
+                    if str(f).endswith(suffix):
+                        raise PermissionError(1, "Operation not permitted")
+                    return real_open(f, *a, **k)
+                builtins.open = fake_open
+                try:
+                    yield
+                finally:
+                    builtins.open = real_open
+
+            def run_check():
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = check_mode()
+                return rc, buf.getvalue()
+
+            blind_settings = widget_root / ".claude" / "settings.json"
+            reload_config()
+            rc, text = run_check()
+            check("BLIND" not in text, "blind: absent project settings stay silent (no BLIND line)")
+            _write(blind_settings, '{"autoMemoryEnabled": true}')
+            reload_config()
+            rc, text = run_check()
+            check("BLIND" not in text, "blind: readable project settings stay silent")
+            with deny_open("Widget/.claude/settings.json"):
+                reload_config()
+                rc, text = run_check()
+            lines = [ln for ln in text.splitlines() if ln.startswith("BLIND ")]
+            check(rc == 1 and len(lines) == 1
+                  and "settings.json: cannot read (PermissionError: Operation not permitted)" in lines[0]
+                  and "the check is blind for scope" in lines[0] and "Widget" in lines[0],
+                  "blind: unreadable project settings -> one BLIND line naming path, error and scope; rc 1")
+            reload_config()
+            is_auto_memory_enabled(str(widget_root))
+            check(blind_reads() == [], "blind: reload_config() clears the record")
+            _write(blind_settings, "{not json")
+            reload_config()
+            rc, text = run_check()
+            check(rc == 1 and any(ln.startswith("BLIND ") and "JSONDecodeError" in ln
+                                  for ln in text.splitlines()),
+                  "blind: malformed project settings JSON is BLIND, not skipped")
+            blind_settings.unlink()
+            with deny_open(".claude/settings.json"):
+                reload_config()
+                is_auto_memory_enabled(str(widget_root))
+                user_blind = [b for b in blind_reads() if b[1] == "user settings"]
+            check(len(user_blind) == 1, "blind: unreadable USER settings are recorded for 'user settings'")
+            with deny_open("Widget/CLAUDE.md"):
+                reload_config()
+                boot_files_for_scope(str(widget_root))
+                imp_blind = [b for b in blind_reads() if b[0].endswith("Widget/CLAUDE.md")]
+            check(len(imp_blind) == 1 and imp_blind[0][1] == str(widget_root),
+                  "blind: an unreadable entry point (CLAUDE.md) is recorded for its scope")
+            reload_config()
+            boot_files_for_scope(str(widget_root / "nope"))
+            check(blind_reads() == [], "blind: an absent CLAUDE.md in the chain stays silent")
+
+            # --- fix round 1 ---
+            reload_config()
+            record_blind("/stale/entry.md", PermissionError(1, "Operation not permitted"), "x")
+            rc, text = run_check()
+            check("/stale/entry.md" not in text, "blind: check_mode starts from a clean record")
+            _write(blind_settings, '["not", "an", "object"]')
+            reload_config()
+            is_auto_memory_enabled(str(widget_root))
+            check(len(blind_reads()) == 1 and "not a JSON object" in blind_reads()[0][2],
+                  "blind: settings JSON that is not an object is BLIND")
+            blind_settings.unlink()
+            # an os.stat that fails for a reason other than absence is recorded (the stat branch)
+            stat_target = widget_root / "stat-denied.md"
+            _write(stat_target, "x\n")
+            real_stat = os.stat
+
+            def fake_stat(f, *a, **k):
+                if str(f).endswith("stat-denied.md"):
+                    raise PermissionError(1, "Operation not permitted")
+                return real_stat(f, *a, **k)
+            os.stat = fake_stat
+            try:
+                reload_config()
+                resolve_imports(str(stat_target), scope="sc")
+            finally:
+                os.stat = real_stat
+            check(blind_reads() == [(str(stat_target), "sc", "PermissionError: Operation not permitted")],
+                  "blind: a PermissionError from os.stat in resolve_imports is recorded")
+            # an over-long @token names nothing: absent, not BLIND
+            reload_config()
+            long_imp = widget_root / "long-import" / "CLAUDE.md"
+            _write(long_imp, "@" + "a" * 300 + "\n")
+            resolve_imports(str(long_imp), scope="sc")
+            check(blind_reads() == [], "blind: a 300-char @token (ENAMETOOLONG) is absent, not BLIND")
+            # char_count: unreadable records, absent is 0 and silent
+            reload_config()
+            with deny_open("Widget/CLAUDE.md"):
+                n = char_count(str(widget_root / "CLAUDE.md"))
+            check(n == 0 and len(blind_reads()) == 1, "blind: char_count on an unreadable file records BLIND")
+            reload_config()
+            check(char_count(str(widget_root / "absent.md")) == 0 and blind_reads() == [],
+                  "blind: char_count on an absent file is 0 and silent")
 
         # --- Regression guard: WARN_AT must stay reachable below TOTAL_LIMIT ---
         check(orig_warn < orig_total, "WARN_AT stays strictly below TOTAL_LIMIT in the real config")

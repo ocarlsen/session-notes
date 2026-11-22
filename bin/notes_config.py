@@ -79,6 +79,9 @@ DEFAULTS = {
         # The global memory store. Empty means "derive it": the projects/
         # folder Claude Code uses for your home directory, plus /memory.
         "global_store": "",
+        # Where nightly_check records its last run (read by `nightly_check.py status`).
+        # Empty = <shared_state_dir>/last-check.json, the same file for every agent.
+        "last_check": "",
     },
     "time": {
         # IANA zone for the clock anchor. Empty = the system's local zone.
@@ -294,6 +297,8 @@ def _resolve(cfg, base=None, env=None):
     # state_dir, NOT moved by codex mode. It holds no memory, so the
     # no-piggyback rule below does not apply to it.
     p["shared_state_dir"] = p["state_dir"]
+    p["last_check"] = (_abs(p["last_check"], base) if p["last_check"].strip()
+                       else os.path.join(p["shared_state_dir"], "last-check.json"))
     # A derived store (not named in the config) is created on the first save, so
     # "missing" is normal for it until then; a named one that is missing is a typo.
     p["global_store_derived"] = kind == "codex" or not p["global_store"]
@@ -493,6 +498,17 @@ store = "/tmp/beta-store"
             "-tmp-alpha/memory"))
         check("explicit store", cfg["scopes"][1]["store"] == "/tmp/beta-store")
         check("defaults kept", cfg["bcast"]["prefix"] == DEFAULTS["bcast"]["prefix"])
+        check("last_check derives from shared_state_dir",
+              cfg["paths"]["last_check"] == "/tmp/x/last-check.json")
+        cx = load(f, env={"SESSION_NOTES_AGENT": "codex"})
+        check("last_check stays on the shared state dir in codex mode",
+              cx["paths"]["last_check"] == "/tmp/x/last-check.json")
+        with open(f, "w") as fh:
+            fh.write('[paths]\nlast_check = "sub/lc.json"\n')
+        check("explicit last_check is resolved against the config dir",
+              load(f)["paths"]["last_check"] == os.path.join(d, "sub", "lc.json"))
+        with open(f, "w") as fh:
+            fh.write(sample)
 
         with open(f, "w") as fh:
             fh.write("[paths]\nstat_dir = \"/x\"\n")
