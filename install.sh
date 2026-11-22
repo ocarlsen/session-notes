@@ -3,8 +3,8 @@
 #
 # What it does:
 #   - symlinks the /reflect, /refresh and /rnr skills into ~/.claude/skills/<name>
-#   - optionally symlinks the three commands (handoff_session, session_peers,
-#     bcast) into a directory on your PATH
+#   - optionally symlinks the four commands (handoff_session, session_peers,
+#     bcast, wt) into a directory on your PATH
 #   - in a terminal, it asks [y/N] before each of those, and before each edit below
 #   - offers, one [y/N] question each, to add its hooks (and SESSION_NOTES, which the
 #     skills use to find the tools) to ~/.claude/settings.json, and the lines that tell
@@ -76,7 +76,10 @@ run() { if [ "$DRY" = 1 ]; then echo "would: $*"; else "$@"; fi; }
 link() {  # link SRC DEST: create or refresh a symlink, never clobber a real file
   src=$1 dest=$2
   if [ -L "$dest" ]; then
-    run ln -sfn "$src" "$dest"
+    case "$(readlink "$dest")" in
+      "$REPO"/*) run ln -sfn "$src" "$dest" ;;
+      *) echo "skip: $dest is a symlink to somewhere else (remove it to install)" >&2; return 0 ;;
+    esac
   elif [ -e "$dest" ]; then
     echo "skip: $dest exists and is not a symlink (move it aside to install)" >&2
     return 0
@@ -89,7 +92,7 @@ link() {  # link SRC DEST: create or refresh a symlink, never clobber a real fil
 # The default surface. The skills call every other tool by its path under
 # $SESSION_NOTES/bin, so nothing they need has to be on PATH.
 SKILLS="reflect refresh rnr"
-TOOLS="handoff_session session_peers bcast"
+TOOLS="handoff_session session_peers bcast wt"
 if [ "$ALL" = 1 ]; then
   # skills/codex/ holds the Codex variants (install.sh --codex), not a Claude skill.
   SKILLS=$(for d in "$REPO"/skills/*/; do n=$(basename "$d"); [ "$n" = codex ] || echo "$n"; done)
@@ -250,11 +253,11 @@ RULE
   AG="$CODEX_DIR/AGENTS.md"
   echo
   echo "Standing rules and session-notes lines for $(tilde "$AG") (read by Codex at every session start):"
-  offer "Write the block (keeping a .bak-session-notes copy)?" apply --file "$AG"
+  offer "Write the block (keeping a timestamped backup)?" apply --file "$AG"
   # Models are set once, in rules_block.py. Top-level keys go before the first [table].
   echo
   echo "Default model and effort for $(tilde "$CT"), only where unset:"
-  offer "Set them (keeping a .bak-session-notes copy)?" codex-defaults --config "$CT"
+  offer "Set them (keeping a timestamped backup)?" codex-defaults --config "$CT"
   echo
   echo "Profiles for sub-agent roles in $(tilde "$CODEX_DIR") (codex -p build, codex -p review; never overwritten):"
   offer "Create the missing ones?" profiles --dir "$CODEX_DIR"
@@ -336,7 +339,7 @@ if [ "$ASK" = 1 ]; then
   python3 "$REPO/bin/setup_claude.py" claude-md --file "$CLAUDE_DIR/CLAUDE.md" --snippet "$REPO/CLAUDE.snippet.md" "$@"
   echo
   echo "Standing rules for $(tilde "$CLAUDE_DIR/CLAUDE.md") (@import lines):"
-  offer "Add them (keeping a .bak-session-notes copy)?" claude-apply --file "$CLAUDE_DIR/CLAUDE.md"
+  offer "Add them (keeping a timestamped backup)?" claude-apply --file "$CLAUDE_DIR/CLAUDE.md"
   CHECK="python3 $SHOWN/bin/session_peers.py"
   [ -n "$BIN_DIR" ] && [ -L "$BIN_DIR/session_peers" ] && CHECK="session_peers"
   cat <<EOF

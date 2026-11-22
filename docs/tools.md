@@ -1,6 +1,6 @@
 # session-notes: the full toolkit
 
-The README covers the default install: three skills and three commands. This page is everything else in the repo, and the reference for the default pieces too. `sh install.sh --all` links all of it.
+The README covers the default install: three skills and four commands (`handoff_session`, `session_peers`, `bcast` and `wt`). This page is everything else in the repo, and the reference for the default pieces too. `sh install.sh --all` links all of it.
 
 ## The mental model
 
@@ -84,7 +84,7 @@ fixed line (never the message) into its empty input box.
 | Session coordination | `bin/session_peers.py`, `session_lineage.py`, `handoff_session.py`, `bcast.py`; `hooks/session_pane_registry.py` | List and peek at sibling sessions, launch a worker session and record who launched it, show the lineage tree, broadcast a line you type to every session. |
 | Bus | `bin/session_bus.py`, `bus_nudge.py`; `hooks/session_bus_hook.py` | Staged specs and mail from scripts, addressed by tmux session name, delivered at least once; wake idle recipients. |
 | Worktrees | `bin/wt.py`, `githooks/pre-commit` | A worktree per change, a PR that merges only on a review verdict, and a staged-content pre-commit. See the `wt` section below. |
-| Standing rules | `rules/core.md`, `rules/review-contract.md`, `bin/rules_block.py` | The rules every session follows, for both agents. `rules_block.py apply` writes them, with `AGENTS.snippet.md` and an optional private addendum (`rules.local` in the config), into a marked block in `~/.codex/AGENTS.md` that every `install.sh --codex` rewrites (a file with an older install of the snippet is migrated, and anything outside the markers is kept); `claude-apply` adds `@import` lines to `~/.claude/CLAUDE.md`. `codex-defaults` and `profiles` set Codex's model and effort where unset and create `build` and `review` profiles. |
+| Standing rules | `rules/core.md`, `rules/review-contract.md`, `bin/rules_block.py` | The rules every session follows, for both agents. `rules_block.py apply` writes them, with `AGENTS.snippet.md` and an optional private addendum (`rules.local` in the config), into a marked block in `~/.codex/AGENTS.md` that every `install.sh --codex` rewrites (a file with an older install of the snippet is migrated, and anything outside the markers is kept; each change keeps a timestamped backup, and only the newest 3 are kept); `claude-apply` adds `@import` lines to `~/.claude/CLAUDE.md`. `codex-defaults` and `profiles` set Codex's model and effort where unset and create `build` and `review` profiles. |
 | Senses | `hooks/time_sense.py` | Stamps the first prompt, and any prompt after a long gap, with the current time; after a long idle it tells the model its context may be stale. |
 | Example guard | `hooks/em_dash_guard.py` | A harmless PostToolUse hook showing the pattern: it flags em dashes in text the model just wrote and asks for a rewrite. |
 
@@ -278,7 +278,7 @@ project scopes there.
 `--uninstall` flag. For each skill, `rm` `${CLAUDE_HOME:-~/.claude}/skills/<name>`
 (one per directory under `skills/`). If you passed `--bin-dir`, `rm` each
 linked tool name (`session_peers`, `session_bus`, `bcast`, `bus_nudge`,
-`handoff_session`, `reflect_lock`, `append_memory_index`, `memory_index_lint`,
+`handoff_session`, `wt`, `reflect_lock`, `append_memory_index`, `memory_index_lint`,
 `boot_budget`, `memory_hygiene_canary`, `notes_config`) from that directory.
 The hooks and the `CLAUDE.md` lines come out by hand too (the
 `.bak-session-notes` copies are the files as they were before the first install): delete every entry under `SessionStart`,

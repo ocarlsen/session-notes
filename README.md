@@ -21,7 +21,7 @@ left to you:
   each pane and type the answer yourself.
 
 session-notes covers the first with three skills, which work in any Claude
-Code session, and the second with three commands, which run in tmux. It is
+Code session, and the second with four commands: three that run in tmux, and `wt`, which needs git (and `gh` for `wt pr` and `wt merge`). It is
 plain Python 3.9+ with no dependencies.
 
 ## The memory loop
@@ -101,7 +101,7 @@ python3 bin/bcast.py -n --to worker "Yes, commit it."   # -n: show what it would
 
 ```sh
 sh install.sh --dry-run --bin-dir ~/bin      # see what it would do
-sh install.sh --bin-dir ~/bin                # link the three skills and three commands
+sh install.sh --bin-dir ~/bin                # link the three skills and four commands
 ```
 
 `install.sh` asks `[y/N]` before each of four steps and shows exactly what it
@@ -127,14 +127,14 @@ The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
 `~/.codex/skills` and adds a SessionStart hook that loads the index and
 RESUME at startup, on resume and after compaction. Codex keeps its own store
 under `~/.codex/session-notes`, separate from Claude's, and the tools refuse a
-Codex path under `~/.claude`. The three commands are Claude Code only for now, but
+Codex path under `~/.claude`. The three tmux commands are Claude Code only for now, but
 `bcast` and the bus reach Codex panes too: an idle Codex pane gets bus mail by pulling
 its inbox when `bus_nudge` asks it to.
 Setup and limits are in [docs/codex.md](docs/codex.md).
 
 ## Honest limits
 
-- Tested on macOS, on one machine. The three commands need tmux today; the
+- Tested on macOS, on one machine. The three tmux commands need tmux today; the
   three skills do not. Sessions outside tmux, headless jobs and other
   machines are invisible to the commands.
 - Built on Claude Code hooks, skills and terminal titles. A title is a UI this
