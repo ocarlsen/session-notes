@@ -156,7 +156,7 @@ def all_unmerged(tree, paths):
         return False
     for p in paths:
         if p == "." or p.startswith(":") or os.path.isdir(os.path.join(d, p)) \
-                or any(c in p for c in "*?["):
+                or (any(c in p for c in "*?[") and not os.path.lexists(os.path.join(d, p))):
             return False
         r = _git(d, "ls-files", "-u", "--", p)
         if r.returncode != 0 or not r.stdout.strip():
@@ -624,14 +624,16 @@ def selftest():
         sh(devmain, "git", "checkout", "-q", "-b", "dev")
         wt_on_main = os.path.join(tmp, "wt_on_main")
         sh(devmain, "git", "worktree", "add", "-q", wt_on_main, "main")
-        conf = mkrepo("conf", ("a.txt", "b.txt", "c.txt"))
+        conf = mkrepo("conf", ("a.txt", "b.txt", "c.txt", "app/[id]/page.tsx"))
         sh(conf, "git", "checkout", "-q", "-b", "other")
-        with open(os.path.join(conf, "a.txt"), "w") as fh:
-            fh.write("theirs\n")
+        for conflicted in ("a.txt", "app/[id]/page.tsx"):
+            with open(os.path.join(conf, conflicted), "w") as fh:
+                fh.write("theirs\n")
         sh(conf, "git", "commit", "-q", "-am", "o")
         sh(conf, "git", "checkout", "-q", "main")
-        with open(os.path.join(conf, "a.txt"), "w") as fh:
-            fh.write("ours\n")
+        for conflicted in ("a.txt", "app/[id]/page.tsx"):
+            with open(os.path.join(conf, conflicted), "w") as fh:
+                fh.write("ours\n")
         sh(conf, "git", "commit", "-q", "-am", "m")
         subprocess.run(["git", "merge", "other"], cwd=conf, env=gitenv, capture_output=True)
         for dirty_name in ("b.txt", "c.txt"):
@@ -806,6 +808,10 @@ def selftest():
                     "git checkout --ours -- '*'", "git restore --theirs '*.txt'",
                     "git checkout --theirs a.tx?"):
             check("B refuse (conflict tree, glob): " + cmd, refused(bash(cmd, conf)))
+        for cmd in ("git checkout --theirs 'app/[id]/page.tsx'",
+                    "git checkout --ours -- 'app/[id]/page.tsx'",
+                    "git restore --theirs 'app/[id]/page.tsx'"):
+            check("B pass (conflict, literal bracket path): " + cmd, passed(bash(cmd, conf)))
         check("B refuse (conflict tree): --ours with a mix of conflicted and dirty paths",
               refused(bash("git checkout --ours a.txt b.txt", conf)))
         check("B refuse (dirty): bare git checkout a.txt",

@@ -192,7 +192,9 @@ comment that turns the guard off.
 the line names the file and says the guard is off for that call.
 
 **Conflict resolution passes.** `git checkout --ours/--theirs/--merge/-m <paths>` and
-`git restore --ours/--theirs/--merge <paths>` are allowed when every named path is unmerged. `git
+`git restore --ours/--theirs/--merge <paths>` are allowed when every named path is unmerged. A glob operand (`*`, `?`, `[`) is never treated as
+conflict resolution and goes through the dirty check, unless it names an existing file (a literal
+path such as `app/[id]/page.tsx`). `git
 checkout -- <paths>` and `git restore <paths>` are judged by the named paths only (`.` or a magic
 pathspec falls back to the whole tree). `git clean -X` (ignored files only) passes. A repo with
 no `origin` remote is never refused by Arm A, since there is no PR flow and `wt new` needs one.
