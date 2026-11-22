@@ -124,10 +124,60 @@ def _split_header_and_hunks(block_lines):
     return header, hunk_lines
 
 
+_C_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34}
+
+
+def _unquote_c(tok):
+    """Decode a git C-quoted path (`"a/t\\303\\251st.py"`); any other string is returned as is.
+
+    Octal escapes are UTF-8 bytes; \\\\ \\" \\t \\n and the other single-letter escapes are handled.
+    """
+    if not (len(tok) >= 2 and tok.startswith('"') and tok.endswith('"')):
+        return tok
+    raw = tok[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch != "\\" or i + 1 >= len(raw):
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = raw[i + 1]
+        if nxt in "0123":
+            digits = raw[i + 1:i + 4]
+            if len(digits) == 3 and all(c in "01234567" for c in digits):
+                out.append(int(digits, 8))
+                i += 4
+                continue
+        if nxt in _C_ESCAPES:
+            out.append(_C_ESCAPES[nxt])
+        else:
+            out += ("\\" + nxt).encode("utf-8")
+        i += 2
+    return out.decode("utf-8", errors="replace")
+
+
 def _strip_prefix(p):
+    p = _unquote_c(p)
     if p.startswith("a/") or p.startswith("b/"):
         return p[2:]
     return p
+
+
+def _quoted_head(rest):
+    """(first token, remainder) when `rest` starts with a C-quoted token, else None."""
+    if not rest.startswith('"'):
+        return None
+    i = 1
+    while i < len(rest):
+        if rest[i] == "\\":
+            i += 2
+            continue
+        if rest[i] == '"':
+            return rest[:i + 1], rest[i + 1:].strip()
+        i += 1
+    return None
 
 
 def _git_header_path(header_lines):
@@ -140,8 +190,18 @@ def _git_header_path(header_lines):
                 a = rest[2:2 + n]
                 if rest == "a/%s b/%s" % (a, a):
                     return a
-            if rest.startswith('"') and rest.endswith('"'):
-                return None
+            # a quoted form: `"a/x" "b/x"`, `a/x "b/x"` or `"a/x" b/x`
+            head = _quoted_head(rest)
+            if head:
+                first, second = head
+            else:
+                k = rest.find(' "b/')
+                first, second = (rest[:k], rest[k + 1:]) if k > 0 and rest.endswith('"') else (
+                    None, None)
+            if first is not None:
+                a, b = _strip_prefix(first), _strip_prefix(second)
+                if a and a == b:
+                    return a
     return None
 
 
@@ -163,9 +223,9 @@ def _block_paths(header_lines):
             if p != "/dev/null":
                 old = _strip_prefix(p)
         elif line.startswith("rename from "):
-            rename_from = line[len("rename from "):].strip()
+            rename_from = _unquote_c(line[len("rename from "):].strip())
         elif line.startswith("rename to "):
-            rename_to = line[len("rename to "):].strip()
+            rename_to = _unquote_c(line[len("rename to "):].strip())
     git_path = _git_header_path(header_lines)
     old = old or rename_from or git_path
     new = new or rename_to or git_path
@@ -855,8 +915,82 @@ def selftest():
     )
     check(scan(diff_x2) == [], "x2. a removed line in a multi-line non-check call is not flagged")
 
+    # --- y. git C-quoted paths (non-ASCII names) are decoded, not skipped ---
+    diff_y1 = (
+        'diff --git "a/tests/fixtures/\\303\\251.bin" "b/tests/fixtures/\\303\\251.bin"\n'
+        "index 1..2 100644\n"
+        'Binary files "a/tests/fixtures/\\303\\251.bin" and "b/tests/fixtures/\\303\\251.bin" differ\n'
+    )
+    hits_y1 = scan(diff_y1)
+    check(len(hits_y1) == 1 and hits_y1[0]["reason"] == "test-file-binary"
+          and hits_y1[0]["file"] == "tests/fixtures/\u00e9.bin",
+          "y1. a changed binary fixture with a quoted non-ASCII name is reported, decoded")
+    diff_y2 = (
+        'diff --git "a/tests/t\\303\\251st_q.py" "b/lib/q.py"\n'
+        "similarity index 100%\n"
+        'rename from "tests/t\\303\\251st_q.py"\n'
+        "rename to lib/q.py\n"
+    )
+    hits_y2 = scan(diff_y2)
+    check(len(hits_y2) == 1 and hits_y2[0]["file"] in ("lib/q.py", "tests/t\u00e9st_q.py"),
+          "y2. a pure rename out of a quoted test path is reported")
+    diff_y3 = (
+        'diff --git "a/tests/t\\303\\251st.py" "b/tests/t\\303\\251st.py"\n'
+        "index 1..2 100644\n"
+        '--- "a/tests/t\\303\\251st.py"\n'
+        '+++ "b/tests/t\\303\\251st.py"\n'
+        "@@ -3,1 +3,1 @@\n"
+        "-    assert a == 1\n"
+        "+    assert a\n"
+    )
+    hits_y3 = scan(diff_y3)
+    check(len(hits_y3) == 1 and hits_y3[0]["file"] == "tests/t\u00e9st.py"
+          and hits_y3[0]["line"] == 3,
+          "y3. a quoted ---/+++ path is decoded and the edit is reported at its line")
+    check(_unquote_c('"a/x\\\\y\\"z\\tq\\nr"') == 'a/x\\y"z\tq\nr'
+          and _unquote_c('"\\303\\251"') == "\u00e9" and _unquote_c("plain") == "plain",
+          "y4. octal (UTF-8), backslash, quote, tab and newline escapes decode")
+    diff_y5 = (
+        'diff --git a/tests/plain.bin "b/tests/plain.bin"\n'
+        "index 1..2 100644\n"
+        "Binary files a/tests/plain.bin and b/tests/plain.bin differ\n"
+    )
+    check(len(scan(diff_y5)) == 1, "y5. a header with only the b side quoted still names the file")
+
+    # --- z. a diff file with non-UTF-8 bytes is read with a warning, not a traceback ---
+    import contextlib
+    import io
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        pth = os.path.join(td, "bad.diff")
+        with open(pth, "wb") as fh:
+            fh.write(b"diff --git a/x b/x\n+caf\xe9\n")
+        err_z = io.StringIO()
+        with contextlib.redirect_stderr(err_z):
+            txt_z = read_diff_file(pth)
+        check("caf\ufffd" in txt_z and "not valid UTF-8" in err_z.getvalue(),
+              "z1. --diff-file with a non-UTF-8 byte is decoded with replacement and warns")
+        with open(pth, "wb") as fh:
+            fh.write("caf\u00e9\n".encode("utf-8"))
+        err_z = io.StringIO()
+        with contextlib.redirect_stderr(err_z):
+            txt_z = read_diff_file(pth)
+        check(txt_z == "caf\u00e9\n" and err_z.getvalue() == "",
+              "z2. a UTF-8 diff file reads silently")
+
     print("selftest:", "PASS" if ok else "FAIL")
     return ok
+
+
+def read_diff_file(path):
+    """The diff file's text. Bytes that are not UTF-8 are replaced, with a warning on stderr."""
+    data = Path(path).read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        print("test_edit_check: warning: %s is not valid UTF-8; undecodable bytes were replaced"
+              % path, file=sys.stderr)
+        return data.decode("utf-8", errors="replace")
 
 
 def main(argv=None):
@@ -883,7 +1017,7 @@ def main(argv=None):
     if args.diff_file == "-":
         diff_text = sys.stdin.read()
     else:
-        diff_text = Path(args.diff_file).read_text()
+        diff_text = read_diff_file(args.diff_file)
 
     hits, counts = _scan_blocks(diff_text, extra_globs=globs)
     if hits:
