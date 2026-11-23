@@ -1,4 +1,4 @@
-.PHONY: test leak check hooks drift selftest-live
+.PHONY: test leak check hooks drift selftest-live selftest-watch
 
 # Everything CI runs, plus the private-term leak scan.
 check: test leak
@@ -22,3 +22,8 @@ hooks:
 # part of check). See tests/live/selftest_live.py and docs/tools.md.
 selftest-live:
 	python3 tests/live/selftest_live.py
+
+# The same live run built to be watched and filmed: `tmux -L sn-watch attach` while it runs.
+# Pass options through ARGS, e.g. make selftest-watch ARGS="--pace 2 --step".
+selftest-watch:
+	python3 tests/live/selftest_live.py --watch $(ARGS)

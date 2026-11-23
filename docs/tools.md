@@ -470,7 +470,9 @@ it clones this checkout's committed HEAD into a throwaway directory, installs it
 user would (`install.sh`, then `install.sh --codex`), launches real sessions, and prints a
 pass/fail table (feature x CLI): boot context and clock line, bus mail, peers, bcast, handoff,
 refresh, reflect, the em-dash and checkout guards, the `wt` verdict gate, that every registered
-hook path exists, and that nothing the run wrote reached the real `~/.claude`, `~/.codex` and
+hook path exists, live context (one CLI's note reaches a fresh session of the other), the review
+skill (a verdict comment on a stubbed PR that `wt merge` accepts), the rendered environment (`claude
+auto-mode config`, Codex `/status`), and that nothing the run wrote reached the real `~/.claude`, `~/.codex` and
 session-notes dirs (no install target gained, lost or changed content referencing the sandbox;
 files changed by other live sessions are listed, not failed). It catches what
 unit tests cannot, such as a `hooks.json` naming scripts in a deleted worktree.
@@ -491,3 +493,67 @@ Limits worth knowing: Codex runs with `--dangerously-bypass-hook-trust`, so hook
 covered; tmux is reached only through a sandbox `TMUX_TMPDIR` (asserted before any pane-listing
 tool runs); `launchctl` and `gh` are stubs; `em_dash_guard` is advisory, so its row checks that the
 flag reached the session, not that the file was refused.
+
+### Watch mode: `make selftest-watch`
+
+The same run, built to be watched and filmed (`python3 tests/live/selftest_live.py --watch`; extra
+options through `ARGS`, e.g. `make selftest-watch ARGS="--pace 2 --step"`). One tmux session
+`watch` in the sandbox server, window fixed at 180x50 (`window-size manual`, so attaching or
+recording never resizes it): a 3-row status pane on top, then the Claude session under test on the
+left (89x46) and the Codex one on the right (90x46), each a read-only nested attach
+(`tmux attach -r -f ignore-size`) of the real session. The side follows the step's focus session.
+Attach from another terminal with
+
+    tmux -L sn-watch attach
+
+(a symlink named `sn-watch` in your default tmux socket directory, `$TMUX_TMPDIR` or `/tmp`
+followed by `tmux-<uid>/`, points at the sandbox socket; a sandbox `attach` alias lands on the
+`watch` window. The run refuses to start if `sn-watch` already exists there, and removes the link
+in the same teardown as everything else, on every exit path). Needs a terminal of at least 180x50.
+
+Steps that run as headless one-shots in CI mode (boot, reflect, em dash, checkout) run as
+interactive panes here, with the same checks, and carry "(pane)" in the final table.
+
+Flags: `--pace X` scales the holds (default 1: about 2 s on each chapter title before the step and
+4 s on its result after; 0 = none); `--step` holds each step until Enter is pressed in the status
+pane; `p` pauses and resumes; `q` aborts with full teardown; `--leak-terms FILE` adds the terms of a
+leak-terms file to the screen guard, read with the same syntax as `tests/leak_scan.py` (`w:` whole
+word entries, `!` allowed phrases, `#` comments); `--no-hold-final` tears down when the run ends instead of waiting for
+`q` with the final table in the status pane. The status pane only forwards keys (through a FIFO
+under the sandbox); it never types into another pane.
+
+Nothing private on screen, because the run is public. The panes get only sandbox directories on
+`PATH` (tmux, git, python3 and the CLIs are linked into the sandbox `bin/`), the user name `user`,
+a plain `$ ` prompt, and no tmux status line or hostname titles. The Claude `apiKeyHelper` names no
+keychain path: a sandbox `home/Library/Keychains/login.keychain-db` symlink to the real login
+keychain lets `security find-generic-password -s <service> -w` work under the temp HOME (without
+the link it exits 44). A screen guard captures every visible pane (rows joined across the pane edge, and also read with
+the row breaks removed, so a path that wraps is still seen) about once a second while the runner
+waits, and at each step transition. It looks for the real home path, the user name (both taken from
+the passwd entry of the real user as well as `$HOME` and `$USER`), the short and full hostname, key
+shaped strings (`sk-` plus 20 characters) and, with `--leak-terms`, each term. It does not scan
+while the runner is inside a blocking call (bcast, handoff, the `wt` row, review PR setup,
+`environment_render apply`: up to two minutes), only before and after it. `--watch` refuses to
+start when a class has nothing to look for. A hit blanks the watch panes and aborts the run
+(teardown runs; a trip in the final hold exits nonzero); the message names the pane and the class
+of hit, never the matched text. A hit can be on screen for up to a second before it is seen.
+
+#### Status file
+
+The runner writes `status.json` in the sandbox root (the path is printed at start), rewritten
+atomically at each transition, so a storyboard can time chapter cards off it:
+
+    {"step": 3, "total": 16, "id": "bcast", "cli": "claude",
+     "title": "Broadcast: one line reaches every pane",
+     "claude": "working", "codex": "idle",
+     "phase": "running", "result": "", "paused": false,
+     "pass": 2, "fail": 0, "skip": 1, "t": 1795404391}
+
+`phase` is `title` (the chapter title is up, before the step runs), `running`, `result` (the step
+finished; `result` is PASS, FAIL or SKIP), `done` (the final table, in `table`, is up until `q`) or
+`aborted` (screen guard, `q`, Ctrl-C or any other abort; `note` says why; once written the file is
+final). `id` is the feature id and `cli` is `claude`,
+`codex` or `both`; `claude` and `codex` are `idle`, `working`, `pass`, `fail` or `skip`; `step` is 0
+during setup and `total` counts every step including the last one (`realdirs`). Chapter titles
+have no dashes, at most 8 words and no internal jargon; the table in `CHAPTERS` in
+`tests/live/selftest_live.py` is the list.

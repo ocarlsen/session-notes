@@ -235,12 +235,15 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
         rc, checks = doc["rc"], doc["checks"]
         rows = [(c["agent"], c["check"], c["status"], int(c["findings"])) for c in checks]
         age = (now - ran).total_seconds() / 86400.0
-        day = ran.astimezone().strftime("%Y-%m-%d")
+        # Range check on the aware UTC value, BEFORE astimezone(): that overflows for a
+        # year-9999 stamp only in some zones, which made the message depend on the local TZ.
+        future = age < -1
+        day = None if future else ran.astimezone().strftime("%Y-%m-%d")
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         return "MEMORY CHECKS STATUS UNREADABLE: %s (malformed record)" % path
     if type(rc) is not int or rc not in (0, 1, EXIT_FINDINGS):
         return "MEMORY CHECKS STATUS UNREADABLE: %s (unknown rc %r)" % (path, rc)
-    if age < -1:
+    if future:
         return "MEMORY CHECKS STATUS UNREADABLE: timestamp in the future (%s)" % path
     if age > max_age_days:
         return "MEMORY CHECKS STALE: last run %s, %d days ago" % (day, int(age))
@@ -455,6 +458,18 @@ def selftest():
                                    "findings": 1}]), 8, old).startswith("MEMORY CHECKS STALE"))
         check("status: --max-age-days is honoured",
               status_line(rec(0, clean), 20, old) == "")
+
+        # --- the future check runs on the UTC value: same message in every TZ ---
+        far = rec(0, clean, when=datetime(9999, 12, 31, 23, 0, tzinfo=timezone.utc), name="far.json")
+        code = ("import sys; sys.path.insert(0, %r); import nightly_check as n; "
+                "print(n.status_line(%r, 8))" % (os.path.dirname(os.path.abspath(__file__)), far))
+        msgs = {}
+        for tz in ("UTC", "America/Chicago", "Etc/GMT-14"):
+            msgs[tz] = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                      env=dict(os.environ, TZ=tz)).stdout.strip()
+        check("status: a year-9999 stamp gives the identical 'future' message in every TZ",
+              len(set(msgs.values())) == 1
+              and "timestamp in the future" in msgs["UTC"])
 
         # --- fix round 1: a check that hangs or cannot launch still gets recorded ---
         for exc in (subprocess.TimeoutExpired(["x"], 600), FileNotFoundError(2, "No such file")):
