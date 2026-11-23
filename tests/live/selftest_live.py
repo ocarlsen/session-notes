@@ -758,6 +758,10 @@ def selftest():
         os.chmod(sj, 0)
         try:
             after = snapshot(h)
+            if os.access(sj, os.R_OK):
+                # Root (e.g. a CI container) reads mode-0 files, so chmod cannot make one
+                # unreadable there; feed fatal_diffs the snapshot an unreadable file gives.
+                after[sj] = "unreadable"
             fat, ben = fatal_diffs(before, after, ["sn-live-ZZZ"])
             check("realdirs: NEGATIVE control, an unreadable target is fatal", len(fat) == 1 and not ben and "unreadable" in fat[0], str((fat, ben)))
         finally:
