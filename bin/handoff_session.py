@@ -343,6 +343,24 @@ def selftest():
     check("--dry-run with --display shows the @display set-option",
           rc == 0 and "'@display' 'L'" in buf.getvalue(), "rc=%r out=%r" % (rc, buf.getvalue()[-300:]))
 
+    # rc 5 gate: no tmux on PATH -> a real launch refuses; a dry run still exits 0 with a note.
+    saved_which = shutil.which
+    try:
+        shutil.which = lambda n: None if n == "tmux" else saved_which(n)
+        argv = ["--name", "t", "--prompt", "go.", "--cwd", "/tmp", "--claude-bin", sys.executable]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc_real = main(argv)
+        check("no tmux on PATH: a real launch returns 5", rc_real == 5, "rc=%r" % rc_real)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc_dry = main(argv + ["--dry-run"])
+        check("no tmux on PATH: --dry-run returns 0 and notes a real launch would fail",
+              rc_dry == 0 and "tmux not found on PATH" in err.getvalue()
+              and "would fail" in err.getvalue(), "rc=%r err=%r" % (rc_dry, err.getvalue()))
+    finally:
+        shutil.which = saved_which
+
     print("handoff_session selftest: %d checks, %d failed" % (ran[0], len(fails)))
     for f in fails:
         print("  FAIL %s" % f)
@@ -468,9 +486,12 @@ def main(argv=None):
         return 2
 
     # --dry-run spawns nothing, so it must not need tmux (a CI container has none).
-    if not a.dry_run and shutil.which("tmux") is None:
-        print("handoff_session: tmux not found on PATH", file=sys.stderr)
-        return 5
+    if shutil.which("tmux") is None:
+        if not a.dry_run:
+            print("handoff_session: tmux not found on PATH", file=sys.stderr)
+            return 5
+        print("handoff_session: note: tmux not found on PATH; a real launch would fail (rc 5)",
+              file=sys.stderr)
 
     claude = resolve_claude(a.claude_bin)
     if not claude:
