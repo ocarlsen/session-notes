@@ -1,4 +1,4 @@
-.PHONY: test leak check hooks drift
+.PHONY: test leak check hooks drift selftest-live
 
 # Everything CI runs, plus the private-term leak scan.
 check: test leak
@@ -17,3 +17,8 @@ drift:
 # Point git at the repo's hooks (pre-commit leak scan + commit-msg scan).
 hooks:
 	git config core.hooksPath .githooks
+
+# Real Claude Code and Codex CLI sessions in a sandbox (costs API credits, needs Keychain keys; not
+# part of check). See tests/live/selftest_live.py and docs/tools.md.
+selftest-live:
+	python3 tests/live/selftest_live.py
