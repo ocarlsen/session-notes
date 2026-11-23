@@ -301,7 +301,13 @@ match the rule and falls back to an approval prompt.
 
 - The commands (`handoff_session`, `session_peers`, `bcast`) are Claude Code's; Codex can
   run them from its shell with approval (see above), but `$refresh` does not peek at
-  sibling sessions.
+  sibling sessions. `handoff_session.py --cli codex` (the default when `SESSION_NOTES_AGENT=codex`)
+  starts the new pane as `codex --no-daemon`; `--bypass` becomes
+  `--dangerously-bypass-approvals-and-sandbox`, `--model` becomes `-m`, and `--codex-arg=ARG`
+  passes any other Codex flag. A staged handoff (`--spec`) parks the spec on the bus and the
+  pane stays idle; the UserPromptSubmit hook delivers it on the first prompt typed there, so
+  the hooks must be trusted. There is no `$handoff` skill: Claude Code has none either, the
+  command is the interface.
 - Bus mail rides the prompt hook only when the hook runs inside the pane (`codex --no-daemon`,
   or `codex features disable daemon_auto_start`, which sets it under `[features]` in
   `config.toml`); otherwise it is pulled.

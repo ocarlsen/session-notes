@@ -485,8 +485,12 @@ def selftest():
           and choose_cli(None, {}) == "claude"
           and choose_cli(None, {"SESSION_NOTES_AGENT": "claude"}) == "claude")
     saved_which = shutil.which
+    saved_probes = (g["live_sessions"], g["tmux_has_session"], session_lineage.spawn_env_args)
     try:
         shutil.which = lambda n: "/usr/bin/" + n
+        g["live_sessions"] = lambda: set()
+        g["tmux_has_session"] = lambda name: False
+        session_lineage.spawn_env_args = lambda *a, **k: []
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = main(["--cli", "codex", "--name", "x", "--prompt", "go.", "--dry-run", "--cwd", "/tmp",
@@ -533,6 +537,7 @@ def selftest():
               "rc=%r,%r" % (rc2, rc3))
     finally:
         shutil.which = saved_which
+        (g["live_sessions"], g["tmux_has_session"], session_lineage.spawn_env_args) = saved_probes
 
     print("handoff_session selftest: %d checks, %d failed" % (ran[0], len(fails)))
     for f in fails:

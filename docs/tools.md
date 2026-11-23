@@ -406,7 +406,20 @@ python3 bin/bcast.py -n "check the bus"      # dry run: targets and exact keystr
 ```
 
 `handoff_session.py` starts `worker` idle with the spec parked on the bus;
-it shows up in `worker`'s context when someone types there. To have idle
+it shows up in `worker`'s context when someone types there. `--cli codex` launches
+`codex --no-daemon` instead of Claude Code (default: codex when `SESSION_NOTES_AGENT=codex`,
+else claude), with the same naming, lineage, staged and auto-start modes and `--dry-run`:
+
+| handoff flag | Claude pane | Codex pane |
+|---|---|---|
+| `--model M` | `--model M` | `-m M` |
+| `--bypass` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` (no approvals and no sandbox) |
+| `--claude-bin` / `--codex-bin` | the Claude binary | `--claude-bin` is refused; use `--codex-bin` |
+| `--codex-arg=ARG` (repeatable) | refused | passed to `codex` verbatim, before the prompt |
+| session name | `claude -n <name>` | none; the tmux session name is the address |
+
+A staged Codex pane needs the session-notes hooks trusted (`/hooks`); the parked spec arrives
+on the first prompt typed in the pane. To have idle
 recipients of bus mail woken instead, keep `bin/bus_nudge.py` running: on macOS
 `python3 bin/launch_agents.py install bus-nudge` starts it at login and restarts it
 if it exits; or run it in its own tmux session. Only one loop runs at a time. A session launched with `handoff_session.py` records its parent at
