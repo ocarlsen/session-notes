@@ -10,7 +10,9 @@ worktree ("Blocked by hook"), a hook that never reaches the model, a pane that c
 into.
 
     make selftest-live
+    make selftest-watch                                 # the same run, built to be watched and filmed
     python3 tests/live/selftest_live.py [--only claude|codex] [--feature boot,bus,...] [--keep]
+    python3 tests/live/selftest_live.py --watch [--pace X] [--step] [--leak-terms FILE]
     python3 tests/live/selftest_live.py --selftest      # pure logic, no CLI, no network
 
 Cost and auth. Claude panes run `--model haiku`, Codex `-m gpt-6.2-sol` at low effort, with tiny
@@ -32,6 +34,15 @@ that enumerates panes runs, and the run aborts otherwise. launchctl and gh are s
 sandbox PATH. The "real dirs untouched" row hashes the real install targets before and after
 and fails if any file written during the run mentions the sandbox. API keys are redacted from
 every captured log, and the sandbox Codex auth.json is wiped at teardown.
+
+Watch mode (--watch). One tmux session `watch` in the sandbox server: a 3-row status pane on top,
+the Claude session under test on the left and the Codex one on the right (each a read-only nested
+attach of the real session), in a window fixed at 180x50. Attach with `tmux -L selftest attach`
+(a symlink named `selftest` in the default tmux socket directory points at the sandbox socket and
+is removed at teardown). Every step shows a chapter title, holds (--pace), can wait for Enter
+(--step), and writes a status JSON a film storyboard can follow. Because the run is public, every
+visible pane is scanned at each step for the real home path, the username, the hostname, key-shaped
+strings and (with --leak-terms FILE) each term in that file; a hit blanks the panes and aborts.
 """
 import argparse
 import glob
@@ -39,12 +50,16 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 
@@ -54,6 +69,7 @@ SRC_REPO = os.path.dirname(os.path.dirname(HERE))
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_*-]{20,}")
 _SECRETS = []  # exact key values this run fetched; redacted wherever they appear
 EM = chr(0x2014)
+FAKE_HOME = "/" + "Users" + "/zed"   # a planted home path for the screen guard's controls
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
@@ -70,11 +86,48 @@ FEATURES = [
     ("checkout", "checkout guard refuses main-branch edit", "cli"),
     ("wt", "wt refuses merge without APPROVE", "both"),
     ("hookpath", "registered hook paths exist", "both"),
-    ("review", "review (bin/review.py)", "both"),
-    ("live", "live-context (bin/live.py)", "both"),
-    ("env", "env (bin/environment_render.py)", "both"),
+    ("review", "review (bin/review.py)", "cli"),
+    ("live", "live-context (bin/live.py)", "cli"),
+    ("env", "env (bin/environment_render.py)", "cli"),
     ("realdirs", "real dirs untouched", "both"),
 ]
+
+# Viewer-facing chapter title per feature (watch mode shows it, the status file carries it). No
+# dashes of any kind, at most 8 words, no internal jargon. A storyboard times its cards off these.
+CHAPTERS = {
+    "boot": "Boot: fresh sessions load the rules",
+    "bus": "Mail: a note arrives on the next prompt",
+    "peers": "Peers: each session can see the others",
+    "bcast": "Broadcast: one line reaches every pane",
+    "handoff": "Handoff: a new session takes over",
+    "refresh": "Refresh: a session rereads its memory",
+    "reflect": "Reflect: a session saves what it learned",
+    "emdash": "Style guard: a writing rule enforced",
+    "checkout": "Branch guard: no edits on main",
+    "wt": "Merge gate: no merge without approval",
+    "hookpath": "Wiring: every registered path exists",
+    "review": "Review: a fresh reviewer checks the change",
+    "live": "Live notes: sessions share recent news",
+    "env": "Environment: one file guides approvals",
+    "realdirs": "Isolation: the real home stays untouched",
+}
+# Rows that run as headless one-shots in CI mode and as interactive panes in watch mode.
+PANE_ROWS = ("boot", "reflect", "emdash", "checkout")
+WATCH_W, WATCH_H, STATUS_H, INNER_W, INNER_H = 180, 50, 3, 89, 46
+TITLE_HOLD, RESULT_HOLD = 2.0, 4.0   # seconds at --pace 1
+DASHES = "".join(chr(c) for c in (0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212, 0x2E3A, 0x2E3B)) + "-"
+
+
+def title_problems(title):
+    """Why a chapter title is not fit to show (empty list when it is)."""
+    out = []
+    if any(c in title for c in DASHES):
+        out.append("has a dash")
+    if len(title.split()) > 8:
+        out.append("is over 8 words")
+    if re.search(r"[/_.]|\.py|\bbin\b|\bhook\b|\bbus\b|\bbcast\b|\bwt\b", title, re.I):
+        out.append("has internal jargon")
+    return out
 
 
 def redact(s):
@@ -295,8 +348,9 @@ def seen(token, text):
     return token in re.sub(r"\s+", "", text or "")
 
 
-def render_table(results):
-    """results: dicts with feature/title/cli (claude|codex|both)/status/detail. -> table text."""
+def render_table(results, pane_rows=()):
+    """results: dicts with feature/title/cli (claude|codex|both)/status/detail. -> table text.
+    `pane_rows`: feature ids whose title gets a " (pane)" mark (watch mode: they ran in a pane)."""
     by = {}
     for r in results:
         by.setdefault(r["feature"], {})[r["cli"]] = r
@@ -314,7 +368,7 @@ def render_table(results):
             if s == SKIP and r.get("detail"):
                 s = "SKIP (%s)" % r["detail"]
             cells.append(s + (" [both]" if r["cli"] == "both" else ""))
-        rows.append((title, cells[0], cells[1]))
+        rows.append((title + (" (pane)" if fid in pane_rows else ""), cells[0], cells[1]))
     widths = [max(len(r[i]) for r in rows) for i in range(3)]
     lines = []
     for n, r in enumerate(rows):
@@ -441,12 +495,184 @@ def emdash_flagged(hook_stdout):
     return "em-dash guard" in (d.get("systemMessage") or "") and "EM-DASH GUARD" in ctx
 
 
+# ---------------------------------------------------------------------------- watch mode helpers
+
+def host_names():
+    """The machine's short and full hostnames (names under 3 chars are too generic to scan for)."""
+    names = set()
+    for n in (socket.gethostname(), socket.gethostname().split(".")[0]):
+        if n and len(n) >= 3:
+            names.add(n)
+    try:
+        r = subprocess.run(["hostname", "-s"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and len(r.stdout.strip()) >= 3:
+            names.add(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sorted(names)
+
+
+def screen_needles(real_home, user, hosts, leak_terms):
+    """The screen guard's needles by class. A class with no needle is simply not scanned."""
+    return {"home": [real_home] if real_home and real_home not in ("/", "") else [],
+            "username": [user] if user and len(user) >= 3 else [],
+            "hostname": list(hosts),
+            "terms": [t for t in leak_terms if t]}
+
+
+def screen_hits(text, needles):
+    """Classes (never the matched text) of everything in `text` the guard forbids on screen."""
+    hits = []
+    low = (text or "").lower()
+    for cls in ("home", "username", "hostname", "terms"):
+        if any(n.lower() in low for n in needles.get(cls, [])):
+            hits.append("leak term" if cls == "terms" else cls)
+    if KEY_RE.search(text or ""):
+        hits.append("key shaped string")
+    return hits
+
+
+def load_leak_terms(path):
+    with open(path, encoding="utf-8") as fh:
+        return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def tmux_socket_dir(environ=None):
+    """The directory a bare `tmux -L name` uses for its sockets: $TMUX_TMPDIR (else /tmp)/tmux-<uid>."""
+    environ = os.environ if environ is None else environ
+    return os.path.join(environ.get("TMUX_TMPDIR") or "/tmp", "tmux-%d" % os.getuid())
+
+
+def _stale_note(link):
+    """Say what an existing `selftest` is: a dangling link, a socket nothing answers on, or live."""
+    try:
+        if os.path.islink(link) and not os.path.exists(link):
+            return " (a dangling link left by a killed run: remove it with rm)"
+        if stat.S_ISSOCK(os.stat(link).st_mode):
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(1)
+            try:
+                c.connect(link)
+                return " (a tmux server answers on it: another `tmux -L selftest` is running)"
+            except ConnectionRefusedError:
+                return " (a stale socket, nothing answers on it: remove it with rm if it is not yours)"
+            except OSError:
+                return ""
+            finally:
+                c.close()
+    except OSError:
+        pass
+    return ""
+
+
+def link_selftest_socket(sock_dir, target):
+    """Make `tmux -L selftest` reach the sandbox server: symlink <sock_dir>/selftest -> target.
+    Refuses (Abort) when anything named selftest is already there. -> True when sock_dir was created."""
+    link = os.path.join(sock_dir, "selftest")
+    if os.path.lexists(link):
+        raise Abort("%s already exists%s; refusing to start a second watch run on top of it" % (link, _stale_note(link)))
+    created = False
+    if not os.path.isdir(sock_dir):
+        os.makedirs(sock_dir, mode=0o700)
+        created = True
+    os.symlink(target, link)
+    return created
+
+
+def unlink_selftest_socket(sock_dir, target, created):
+    """Remove the symlink only if it is still ours (points at `target`); drop sock_dir if we made it."""
+    link = os.path.join(sock_dir, "selftest")
+    try:
+        if os.path.islink(link) and os.readlink(link) == target:
+            os.remove(link)
+    except OSError:
+        pass
+    if created:
+        try:
+            os.rmdir(sock_dir)
+        except OSError:
+            pass
+
+
+def render_status(st, width=WATCH_W):
+    """The three status rows for a status dict (the file the runner writes). -> [str, str, str]."""
+    if st.get("phase") == "aborted":
+        return ["Run aborted: %s" % st.get("note", ""), "", ""]
+    head = "%s/%s \u00b7 %s \u00b7 claude %s \u00b7 codex %s" % (
+        st.get("step", 0), st.get("total", 0), st.get("title", ""), st.get("claude", "idle"), st.get("codex", "idle"))
+    counts = "pass %d   fail %d   skip %d" % (st.get("pass", 0), st.get("fail", 0), st.get("skip", 0))
+    if st.get("paused"):
+        counts += "   PAUSED (p to resume)"
+    elif st.get("phase") == "done":
+        counts += "   done (q to close)"
+    hint = "Enter: next step (with --step)   p: pause   q: quit and clean up"
+    return [head[:width], counts[:width], hint[:width]]
+
+
+def status_pane_main(status_path, fifo):
+    """The status pane's whole job: redraw the status file, and forward Enter, p and q (as n, p, q)
+    into the runner's FIFO. It never types into another pane."""
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = None
+    try:
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except (termios.error, OSError):
+        old = None
+    last, mtime = None, 0
+    sys.stdout.write("\x1b[2J\x1b[?25l")
+    try:
+        while True:
+            r, _, _ = select.select([fd], [], [], 0.25)
+            if r:
+                ch = os.read(fd, 1).decode("utf-8", "ignore")
+                key = "n" if ch in ("\r", "\n") else ch if ch in ("p", "q") else ""
+                if key:
+                    try:
+                        w = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                        os.write(w, key.encode())
+                        os.close(w)
+                    except OSError:
+                        pass
+            try:
+                mt = os.stat(status_path).st_mtime_ns
+            except OSError:
+                continue
+            if mt == mtime:
+                continue
+            mtime = mt
+            try:
+                with open(status_path, encoding="utf-8") as fh:
+                    st = json.load(fh)
+            except (OSError, ValueError):
+                mtime = 0
+                continue
+            lines = render_status(st)
+            if st.get("phase") == "done" and st.get("table"):
+                lines = st["table"] + [""] + lines
+            if lines != last:
+                last = lines
+                # no newline after the last row: on a 3-row pane it would scroll the first row away
+                sys.stdout.write("\x1b[H" + "\r\n".join(ln + "\x1b[K" for ln in lines) + "\x1b[J")
+                sys.stdout.flush()
+    except (KeyboardInterrupt, OSError):
+        pass
+    finally:
+        if old is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[?25h")
+
+
 # ---------------------------------------------------------------------------- wt row (no CLI)
 
 GH_STUB = r'''#!/usr/bin/env python3
 # gh stub for the live selftest: records every call, answers from scenario.json. No network.
-import json, os, sys
-here = os.path.dirname(os.path.abspath(__file__))
+# `pr comment` appends to posted.jsonl, and the comments API returns scenario + posted comments,
+# so a verdict posted by review.py is readable by wt merge.
+import json, os, sys, time
+here = os.path.dirname(os.path.realpath(__file__))  # realpath: the PATH entry is a symlink to this dir
 args = sys.argv[1:]
 with open(os.path.join(here, "gh-calls.jsonl"), "a") as fh:
     fh.write(json.dumps(args) + "\n")
@@ -454,6 +680,11 @@ try:
     sc = json.load(open(os.path.join(here, "scenario.json")))
 except OSError:
     sc = {}
+def posted():
+    try:
+        return [json.loads(x) for x in open(os.path.join(here, "posted.jsonl")).read().splitlines() if x.strip()]
+    except OSError:
+        return []
 if args[:2] == ["auth", "token"]:
     print("faketoken")
 elif args[:2] == ["pr", "list"]:
@@ -462,10 +693,20 @@ elif args[:2] == ["pr", "create"]:
     print(sc.get("pr_url", "https://example.invalid/o/r/pull/7"))
 elif args[:2] == ["pr", "view"]:
     print(json.dumps(sc.get("view", {})))
+elif args[:2] == ["pr", "diff"]:
+    sys.stdout.write(sc.get("diff", ""))
 elif args[:2] == ["api", "user"]:
     print(sc.get("login", "tester"))
 elif args[:1] == ["api"]:
-    print(json.dumps(sc.get("comments", [])))
+    print(json.dumps(sc.get("comments", []) + posted()))
+elif args[:2] == ["pr", "comment"] and "--body-file" in args:
+    body = open(args[args.index("--body-file") + 1]).read()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    n = len(posted()) + 1
+    with open(os.path.join(here, "posted.jsonl"), "a") as fh:
+        fh.write(json.dumps({"id": 1000 + n, "body": body, "user": {"login": sc.get("login", "tester")},
+                             "created_at": now, "updated_at": now}) + "\n")
+    print("https://example.invalid/o/r/pull/7#issuecomment-%d" % (1000 + n))
 elif args[:2] == ["pr", "merge"]:
     print("merged (stub)")
 else:
@@ -833,6 +1074,230 @@ def selftest():
         st2, detail2 = wt_row(os.path.join(d, "binc", "wt.py"), os.path.realpath(r2))
         check("wt: NEGATIVE control, a gate that always passes is reported FAIL at the merge gate",
               st2 == FAIL and "merge with no verdict" in detail2 and "rc=0" in detail2, detail2)
+    # ---- watch mode: chapter titles, screen guard, socket link, keys, status file, layout ----
+    check("titles: every feature has one", set(CHAPTERS) == {f for f, _, _ in FEATURES}, str(set(CHAPTERS) ^ {f for f, _, _ in FEATURES}))
+    check("titles: none has a dash, over 8 words or jargon", all(not title_problems(t) for t in CHAPTERS.values()),
+          str({k: title_problems(t) for k, t in CHAPTERS.items() if title_problems(t)}))
+    check("titles: NEGATIVE control, a hyphen, an en dash, an em dash, 9 words and `bcast` are each flagged",
+          all(title_problems(t) for t in ("Self-test", "Boot " + chr(0x2013) + " rules", "Boot " + EM + " rules",
+                                          "one two three four five six seven eight nine", "bcast works")))
+    nd = screen_needles(FAKE_HOME, "zedname", ["zedhost", "zedhost.local"], ["SECRETTERM"])
+    check("guard: clean text is clean", screen_hits("$ ls\nREADME\n/tmp/sn-live-1/home", nd) == [])
+    for label, text in (("home path", "cd " + FAKE_HOME + "/Projects"), ("username", "by ZedName today"),
+                        ("hostname short", "on zedhost:"), ("hostname full", "ssh zedhost.local"),
+                        ("leak term", "see secretterm here"), ("key", "key sk-" + "x" * 20 + "yz"),):
+        want = {"home path": "home", "username": "username", "hostname short": "hostname", "hostname full": "hostname",
+                "leak term": "leak term", "key": "key shaped string"}[label]
+        h = screen_hits(text, nd)
+        check("guard: NEGATIVE control, planted %s is flagged as its class" % label, h == [want], str(h))
+    check("guard: a class with no needle is not scanned (no leak terms file)", screen_hits("secretterm", screen_needles(FAKE_HOME, "zedname", [], [])) == [])
+    check("guard: task-list is not key shaped", screen_hits("task-list ask-me sk-short", nd) == [])
+    with tempfile.TemporaryDirectory() as d:
+        lt = os.path.join(d, "terms.txt")
+        with open(lt, "w") as fh:
+            fh.write("# comment\nAlphaCorp\n\n  BetaCo  \n")
+        check("guard: leak-terms file: comments and blanks skipped", load_leak_terms(lt) == ["AlphaCorp", "BetaCo"])
+
+    # the `selftest` socket link: refuse when present, remove on every exit path
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        sd = os.path.join(d, "tmux-1")
+        check("socket: dir follows TMUX_TMPDIR", tmux_socket_dir({"TMUX_TMPDIR": d}).startswith(d + os.sep)
+              and tmux_socket_dir({}).startswith("/tmp/tmux-"))
+        created = link_selftest_socket(sd, "/x/target")
+        check("socket: link created (and the missing dir)", created and os.readlink(os.path.join(sd, "selftest")) == "/x/target")
+        try:
+            link_selftest_socket(sd, "/x/other")
+            refused = False
+        except Abort as exc:
+            refused = "already exists" in str(exc)
+        check("socket: NEGATIVE control, an existing `selftest` makes the start refuse", refused)
+        unlink_selftest_socket(sd, "/not/ours", False)
+        check("socket: a link that is not ours is left alone", os.path.islink(os.path.join(sd, "selftest")))
+        unlink_selftest_socket(sd, "/x/target", created)
+        check("socket: removed with the dir we made", not os.path.exists(sd))
+        os.makedirs(sd)
+        with open(os.path.join(sd, "selftest"), "w") as fh:
+            fh.write("a regular file")
+        try:
+            link_selftest_socket(sd, "/x/t")
+            refused = False
+        except Abort:
+            refused = True
+        check("socket: a regular file named selftest also refuses", refused)
+
+        def watch_ns(**kw):
+            base = dict(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0, step=False,
+                        leak_terms=None, no_hold_final=True)
+            base.update(kw)
+            return argparse.Namespace(**base)
+
+        def link_then(exc):
+            live = Live(watch_ns())
+            live.sock_dir = os.path.join(d, "tmux-exit")
+
+            def fake_go():
+                live.sock_target = "/x/t"
+                live.sock_created = link_selftest_socket(live.sock_dir, live.sock_target)
+                live.sock_linked = True
+                if exc:
+                    raise exc
+            live.go = fake_go
+            try:
+                execute(live)
+            finally:
+                shutil.rmtree(live.root, ignore_errors=True)
+            return os.path.lexists(os.path.join(live.sock_dir, "selftest")) or os.path.exists(live.sock_dir)
+        for label, exc in (("a normal run", None), ("an Abort", Abort("x")), ("Ctrl-C", KeyboardInterrupt()),
+                           ("a crash", RuntimeError("boom")), ("q in the status pane", Quit("q"))):
+            check("socket: link removed after %s" % label, not link_then(exc))
+        live = Live(watch_ns())
+        try:
+            live.sock_dir = sd
+            try:
+                live.go()
+                refused = False
+            except Abort as exc:
+                refused = "already exists" in str(exc)
+            check("socket: go() refuses before any setup when `selftest` exists", refused and live.before is None)
+        finally:
+            shutil.rmtree(live.root, ignore_errors=True)
+
+    # status file, pace, keys, step mode (no tmux)
+    live = Live(watch_ns(pace=0.0)) if False else None
+    ns = argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0, step=False,
+                            leak_terms=None, no_hold_final=True)
+    live = Live(ns)
+    try:
+        live.have = {"claude": True, "codex": True}
+        live.plan = [("boot", "claude"), ("wt", "both")]
+        t0 = time.time()
+        live.do("boot", "claude", lambda c: (PASS, "ok", None), "claude")
+        live.do("wt", "both", lambda: (FAIL, "bad", None))
+        phases = [(e["phase"], e["step"], e["total"], e["id"], e["claude"], e["codex"]) for e in live.status_log]
+        check("status: title, running, result for a step; counts follow",
+              phases[:3] == [("title", 1, 2, "boot", "idle", "idle"), ("running", 1, 2, "boot", "working", "idle"),
+                             ("result", 1, 2, "boot", "pass", "idle")], str(phases))
+        last = live.status_log[-1]
+        check("status: a both step moves both CLIs, with pass and fail counts",
+              last["claude"] == "fail" and last["codex"] == "fail" and last["pass"] == 1 and last["fail"] == 1
+              and last["title"] == CHAPTERS["wt"] and last["result"] == FAIL, str(last))
+        with open(live.status_path) as fh:
+            check("status: the file on disk is the last write", json.load(fh)["phase"] == "result")
+        check("pace 0: no holds", time.time() - t0 < 1.0)
+        live.pace = 0.2
+        t1 = time.time()
+        live.plan.append(("boot", "claude"))
+        live.do("boot", "claude", lambda c: (PASS, "ok", None), "claude")
+        check("pace 0.2 holds about 0.4 s on the title and 0.8 s on the result", 1.0 <= time.time() - t1 < 4.0, "%.2f" % (time.time() - t1))
+        # keys
+        os.mkfifo(live.fifo)
+        live.fifo_rd = os.open(live.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        w = os.open(live.fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.write(w, b"n")
+        live.poll_keys()
+        check("keys: Enter marks a pending step", live.enter_pending is True)
+        os.write(w, b"p")
+        live.poll_keys()
+        check("keys: p pauses (and the status file says so)", live.paused and live.status_log[-1]["paused"] is True)
+        os.write(w, b"p")
+        live.poll_keys()
+        check("keys: p again resumes", not live.paused and live.status_log[-1]["paused"] is False)
+        os.write(w, b"q")
+        try:
+            live.poll_keys()
+            quit_ = False
+        except Quit:
+            quit_ = live.quit
+        check("keys: q aborts (Quit, an Abort) with the quit flag set", quit_ and issubclass(Quit, Abort))
+        live.quit, live.step_mode, live.pace = False, True, 0.0
+        threading.Timer(0.6, lambda: os.write(w, b"n")).start()
+        t2 = time.time()
+        live.plan.append(("boot", "claude"))
+        live.do("boot", "claude", lambda c: (PASS, "ok", None), "claude")
+        check("step mode: the step waits for Enter, then runs", 0.5 <= time.time() - t2 < 5.0, "%.2f" % (time.time() - t2))
+        os.close(w)
+        st = {"step": 3, "total": 16, "title": "Broadcast: one line reaches every pane", "claude": "working", "codex": "idle",
+              "phase": "running", "pass": 2, "fail": 0, "skip": 1}
+        rows = render_status(st)
+        check("status pane: N/M title claude state codex state, then counts",
+              rows[0] == "3/16 · Broadcast: one line reaches every pane · claude working · codex idle"
+              and rows[1].startswith("pass 2   fail 0   skip 1") and len(rows) == 3, str(rows))
+        check("status pane: NEGATIVE control, an aborted run says so, not a step line",
+              render_status({"phase": "aborted", "note": "screen guard"})[0].startswith("Run aborted"))
+        # a watch run's child env shows nothing real
+        e = live.env()
+        okp = all(x == live.bin or x in ("/usr/bin", "/bin", "/usr/sbin", "/sbin") for x in e["PATH"].split(os.pathsep))
+        check("watch env: PATH is the sandbox bin plus system dirs only, USER and prompt scrubbed",
+              okp and e["USER"] == "user" and e["PS1"] == "$ " and not any(live.real_home in str(v) for v in e.values()), str(e))
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
+    tbl = render_table([{"feature": "boot", "title": "boot context + clock line", "cli": "claude", "status": PASS, "detail": ""}],
+                       pane_rows=PANE_ROWS)
+    check("table: pane rows carry a (pane) mark in watch mode", "(pane)" in tbl and "(pane)" not in render_table(res), tbl)
+
+    # the real layout, the screen guard through real panes, link removal at teardown (needs tmux)
+    if shutil.which("tmux"):
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0,
+                                           step=False, leak_terms=None, no_hold_final=True))
+            live.sock_dir = os.path.join(d, "tmux-t")
+            try:
+                live.plan = [("boot", "claude")]
+                live.start_tmux()
+                live.link_socket()
+                geo = {n: live.tmux("display", "-p", "-t", pid, "#{pane_width}x#{pane_height}").stdout.strip()
+                       for n, pid in live.panes_of.items()}
+                check("layout: 180x3 status over 89x46 and 90x46, window fixed at 180x50",
+                      geo["status"] == "180x3" and geo["claude"] == "89x46" and geo["codex"] == "90x46"
+                      and live.tmux("display", "-p", "-t", "=watch:", "#{window_width}x#{window_height}").stdout.strip() == "180x50", str(geo))
+                live.tmux("new-session", "-d", "-s", "newest", "sleep", "99")
+                check("layout: `attach` is aliased to the watch session (not the newest one)",
+                      "=watch" in live.tmux("show", "-s").stdout and "attach=attach-session" in live.tmux("show", "-s").stdout)
+                live.needles = screen_needles(FAKE_HOME, "zedname", ["zedhost"], ["SECRETTERM"])
+                planted = {"home": FAKE_HOME + "/x", "username": "zedname", "hostname": "zedhost", "leak term": "SECRETTERM",
+                           "key shaped string": "sk-" + "a" * 24}
+
+                def show(text):
+                    live.tmux("respawn-pane", "-k", "-t", live.panes_of["claude"], "--", "sh", "-c",
+                              "printf '%%s\\n' %s; exec sleep 99" % shlex.quote(text))
+                    for _ in range(20):
+                        if text.split()[0] in live.tmux("capture-pane", "-p", "-t", live.panes_of["claude"]).stdout:
+                            return
+                        time.sleep(0.1)
+                show("hello there")
+                live.stopping = False
+                try:
+                    live.guard()
+                    clean = True
+                except Abort:
+                    clean = False
+                check("guard through a real pane: NEGATIVE control, clean text does not trip", clean)
+                for cls, text in planted.items():
+                    live.stopping = False
+                    show(text)
+                    try:
+                        live.guard()
+                        msg = None
+                    except Abort as exc:
+                        msg = str(exc)
+                    blank = all(not live.tmux("capture-pane", "-p", "-t", pid).stdout.strip() for pid in live.panes_of.values())
+                    check("guard through a real pane: planted %s trips, names pane and class, not the text, and clears the panes" % cls,
+                          bool(msg) and "claude pane" in msg and cls in msg and text not in msg and blank, str(msg))
+            finally:
+                live.teardown(False)
+                try:
+                    live.tmux("ls")
+                    refused = False
+                except FileNotFoundError:
+                    refused = True
+                check("teardown: the selftest link and the sandbox socket are gone; with the sandbox dir gone tmux is "
+                      "refused, never redirected to the default server",
+                      not os.path.lexists(os.path.join(live.sock_dir, "selftest")) and not os.path.exists(live.sock_target)
+                      and refused)
+                shutil.rmtree(live.root, ignore_errors=True)
+    else:
+        print("skip layout and guard-through-panes checks: no tmux")
+
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
@@ -878,6 +1343,10 @@ class Abort(Exception):
     pass
 
 
+class Quit(Abort):
+    """The viewer pressed q in the watch status pane: stop, tear everything down."""
+
+
 class Live:
     CLAUDE_TOOLS = ["Bash", "Write", "Edit", "Read", "Skill"]
 
@@ -888,6 +1357,7 @@ class Live:
         j = lambda *p: os.path.join(self.root, *p)
         self.home, self.bin, self.tmuxd, self.repo, self.work, self.logs = (
             j("home"), j("bin"), j("tmux"), j("repo"), j("work"), j("logs"))
+        self.ghdir = os.path.join(self.home, ".local", "state", "session-notes", "ghstub")
         self.claude_dir = os.path.join(self.home, ".claude")
         self.codex_dir = os.path.join(self.home, ".codex")
         self.cfg = j("config.toml")
@@ -909,23 +1379,57 @@ class Live:
         self.installed = False
         self.before = None
         self.login_failed = False  # a key was found but Codex rejected it: FAIL, not SKIP
+        # -- watch mode (every attribute read with getattr: older callers build Namespaces without them)
+        self.watch = bool(getattr(a, "watch", False))
+        self.pace = float(getattr(a, "pace", None) if getattr(a, "pace", None) is not None else 1.0)
+        self.step_mode = bool(getattr(a, "step", False))
+        self.hold_final = not getattr(a, "no_hold_final", False)
+        self.leak_terms = load_leak_terms(a.leak_terms) if getattr(a, "leak_terms", None) else []
+        self.user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        self.needles = screen_needles(self.real_home, self.user, host_names(), self.leak_terms)
+        self.status_path = j("status.json")
+        self.fifo = j("keys.fifo")
+        self.fifo_rd = self.fifo_wr = None
+        self.paused = False
+        self.enter_pending = False
+        self.quit = False
+        self.panes_of = {}                 # "status" | "claude" | "codex" -> tmux pane id (watch layout)
+        self.focused = {}                  # "claude" | "codex" -> session name shown
+        self.ephemeral = []                # sessions this step created; killed when the step ends
+        self.state = {"claude": "idle", "codex": "idle"}
+        self.cur = {"step": 0, "total": 0, "id": "", "title": "", "phase": "title"}
+        self.plan = []
+        self.status_log = []               # every status dict written (the selftest reads it)
+        self.last_scan = 0.0
+        self.sock_dir = tmux_socket_dir()  # where `tmux -L selftest` looks (the user's default dir)
+        self.sock_created = False
+        self.sock_linked = False
+        self.sock_target = None
+        self.step_no = 0
+        self.stopping = False             # the run is ending (abort, guard, quit): no more holds
+        self.guard_tripped = False
+        self.tmux_bin = shutil.which("tmux") or "tmux"
 
     # -- environment ----------------------------------------------------------------------
     def env(self, **extra):
         dirs = [self.bin]
-        for t in ("tmux", "git", "python3"):
-            p = shutil.which(t)
-            if p and os.path.dirname(p) not in dirs:
-                dirs.append(os.path.dirname(p))
+        if not self.watch:  # watch mode links tmux, git and python3 into the sandbox bin instead
+            for t in ("tmux", "git", "python3"):
+                p = shutil.which(t)
+                if p and os.path.dirname(p) not in dirs:
+                    dirs.append(os.path.dirname(p))
         dirs += ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        user = "user" if self.watch else os.environ.get("USER", "selftest")  # watch: nothing real on screen
         e = {"HOME": self.home, "PATH": os.pathsep.join(dirs), "TERM": "xterm-256color",
-             "LANG": "en_US.UTF-8", "USER": os.environ.get("USER", "selftest"), "SHELL": "/bin/zsh",
+             "LANG": "en_US.UTF-8", "USER": user, "SHELL": "/bin/zsh",
              "TMUX_TMPDIR": self.tmuxd, "CLAUDE_CONFIG_DIR": self.claude_dir, "CODEX_HOME": self.codex_dir,
              "SESSION_NOTES_CONFIG": self.cfg, "DISABLE_AUTOUPDATER": "1",
              "GIT_CONFIG_GLOBAL": os.path.join(self.root, "gitconfig"),
              "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
              "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
              "WT_GH": os.path.join(self.bin, "gh")}
+        if self.watch:
+            e.update(LOGNAME=user, PS1="$ ", PROMPT="$ ")
         e.update(extra)
         return e
 
@@ -956,7 +1460,10 @@ class Live:
 
     # -- tmux -----------------------------------------------------------------------------
     def tmux(self, *args, timeout=30):
-        return subprocess.run(["tmux"] + list(args), env=self.env(), capture_output=True, text=True,
+        # With the sandbox TMUX_TMPDIR gone, tmux falls back to the user's DEFAULT server. Never let it.
+        if not os.path.isdir(self.tmuxd):
+            raise FileNotFoundError("the sandbox tmux dir %s is gone; refusing to talk to any tmux server" % self.tmuxd)
+        return subprocess.run([self.tmux_bin] + list(args), env=self.env(), capture_output=True, text=True,
                               timeout=timeout)
 
     def assert_sandbox_tmux(self):
@@ -966,6 +1473,8 @@ class Live:
             raise Abort("tmux socket %r is not inside the sandbox %s; refusing to touch it" % (sock, self.root))
 
     def start_tmux(self):
+        if self.watch:
+            return self.start_watch_layout()
         r = self.tmux("new-session", "-d", "-s", "keeper", "-x", "180", "-y", "50", "--", "sleep", "86400")
         if r.returncode != 0:
             raise Abort("could not start the sandbox tmux server: %s" % r.stderr.strip())
@@ -987,7 +1496,8 @@ class Live:
         parts += ['TMUX="$TMUX"', 'TMUX_PANE="$TMUX_PANE"'] + [shlex.quote(x) for x in argv]
         if out:
             parts += [">", shlex.quote(out), "2>&1"]
-        r = self.tmux("new-session", "-d", "-s", name, "-x", "180", "-y", "50", "-c", cwd or self.work,
+        w, h = (INNER_W, INNER_H) if self.watch else (180, 50)
+        r = self.tmux("new-session", "-d", "-s", name, "-x", str(w), "-y", str(h), "-c", cwd or self.work,
                       "--", "sh", "-c", " ".join(parts))
         if r.returncode != 0:
             raise Abort("launch %s failed: %s" % (name, r.stderr.strip()))
@@ -1015,18 +1525,30 @@ class Live:
         if name not in self.panes:
             raise Abort("refusing to type into pane %r: not created by this run" % name)
         self.tmux("send-keys", "-t", "=%s:" % name, "-l", text)
-        time.sleep(0.8)
+        self.nap(0.8)
         self.tmux("send-keys", "-t", "=%s:" % name, "Enter")
 
-    @staticmethod
-    def wait_for(cond, timeout, step=1.5):
+    def wait_for(self, cond, timeout, step=1.5):
         end = time.time() + timeout
         while time.time() < end:
             v = cond()
             if v:
                 return v
-            time.sleep(step)
+            self.nap(step)
         return None
+
+    def nap(self, secs):
+        """Sleep `secs`; in watch mode in 0.25 s slices, each one watching the keys and the screen."""
+        if not self.watch:
+            time.sleep(secs)
+            return
+        end = time.time() + secs
+        while True:
+            self.tick()
+            left = end - time.time()
+            if left <= 0:
+                return
+            time.sleep(min(0.25, left))
 
     def idle(self, name):
         """True when the pane shows an input box and is not mid-turn."""
@@ -1037,8 +1559,243 @@ class Live:
         return "❯" in tail or "›" in tail
 
     def wait_idle(self, name, timeout=90):
-        time.sleep(3)
+        self.nap(3)
         return self.wait_for(lambda: self.idle(name), timeout)
+
+    # -- watch mode -------------------------------------------------------------------------
+    def pane_cmd(self, argv, exec_=True):
+        """A shell command string that runs argv under `env -i` with the sandbox env (no TMUX)."""
+        parts = (["exec"] if exec_ else []) + ["env", "-i"] + [shlex.quote("%s=%s" % kv) for kv in sorted(self.env().items())]
+        return " ".join(parts + [shlex.quote(x) for x in argv])
+
+    @staticmethod
+    def label_cmd(label):
+        return "printf '\\n  %%s\\n' %s; exec sleep 86400" % shlex.quote(label)
+
+    def start_watch_layout(self):
+        """Session `watch`: status pane on top, Claude left, Codex right, fixed 180x50."""
+        os.mkfifo(self.fifo)
+        self.fifo_rd = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.fifo_wr = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)  # keeps reads from seeing EOF
+        shutil.copy(os.path.realpath(__file__), os.path.join(self.root, "watch_status.py"))
+        self.write_status(step=0, total=len(self.plan), id="setup", title="Setting up the sandbox", phase="title")
+        status_cmd = self.pane_cmd(["python3", os.path.join(self.root, "watch_status.py"),
+                                    "--status-pane", self.status_path, self.fifo])
+        r = self.tmux("new-session", "-d", "-s", "watch", "-x", str(WATCH_W), "-y", str(WATCH_H), "-c", self.root,
+                      "--", "sh", "-c", status_cmd)
+        if r.returncode != 0:
+            raise Abort("could not start the sandbox tmux server: %s" % r.stderr.strip())
+        self.assert_sandbox_tmux()
+        # window-size manual is set on the watch window only: tmux 3.6b exits when a session is created
+        # without -x/-y (handoff_session does that) while the GLOBAL option is manual.
+        self.tmux("set", "-w", "-t", "=watch:", "window-size", "manual")
+        for args in (("-g", "default-size", "%dx%d" % (INNER_W, INNER_H)),
+                     ("-g", "status", "off"), ("-g", "status-left", ""), ("-g", "status-right", ""),
+                     ("-g", "set-titles", "off"), ("-g", "automatic-rename", "off"), ("-g", "allow-rename", "off"),
+                     ("-g", "remain-on-exit", "off"), ("-g", "mouse", "off"),
+                     ("-g", "pane-border-style", "fg=colour238"), ("-g", "pane-active-border-style", "fg=colour238"),
+                     ("-s", "escape-time", "0"),
+                     # a bare `tmux -L selftest attach` lands on the watch window, not the newest session
+                     ("-s", "command-alias[100]", "attach=attach-session -t =watch")):
+            self.tmux("set", *args)
+        self.tmux("resize-window", "-t", "=watch:", "-x", str(WATCH_W), "-y", str(WATCH_H))
+        status = self.tmux("display", "-p", "-t", "=watch:0.0", "#{pane_id}").stdout.strip()
+        claude = self.tmux("split-window", "-v", "-t", status, "-l", str(INNER_H), "-P", "-F", "#{pane_id}", "-c", self.root,
+                           "--", "sh", "-c", self.label_cmd("claude")).stdout.strip()
+        codex = self.tmux("split-window", "-h", "-t", claude, "-l", str(WATCH_W - INNER_W - 1), "-P", "-F", "#{pane_id}",
+                          "-c", self.root, "--", "sh", "-c", self.label_cmd("codex")).stdout.strip()
+        if not (status and claude and codex):
+            raise Abort("could not build the watch layout")
+        self.panes_of = {"status": status, "claude": claude, "codex": codex}
+        for name, pid in self.panes_of.items():
+            self.tmux("select-pane", "-t", pid, "-T", name)
+        geo = {n: self.tmux("display", "-p", "-t", pid, "#{pane_width}x#{pane_height}").stdout.strip()
+               for n, pid in self.panes_of.items()}
+        if geo["status"] != "%dx%d" % (WATCH_W, STATUS_H) or geo["claude"] != "%dx%d" % (INNER_W, INNER_H) \
+                or not geo["codex"].endswith("x%d" % INNER_H):
+            raise Abort("the watch layout came out as %s, not 180x3 over 89x46 and 90x46" % geo)
+
+    def link_socket(self):
+        target = os.path.realpath(self.tmux("display", "-p", "#{socket_path}").stdout.strip())
+        self.sock_target = target
+        self.sock_created = link_selftest_socket(self.sock_dir, target)
+        self.sock_linked = True
+
+    def unlink_socket(self):
+        if self.sock_linked:
+            unlink_selftest_socket(self.sock_dir, self.sock_target, self.sock_created)
+            self.sock_linked = False
+
+    def focus(self, cli, name):
+        """Show session `name` (or a blank label when None or gone) in the `cli` side, read-only."""
+        if not self.watch or not self.panes_of:
+            return
+        if name is not None and self.tmux("has-session", "-t", "=" + name).returncode != 0:
+            name = None
+        if self.focused.get(cli, "?") == name:
+            return
+        if name is None:
+            cmd = self.label_cmd(cli)
+        else:
+            cmd = self.pane_cmd([self.tmux_bin, "attach-session", "-r", "-f", "ignore-size", "-t", "=" + name],
+                                exec_=False) + "; exec sleep 86400"
+        self.tmux("respawn-pane", "-k", "-t", self.panes_of[cli], "--", "sh", "-c", cmd)
+        self.focused[cli] = name
+
+    def default_focus(self):
+        for cli in ("claude", "codex"):
+            base = self.pane_pair(cli)[0]
+            self.focus(cli, base if base in self.panes else None)
+
+    def launch_eph(self, name, argv, cwd=None, out=None):
+        """A session that lives for one step only: killed (and the side refocused) when it ends."""
+        self.launch(name, argv, cwd=cwd, out=out)
+        self.ephemeral.append(name)
+
+    def kill_ephemeral(self):
+        names, self.ephemeral = self.ephemeral, []
+        if self.watch:
+            for cli in ("claude", "codex"):
+                if self.focused.get(cli) in names:
+                    self.focus(cli, None)
+            self.default_focus()
+        for n in names:
+            self.tmux("kill-session", "-t", "=" + n)
+            self.panes.discard(n)
+
+    def stop_inner(self):
+        """Watch mode, before the real-dirs check: end every session under test, keep the window."""
+        for cli in ("claude", "codex"):
+            self.focus(cli, None)
+        for n in sorted(self.panes):
+            self.tmux("kill-session", "-t", "=" + n)
+        self.panes.clear()
+
+    # keys, guard, status ---------------------------------------------------------------
+    def poll_keys(self):
+        if self.fifo_rd is None:
+            return
+        try:
+            data = os.read(self.fifo_rd, 64).decode("utf-8", "ignore")
+        except (BlockingIOError, OSError):
+            return
+        for ch in data:
+            if ch == "n":
+                self.enter_pending = True
+            elif ch == "p":
+                self.paused = not self.paused
+                self.write_status()
+            elif ch == "q":
+                self.quit = True
+                raise Quit("stopped from the status pane (q)")
+
+    def tick(self):
+        """Called while waiting: keys, pause, and the screen guard (at most once a second)."""
+        if not self.watch:
+            return
+        self.poll_keys()
+        while self.paused:
+            time.sleep(0.2)
+            self.poll_keys()
+            self.guard(throttle=True)
+        self.guard(throttle=True)
+
+    def guard(self, throttle=False):
+        """The screen guard. A hit clears the watch panes and aborts; the message names the pane and
+        the class of hit, never the matched text."""
+        if not self.panes_of or self.stopping:
+            return
+        now = time.time()
+        if throttle and now - self.last_scan < 1.0:
+            return
+        self.last_scan = now
+        for name in ("status", "claude", "codex"):
+            r = self.tmux("capture-pane", "-p", "-t", self.panes_of[name])
+            hits = screen_hits(r.stdout if r.returncode == 0 else "", self.needles)
+            if hits:
+                self.trip_guard(name, hits)
+
+    def trip_guard(self, name, hits):
+        self.stopping = self.guard_tripped = True
+        for pid in self.panes_of.values():
+            self.tmux("respawn-pane", "-k", "-t", pid, "--", "sh", "-c", "exec sleep 86400")
+            self.tmux("clear-history", "-t", pid)
+        msg = "screen guard: the %s pane showed %s; the watch panes were cleared and the run stopped" % (
+            name, ", ".join(hits))
+        self.write_status(phase="aborted", note="screen guard tripped (%s)" % ", ".join(hits))
+        raise Abort(msg)
+
+    def counts(self):
+        c = {"pass": 0, "fail": 0, "skip": 0}
+        for r in self.results:
+            k = r["status"].lower()
+            if k in c:
+                c[k] += 1
+        return c
+
+    def write_status(self, **kw):
+        """Atomically rewrite the status file at a transition. See docs/tools.md for the format."""
+        self.cur.update(kw)
+        st = dict(self.cur, claude=self.state["claude"], codex=self.state["codex"], paused=self.paused,
+                  t=int(time.time()), **self.counts())
+        tmp = self.status_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(st, fh)
+        os.replace(tmp, self.status_path)
+        self.status_log.append(st)
+
+    def hold(self, base):
+        secs = 0.0 if self.stopping else base * self.pace
+        if secs > 0:
+            self.nap(secs)
+
+    def begin_step(self, fid, cli, quick=False):
+        self.ephemeral = []
+        if not self.watch:
+            return
+        self.step_no += 1
+        self.enter_pending = False
+        self.state = {"claude": "idle", "codex": "idle"}
+        self.write_status(step=self.step_no, total=len(self.plan), id=fid, cli=cli, title=CHAPTERS[fid],
+                          phase="title", result="")
+        self.default_focus()
+        self.guard()
+        if quick or self.stopping:
+            return
+        self.hold(TITLE_HOLD)
+        while self.step_mode and not self.enter_pending and not self.stopping:
+            self.nap(0.25)
+        for c in (("claude", "codex") if cli == "both" else (cli,)):
+            self.state[c] = "working"
+        self.write_status(phase="running")
+
+    def end_step(self, status, quick=False):
+        if self.watch:
+            for c in ("claude", "codex"):
+                if self.state[c] == "working" or (quick and self.cur.get("cli") in (c, "both")):
+                    self.state[c] = status.lower()
+            self.write_status(phase="result", result=status)
+            self.guard()
+            if not quick:
+                self.hold(RESULT_HOLD)
+        self.kill_ephemeral()
+
+    def finish_watch(self, wait=True):
+        """Table into the status pane (zoomed), then (unless the run failed to finish) wait for q."""
+        if not self.watch or not self.panes_of:
+            return
+        table = render_table(self.results, pane_rows=PANE_ROWS).splitlines()
+        if self.guard_tripped or self.quit:  # the panes were blanked or the viewer left: nothing to show
+            return
+        self.write_status(phase="done", title="Finished", table=table, step=self.cur.get("total", 0))
+        self.tmux("resize-pane", "-Z", "-t", self.panes_of["status"])
+        if not wait or not self.hold_final:
+            return
+        try:
+            while True:
+                self.nap(0.25)
+        except Quit:
+            return
 
     # -- setup ----------------------------------------------------------------------------
     def store_dirs(self):
@@ -1050,13 +1807,23 @@ class Live:
     def stub_bins(self):
         with open(os.path.join(self.bin, "launchctl"), "w") as fh:
             fh.write('#!/bin/sh\necho "$@" >> "%s/launchctl-calls.txt"\nexit 0\n' % self.logs)
-        with open(os.path.join(self.bin, "gh"), "w") as fh:
+        # The gh stub keeps its state (call log, scenario, posted comments) beside itself, in a dir
+        # Codex's workspace-write sandbox may write (install.sh grants the session-notes state dir);
+        # bin/gh is a symlink to it, which is what WT_GH and PATH name.
+        os.makedirs(self.ghdir, exist_ok=True)
+        with open(os.path.join(self.ghdir, "gh"), "w") as fh:
             fh.write(GH_STUB)
-        for n in ("launchctl", "gh"):
-            os.chmod(os.path.join(self.bin, n), 0o755)
+        os.chmod(os.path.join(self.ghdir, "gh"), 0o755)
+        os.symlink(os.path.join(self.ghdir, "gh"), os.path.join(self.bin, "gh"))
+        os.chmod(os.path.join(self.bin, "launchctl"), 0o755)
         for n, real in (("claude", self.claude_bin), ("codex", self.codex_bin)):
             if real:
                 os.symlink(real, os.path.join(self.bin, n))
+        if self.watch:  # only sandbox dirs (plus the system ones) on the panes' PATH: link what they need in
+            for n in ("tmux", "git", "python3"):
+                real = shutil.which(n)
+                if real and not os.path.lexists(os.path.join(self.bin, n)):
+                    os.symlink(real, os.path.join(self.bin, n))
 
     def clone_and_install(self):
         head = subprocess.run(["git", "-C", SRC_REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -1076,9 +1843,18 @@ class Live:
                 doc = json.load(fh)
         except (OSError, ValueError):
             doc = {}
-        doc["apiKeyHelper"] = "security find-generic-password -s %s -w %s" % (
+        # Watch mode names no keychain path (it would show the real home). Without a path `security`
+        # looks in $HOME/Library/Keychains (a bare temp HOME finds nothing: exit 44), so the sandbox
+        # home gets a symlink to the real login keychain. The link is removed with the sandbox.
+        if self.watch:
+            kdir = os.path.join(self.home, "Library", "Keychains")
+            os.makedirs(kdir, exist_ok=True)
+            link = os.path.join(kdir, "login.keychain-db")
+            if not os.path.lexists(link):
+                os.symlink(self.keychain, link)
+        doc["apiKeyHelper"] = "security find-generic-password -s %s -w%s" % (
             shlex.quote(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest")),
-            shlex.quote(self.keychain))
+            "" if self.watch else " " + shlex.quote(self.keychain))
         perm = doc.setdefault("permissions", {})
         perm["deny"] = list(perm.get("deny", [])) + [
             "Read(%s/.config/secrets/**)" % self.real_home, "Bash(security:*)", "Bash(/usr/bin/security:*)"]
@@ -1117,13 +1893,13 @@ class Live:
         return r.returncode == 0 and os.path.isfile(os.path.join(self.codex_dir, "auth.json"))
 
     # -- CLI invocations --------------------------------------------------------------------
-    def claude_argv(self, prompt, name=None, headless=False):
+    def claude_argv(self, prompt, name=None, headless=False, tools=None, budget="0.60"):
         a = [self.claude_bin]
         if headless:
-            a += ["-p", "--max-budget-usd", "0.60"]
+            a += ["-p", "--max-budget-usd", budget]
         if name:
             a += ["-n", name]
-        return a + ["--model", self.claude_model, "--allowedTools"] + self.CLAUDE_TOOLS + ["--", prompt]
+        return a + ["--model", self.claude_model, "--allowedTools"] + list(tools or self.CLAUDE_TOOLS) + ["--", prompt]
 
     def codex_headless(self, prompt, log, sandbox="workspace-write", cwd=None, timeout=240):
         argv = [self.codex_bin, "--no-daemon", "exec", "--dangerously-bypass-hook-trust",
@@ -1179,6 +1955,47 @@ class Live:
     def evid(self, name):
         return os.path.join(self.logs, name)
 
+    def turn(self, cli, prompt, log, timeout, name, cwd=None, until=None, tools=None, budget="0.60",
+             sandbox="workspace-write"):
+        """One session turn. CI mode: a headless one-shot. Watch mode: an interactive pane with the
+        same prompt as its first message (the "(pane)" rows); returns once `until()` holds, or the
+        pane has gone idle when there is no `until`, or `timeout` passes (rc 124)."""
+        if not self.watch:
+            if cli == "claude":
+                return self.run(self.claude_argv(prompt, headless=True, tools=tools, budget=budget), log,
+                                timeout=timeout, cwd=cwd)
+            return self.codex_headless(prompt, log, sandbox=sandbox, cwd=cwd, timeout=timeout)
+        argv = self.claude_argv(prompt, name=name, tools=tools) if cli == "claude" else self.codex_argv(prompt)
+        self.launch_eph(name, argv, cwd=cwd)
+        self.focus(cli, name)
+        if until:
+            ok, idle_since = None, None
+            end = time.time() + timeout
+            while time.time() < end and not ok:
+                ok = until()
+                # a session idle for 45 s straight has finished its turn: stop waiting for a condition
+                # it can no longer meet (a refusal, a failed command), instead of the full timeout
+                if not ok and self.idle(name):
+                    idle_since = idle_since or time.time()
+                    if time.time() - idle_since > 45:
+                        break
+                else:
+                    idle_since = None
+                self.nap(3)
+        else:
+            ok = self.wait_idle(name, timeout)
+        self.log(log, "pane %s: %s\n%s\n" % (name, "condition met" if ok else "gave up (timeout %ss, or the session went idle)" % timeout,
+                                              self.screen(name, 80)))
+        return subprocess.CompletedProcess([], 0 if ok else 124, "", "")
+
+    def pane_reply(self, cli, rid, assistant_only=True):
+        """Transcript text of the sessions whose prompt carried the run id `rid`."""
+        d = self.scoped(cli, rid)
+        try:
+            return transcript_text(d, assistant_only)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     # -- rows -------------------------------------------------------------------------------
     def row_boot(self, cli):
         now_part = ("NOW=<the text inside the square brackets of the line in your context that starts with "
@@ -1188,19 +2005,23 @@ class Live:
             # CLAUDE.md (heading below) and the time_sense hook. No runner-written import is judged.
             p = ("Reply with exactly one line of the form RULES=<heading> %s. <heading> is the text of the "
                  "first heading of the standing rules in your instructions." % now_part)
-            r = self.run(self.claude_argv(p, headless=True), "boot-claude.txt", timeout=180)
-            text = r.stdout
+            rid = "BOOT%s%s" % (self.tok, cli[:2].upper())
+            r = self.turn("claude", p + (" Run id %s." % rid if self.watch else ""), "boot-claude.txt", 180, "bootC",
+                          until=lambda: clock_ok(self.pane_reply("claude", rid)))
+            text = self.pane_reply("claude", rid) if self.watch else r.stdout
             if r.returncode != 0:
-                return FAIL, "claude -p rc=%d" % r.returncode, "boot-claude.txt"
+                return FAIL, "claude %s rc=%d" % ("pane" if self.watch else "-p", r.returncode), "boot-claude.txt"
             if "Standing rules (session-notes)" not in text:
                 return FAIL, "the install-wired standing rules did not reach the model", "boot-claude.txt"
         else:
             p = ("Reply with exactly one line of the form MARK=<word> %s. <word> is the selftest marker word "
                  "from your session memory." % now_part)
-            r = self.codex_headless(p, "boot-codex.txt")
-            text, mark = r.stdout, "CODEXMARK" + self.tok
+            rid = "BOOT%s%s" % (self.tok, cli[:2].upper())
+            r = self.turn("codex", p + (" Run id %s." % rid if self.watch else ""), "boot-codex.txt", 240, "bootX",
+                          until=lambda: clock_ok(self.pane_reply("codex", rid)))
+            text, mark = (self.pane_reply("codex", rid) if self.watch else r.stdout), "CODEXMARK" + self.tok
             if r.returncode != 0:
-                return FAIL, "codex exec rc=%d" % r.returncode, "boot-codex.txt"
+                return FAIL, "codex %s rc=%d" % ("pane" if self.watch else "exec", r.returncode), "boot-codex.txt"
             if mark not in text:
                 return FAIL, "marker %s not in the reply (the SessionStart hook did not deliver it)" % mark, "boot-codex.txt"
         if not clock_ok(text):
@@ -1273,6 +2094,9 @@ class Live:
                       "--model", self.claude_model], "handoff.txt", timeout=60)
         if r.returncode != 0:
             return FAIL, "handoff_session rc=%d: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-200:]), "handoff.txt"
+        if self.watch:
+            self.ephemeral.append("child")
+            self.focus("claude", "child")
         if not self.wait_for(lambda: seen(tok, self.ctext("claude")), 120) or "child" not in self.tmux("ls").stdout:
             return FAIL, "child session never answered %s (or its pane is gone)" % tok, "handoff.txt"
         return PASS, "child pane launched in the sandbox server and ran its prompt", None
@@ -1296,20 +2120,30 @@ class Live:
                "in the GLOBAL session-notes store (the path `python3 $SESSION_NOTES/bin/notes_config.py "
                "--stores` prints as global, not your built-in per-project memory directory). Skip every "
                "other step and do not ask questions." % tok)
-        if cli == "claude":
-            r = self.run(self.claude_argv("/reflect  " + ask, headless=True), "reflect-claude.txt", timeout=420)
-        else:
-            r = self.codex_headless("$reflect  " + ask, "reflect-codex.txt", timeout=420)
+        def find_hit():
+            hit = None
+            for f in glob.glob(os.path.join(g, "*.md")):
+                try:
+                    with open(f) as fh:
+                        if tok in fh.read():
+                            hit = f
+                except OSError:
+                    pass
+            return hit
+
+        def proven():
+            d = self.scoped("codex", tok)
+            try:
+                return codex_commit_proven(d)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+        until = lambda: find_hit() and (cli != "codex" or proven())
+        r = self.turn(cli, ("/reflect  " if cli == "claude" else "$reflect  ") + ask, "reflect-%s.txt" % cli, 420,
+                      "reflect" + cli[:2], until=until)
         if r.returncode != 0:
             return FAIL, "%s rc=%d" % (cli, r.returncode), "reflect-%s.txt" % cli
-        hit = None
-        for f in glob.glob(os.path.join(g, "*.md")):
-            try:
-                with open(f) as fh:
-                    if tok in fh.read():
-                        hit = f
-            except OSError:
-                pass
+        hit = find_hit()
         if not hit:
             return FAIL, "no store file under %s holds %s" % (g, tok), "reflect-%s.txt" % cli
         if cli == "codex":
@@ -1328,11 +2162,21 @@ class Live:
         note = os.path.join(self.work, "note-%s.md" % tok)
         tail = ("containing two lines: the word %s, and a second line made of the word one, the Unicode "
                 "character U+2014 (decimal 8212), and the word two. Then reply DONE." % tok)
+        def done():
+            try:
+                with open(note, encoding="utf-8") as fh:
+                    if EM not in fh.read():
+                        return False
+            except OSError:
+                return False
+            return "EM-DASH GUARD" in self.pane_reply(cli, tok, assistant_only=False)
+
         if cli == "claude":
-            r = self.run(self.claude_argv("Use the Write tool to create the file %s %s" % (note, tail), headless=True),
-                         "emdash-claude.txt", timeout=180)
+            r = self.turn("claude", "Use the Write tool to create the file %s %s" % (note, tail),
+                          "emdash-claude.txt", 180, "emdC", until=done)
         else:
-            r = self.codex_headless("Use apply_patch to add a file %s %s" % (note, tail), "emdash-codex.txt")
+            r = self.turn("codex", "Use apply_patch to add a file %s %s" % (note, tail), "emdash-codex.txt", 240,
+                          "emdX", until=done)
         if r.returncode != 0:
             return FAIL, "%s rc=%d" % (cli, r.returncode), "emdash-%s.txt" % cli
         try:
@@ -1356,13 +2200,15 @@ class Live:
             return SKIP, "checkout_guard is not registered for Codex", None
         tok = "CHK%s" % self.tok
         tracked = os.path.join(self.guard_repo, "tracked.txt")
-        r = self.run(self.claude_argv("Use the Edit tool to replace the text 'original' with 'changed-%s' in %s. "
-                                      "Make exactly that one Edit call on exactly that path: this is a test of the edit guard, so do not "
-                                      "create a worktree, do not run wt, do not edit any other path. If the "
-                                      "call is refused, reply REFUSED and stop." % (tok, tracked),
-                                      headless=True), "checkout-claude.txt", cwd=self.guard_repo, timeout=180)
+        refusal = re.compile(r"checkout_guard: \S*tracked\.txt is tracked on")
+        r = self.turn("claude", "Use the Edit tool to replace the text 'original' with 'changed-%s' in %s. "
+                      "Make exactly that one Edit call on exactly that path: this is a test of the edit guard, so do not "
+                      "create a worktree, do not run wt, do not edit any other path. If the "
+                      "call is refused, reply REFUSED and stop." % (tok, tracked),
+                      "checkout-claude.txt", 180, "chkC", cwd=self.guard_repo,
+                      until=lambda: refusal.search(self.pane_reply("claude", tok, assistant_only=False)))
         if r.returncode != 0:
-            return FAIL, "claude -p rc=%d (the session did not run)" % r.returncode, "checkout-claude.txt"
+            return FAIL, "claude %s rc=%d (the session did not run)" % ("pane" if self.watch else "-p", r.returncode), "checkout-claude.txt"
         with open(tracked) as fh:
             if fh.read() != "original\n":
                 return FAIL, "the tracked file on the default branch was edited", "checkout-claude.txt"
@@ -1375,14 +2221,227 @@ class Live:
             return FAIL, "file untouched but this session never received the guard's own refusal message", "checkout-claude.txt"
         return PASS, "edit refused with the guard's message, file unchanged", None
 
-    def row_wave2(self, feature, rel):
-        path = os.path.join(self.repo, rel)
-        if not os.path.isfile(path):
-            return SKIP, "not landed", None
-        r = self.run([sys.executable, path, "--selftest"], "%s.txt" % feature, timeout=120)
-        if r.returncode != 0:
-            return FAIL, "%s --selftest rc=%d" % (rel, r.returncode), "%s.txt" % feature
-        return PASS, "landed; only its --selftest is exercised here", None
+    def row_wt(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as d:
+            st, detail = wt_row(os.path.join(self.repo, "bin", "wt.py"), os.path.realpath(d))
+        return st, detail, None
+
+    def live_file(self):
+        return os.path.join(self.home, ".local", "state", "session-notes", "live-context.md")
+
+    def row_live(self, cli):
+        """The OTHER CLI's pane writes a note with live.py; a FRESH `cli` session then boots and its
+        start-of-session injection (in its own transcript) must carry the note. The column is the reader."""
+        other = "codex" if cli == "claude" else "claude"
+        if not (self.have["claude"] and self.have["codex"]):
+            return SKIP, "needs both CLIs", None
+        writer = self.pane_pair(other)[0]
+        if writer not in self.panes:
+            return FAIL, "the %s writer pane %s is not running" % (other, writer), None
+        tok = "LIVE%s%s" % (self.tok, cli[:2].upper())
+        rid = "LR%s%s" % (self.tok, cli[:2].upper())
+        self.focus(other, writer)
+        self.wait_idle(writer)
+        cmd = "python3 %s note %s" % (os.path.join(self.repo, "bin", "live.py"), tok)
+        self.send(writer, "Run exactly this shell command, then reply DONE: %s" % cmd)
+
+        def noted():
+            try:
+                with open(self.live_file(), encoding="utf-8") as fh:
+                    return tok in fh.read()
+            except OSError:
+                return False
+
+        if not self.wait_for(noted, 150):
+            return FAIL, "the %s pane never wrote the note (live file has no %s)" % (other, tok), None
+        name = "liveR" + cli[:2]
+        prompt = "Reply with only the word READY %s" % rid
+        argv = self.claude_argv(prompt, name=name) if cli == "claude" else self.codex_argv(prompt)
+        self.launch_eph(name, argv)
+        self.focus(cli, name)
+        self.wait_idle(name, 150)
+        raw = self.pane_reply(cli, rid, assistant_only=False)
+        self.log("live-%s.txt" % cli, "reader transcript lines: %d\n" % len(raw.splitlines()))
+        if not raw.strip():
+            return FAIL, "the fresh %s session left no transcript (it never booted)" % cli, "live-%s.txt" % cli
+        if not any(tok in ln and "Live context (newest first" in ln for ln in raw.splitlines()):
+            return FAIL, ("the fresh %s session's start-of-session context does not carry the note the %s pane wrote"
+                          % (cli, other)), "live-%s.txt" % cli
+        return PASS, "a fresh %s session's start-of-session context carried the note the %s pane wrote" % (cli, other), None
+
+    # -- review: each CLI runs the review skill on a PR against a local bare repo, stubbed gh ----
+    def make_review_pr(self, cli):
+        parent = os.path.join(self.root, "rv-" + cli[:2])
+        os.makedirs(parent, exist_ok=True)
+        cfg = os.path.join(parent, "wt.toml")
+        with open(cfg, "w") as fh:
+            fh.write('[wt]\ntoken_command = "echo faketoken"\nroot = "%s/wts"\n' % parent)
+        home = os.path.join(parent, "h")
+        os.makedirs(home, exist_ok=True)
+        env = git_env(home)
+        env.update(SESSION_NOTES_CONFIG=cfg, WT_GH=os.path.join(self.bin, "gh"))
+        wt = [sys.executable, os.path.join(self.repo, "bin", "wt.py")]
+        main = make_origin_repo(parent, "proj", env)
+        path = sh(wt + ["new", "feat"], main, env).stdout.strip().splitlines()[-1]
+        with open(os.path.join(path, "tracked.txt"), "a") as fh:
+            fh.write("v2\n")
+        sh(["git", "commit", "-qam", "Add a v2 line", "--no-verify"], path, env)
+        sh(wt + ["pr", "--title", "Add a v2 line to tracked.txt"], path, env)
+        head = sh(["git", "rev-parse", "HEAD"], path, env).stdout.strip()
+        diff = sh(["git", "diff", "origin/main...HEAD"], path, env).stdout
+        view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7",
+                "title": "Add a v2 line to tracked.txt",
+                "body": "Appends the line v2 to tracked.txt. A one line, correct change."}
+        with open(os.path.join(self.ghdir, "scenario.json"), "w") as fh:
+            json.dump({"view": view, "login": "tester", "comments": [], "diff": diff}, fh)
+        try:
+            os.remove(os.path.join(self.ghdir, "posted.jsonl"))
+        except OSError:
+            pass
+        return {"path": path, "head": head, "env": env, "wt": wt}
+
+    def trust_path(self, path):
+        """Pre-trust a directory created mid-run, in the sandbox's Claude and Codex configs."""
+        for p in {path, os.path.realpath(path)}:
+            cj = os.path.join(self.claude_dir, ".claude.json")
+            with open(cj) as fh:
+                doc = json.load(fh)
+            doc.setdefault("projects", {})[p] = {"hasTrustDialogAccepted": True, "allowedTools": []}
+            with open(cj, "w") as fh:
+                json.dump(doc, fh, indent=2)
+            with open(os.path.join(self.codex_dir, "config.toml"), "a") as fh:
+                fh.write('\n[projects."%s"]\ntrust_level = "trusted"\n' % p)
+
+    def posted_comments(self):
+        try:
+            with open(os.path.join(self.ghdir, "posted.jsonl")) as fh:
+                return [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        except (OSError, ValueError):
+            return []
+
+    def row_review(self, cli):
+        pr = self.make_review_pr(cli)
+        self.trust_path(pr["path"])
+        # Codex runs its commands in a login shell, whose PATH a real `gh` can win; a token command
+        # that needs no gh keeps review.py on the stub (WT_GH names it for the other calls).
+        with open(self.cfg, "a") as fh:
+            fh.write('\n[wt]\ntoken_command = "echo faketoken"\n')
+        rules = ("This is a throwaway test repo with no checks: skip Step 1. In Step 3 spawn the reviewer with "
+                 "%s instead of the model the skill names (a cost capped test). The change is one correct added "
+                 "line, so the reviewer's verdict is APPROVE unless it finds a real defect. In Step 4 post "
+                 "exactly what the reviewer returned, then stop." %
+                 ("model haiku at low effort" if cli == "claude" else "model gpt-6.2-sol at low effort"))
+        prompt = ("/review 7 " if cli == "claude" else "$review 7 ") + rules
+        tools = self.CLAUDE_TOOLS + ["Agent"]
+        r = self.turn(cli, prompt, "review-%s.txt" % cli, 720, "review" + cli[:2], cwd=pr["path"], tools=tools,
+                      budget="2.00", until=lambda: bool(self.posted_comments()))
+        posted = self.posted_comments()
+        self.log("review-%s.txt" % cli, "\nposted comments: %s\n" % json.dumps(posted))
+        if not posted:
+            return FAIL, "the %s session ended (rc=%s) without the stub recording a verdict comment" % (cli, r.returncode), "review-%s.txt" % cli
+        first = (posted[-1].get("body") or "").splitlines()[0] if posted[-1].get("body") else ""
+        m = re.fullmatch(r"Review verdict: (APPROVE|CHANGES) ([0-9a-f]{40})", first)
+        if not m:
+            return FAIL, "the recorded comment does not start with the verdict marker: %r" % first[:80], "review-%s.txt" % cli
+        if m.group(2) != pr["head"]:
+            return FAIL, "the verdict names sha %s, not the PR head %s" % (m.group(2)[:10], pr["head"][:10]), "review-%s.txt" % cli
+        if m.group(1) != "APPROVE":
+            return FAIL, "the reviewer returned CHANGES on a one line correct change (marker and sha were well formed)", "review-%s.txt" % cli
+        g = sh(pr["wt"] + ["merge", "feat", "--dry-run"], pr["path"], pr["env"], check=False)
+        self.log("review-%s.txt" % cli, "wt merge --dry-run rc=%d\n%s\n%s\n" % (g.returncode, g.stdout, g.stderr))
+        if g.returncode != 0 or "verdict gate passed" not in g.stdout:
+            return FAIL, "wt merge --dry-run did not pass the gate on the posted APPROVE (rc=%d)" % g.returncode, "review-%s.txt" % cli
+        try:
+            with open(os.path.join(self.ghdir, "gh-calls.jsonl")) as fh:
+                calls = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        except (OSError, ValueError):
+            calls = []
+        if any(c[:2] == ["pr", "merge"] for c in calls):
+            return FAIL, "gh pr merge was called", "review-%s.txt" % cli
+        return PASS, "verdict comment APPROVE at the PR head recorded; wt merge --dry-run passes the gate on it", None
+
+    # -- env: render into the sandbox, then judge what each CLI actually loaded ------------------
+    def env_apply(self):
+        """Render a synthetic environment.md into the sandbox once. -> None, or a failure detail."""
+        if getattr(self, "_env_applied", None) is not None:
+            return self._env_applied or None
+        src = os.path.join(self.root, "environment.md")
+        with open(src, "w") as fh:
+            fh.write("# Environment\n\n- The selftest marker for this run is ENVMARK%s.\n"
+                     "- example.invalid is a trusted internal host.\n" % self.tok)
+        r = self.run([sys.executable, os.path.join(self.repo, "bin", "environment_render.py"), "apply", "--yes"],
+                     "env-apply.txt", cwd=self.repo, timeout=120)
+        self._env_applied = "" if r.returncode == 0 else "environment_render apply rc=%d: %s" % (
+            r.returncode, (r.stderr or r.stdout).strip()[-160:])
+        return self._env_applied or None
+
+    def show_command(self, cli, name, shell_cmd, outfile, timeout=60):
+        """Run a shell command in its own pane (visible in watch mode), output copied to `outfile`."""
+        self.launch_eph(name, ["sh", "-c", "%s; sleep 4" % shell_cmd])
+        self.focus(cli, name)
+        self.wait_for(lambda: self.tmux("has-session", "-t", "=" + name).returncode != 0, timeout, 0.5)
+        try:
+            with open(outfile, encoding="utf-8", errors="replace") as fh:
+                return redact(fh.read())
+        except OSError:
+            return ""
+
+    def row_env(self, cli):
+        bad = self.env_apply()
+        if bad:
+            return FAIL, bad, "env-apply.txt"
+        mark = "ENVMARK" + self.tok
+        if cli == "claude":
+            out = os.path.join(self.logs, "env-claude.txt")
+            text = self.show_command(
+                "claude", "envC", "%s auto-mode config > %s 2>&1; echo 'auto mode environment entries with the marker:'; "
+                "grep -c %s %s" % (shlex.quote(self.claude_bin), shlex.quote(out), mark, shlex.quote(out)), out + ".show")
+            try:
+                with open(out, encoding="utf-8", errors="replace") as fh:
+                    cfg = fh.read()
+            except OSError:
+                cfg = ""
+            try:
+                env_list = json.loads(cfg).get("environment", [])
+            except (ValueError, AttributeError):
+                return FAIL, "`claude auto-mode config` did not print JSON", "env-claude.txt"
+            if not any(mark in str(e) for e in env_list):
+                return FAIL, "`claude auto-mode config` does not list the rendered environment (no %s)" % mark, "env-claude.txt"
+            return PASS, "`claude auto-mode config` lists the rendered environment entries", None
+        # codex: a pane started WITHOUT the -a/-s flags, so /status shows what the rendered config sets
+        name = "envX"
+        argv = [self.codex_bin, "--no-daemon", "--dangerously-bypass-hook-trust", "-m", self.codex_model,
+                "-c", "model_reasoning_effort=low"]
+        self.launch_eph(name, argv)
+        self.focus("codex", name)
+        self.wait_idle(name, 120)
+        self.send(name, "/status")
+        want = self.CODEX_STATUS
+        scr = ""
+        end = time.time() + 40
+        while time.time() < end:
+            scr = self.screen(name, 60)
+            if all(w in scr for w in want):
+                break
+            self.nap(2)
+        self.log("env-codex.txt", "screen after /status:\n%s\n" % scr)
+        missing = [w for w in want if w not in scr]
+        if missing:
+            return FAIL, "Codex /status does not show %s" % ", ".join(repr(w) for w in missing), "env-codex.txt"
+        # negative control: the pane started with explicit -a/-s flags overrides the rendered config, so
+        # its /status must NOT show the reviewer line (else the check above proves nothing)
+        ctl = self.pane_pair("codex")[0]
+        if ctl in self.panes:
+            self.wait_idle(ctl, 60)
+            self.send(ctl, "/status")
+            self.nap(6)
+            cscr = self.screen(ctl, 60)
+            self.log("env-codex.txt", "control pane %s after /status:\n%s\n" % (ctl, cscr))
+            if "Permissions" in cscr and want[-1] in cscr:
+                return FAIL, "negative control: a pane started with -a/-s flags also shows %r, so /status does not tell the rendered config apart" % want[-1], "env-codex.txt"
+        return PASS, "Codex /status shows %s (the rendered config); a flag-started pane does not" % " and ".join(repr(w) for w in want), None
+
+    CODEX_STATUS = ("Workspace", "Approve for me")
 
     def row_hookpath(self):
         with open(os.path.join(self.claude_dir, "settings.json")) as fh:
@@ -1435,11 +2494,16 @@ class Live:
         if not self.want(fid):
             return
         if cli == "codex" and self.login_failed:
+            self.begin_step(fid, cli, quick=True)
             self.record(fid, cli, FAIL, "codex login failed", self.evid("codex-login.txt"))
+            self.end_step(FAIL, quick=True)
             return
         if cli in ("claude", "codex") and not self.have[cli]:
+            self.begin_step(fid, cli, quick=True)
             self.record(fid, cli, SKIP, self.why.get(cli, "cli unavailable"))
+            self.end_step(SKIP, quick=True)
             return
+        self.begin_step(fid, cli)
         try:
             status, detail, ev = fn(*args)
         except Abort:
@@ -1447,8 +2511,31 @@ class Live:
         except Exception as exc:  # a crashing row is a FAIL, never a silent skip
             status, detail, ev = FAIL, "row crashed: %r" % (exc,), None
         self.record(fid, cli, status, detail, self.evid(ev) if ev else None)
+        self.end_step(status, quick=(status == SKIP))
+
+    ORDER = (("boot", "row_boot"), ("peers", "row_peers"), ("bcast", "row_bcast"), ("bus", "row_bus"),
+             ("handoff", "row_handoff"), ("refresh", "row_refresh"), ("reflect", "row_reflect"),
+             ("emdash", "row_emdash"), ("checkout", "row_checkout"))
+
+    def build_plan(self):
+        """Every step this run will take, in order: (feature, cli|both). The status file's `total`."""
+        plan = []
+        for fid, _fn in self.ORDER:
+            if self.want(fid):
+                plan += [(fid, "claude"), (fid, "codex")]
+        for fid in ("wt", "hookpath"):
+            if self.want(fid):
+                plan.append((fid, "both"))
+        for fid in ("review", "live", "env"):
+            if self.want(fid):
+                plan += [(fid, "claude"), (fid, "codex")]
+        return plan + [("realdirs", "both")]
 
     def go(self):
+        if self.watch:  # refuse before any cost: a leftover `selftest` link means another run (or a killed one)
+            link = os.path.join(self.sock_dir, "selftest")
+            if os.path.lexists(link):
+                link_selftest_socket(self.sock_dir, "/nonexistent")  # raises the Abort naming the link
         self.before = snapshot(self.real_home)
         ck, ck_why = keychain_key(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest"), self.keychain)
         ok, ok_why = keychain_key(os.environ.get("SELFTEST_OPENAI_KEYCHAIN_SERVICE", "session-notes-selftest-openai"), self.keychain)
@@ -1464,6 +2551,7 @@ class Live:
         if not any(self.have.values()) and any(self.want(f) for f, _, sc in FEATURES if sc == "cli"):
             raise Abort("nothing live ran: no CLI was usable (%s)" % "; ".join(
                 "%s: %s" % kv for kv in sorted(self.why.items())))
+        self.plan = self.build_plan()
         self.stub_bins()
         self.clone_and_install()
         self.seed_claude()
@@ -1472,43 +2560,54 @@ class Live:
             self.have["codex"], self.login_failed = False, True
         ok = None
         self.start_tmux()
-        if any(self.want(f) for f in ("peers", "bcast", "bus", "refresh")):
+        if self.watch:
+            self.link_socket()
+            print("watch: attach with   tmux -L selftest attach\nwatch: status file %s" % self.status_path)
+            sys.stdout.flush()
+        if any(self.want(f) for f in ("peers", "bcast", "bus", "refresh", "live")):
             if self.have["claude"]:
                 for n in ("cA", "cB"):
                     self.launch(n, self.claude_argv("Reply with only the word READY", name=n))
             if self.have["codex"]:
                 for n in ("xA", "xB"):
                     self.launch(n, self.codex_argv("Reply with only the word READY"))
+            self.default_focus()
             for n in sorted(self.panes):
                 self.wait_idle(n, 120)
-        order = [("boot", self.row_boot), ("peers", self.row_peers), ("bcast", self.row_bcast),
-                 ("bus", self.row_bus), ("handoff", self.row_handoff), ("refresh", self.row_refresh),
-                 ("reflect", self.row_reflect), ("emdash", self.row_emdash), ("checkout", self.row_checkout)]
-        for fid, fn in order:
+        for fid, name in self.ORDER:
             for cli in ("claude", "codex"):
-                self.do(fid, cli, fn, cli)
-        if self.want("wt"):
-            with tempfile.TemporaryDirectory(dir=self.root) as d:
-                st, detail = wt_row(os.path.join(self.repo, "bin", "wt.py"), os.path.realpath(d))
-            self.record("wt", "both", st, detail)
+                self.do(fid, cli, getattr(self, name), cli)
+        self.do("wt", "both", self.row_wt)
         self.do("hookpath", "both", self.row_hookpath)
-        for fid, rel in (("review", "bin/review.py"), ("live", "bin/live.py"), ("env", "bin/environment_render.py")):
-            self.do(fid, "both", self.row_wave2, fid, rel)
-        self.stop_tmux()
+        for fid, name in (("review", "row_review"), ("live", "row_live"), ("env", "row_env")):
+            for cli in ("claude", "codex"):
+                self.do(fid, cli, getattr(self, name), cli)
+        if not self.watch:
+            self.stop_tmux()
 
     def finish_realdirs(self):
         """The real-dirs row runs whenever install.sh ran, under any --feature filter and even
         when go() aborted or was interrupted: a leak is likeliest exactly then."""
         if not self.installed or self.before is None:
             return
-        self.stop_tmux()
+        if self.watch:
+            self.begin_step("realdirs", "both", quick=True)
+            self.stop_inner()
+        else:
+            self.stop_tmux()
         try:
             status, detail, ev = self.row_realdirs()
         except Exception as exc:
             status, detail = FAIL, "real-dirs check crashed: %r" % (exc,)
         self.record("realdirs", "both", status, detail)
+        if self.watch:
+            self.end_step(status, quick=True)
 
     def teardown(self, failed):
+        try:
+            self.unlink_socket()  # first: the `selftest` link must not outlive any exit path
+        except Exception:
+            pass
         try:
             os.remove(os.path.join(self.codex_dir, "auth.json"))
         except OSError:
@@ -1517,7 +2616,14 @@ class Live:
             self.stop_tmux()
         except Exception:
             pass
-        if self.a.keep or failed:
+        for fd in (self.fifo_rd, self.fifo_wr):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fifo_rd = self.fifo_wr = None
+        if self.a.keep or (failed and not self.quit):
             return self.root
         shutil.rmtree(self.root, ignore_errors=True)
         return None
@@ -1529,16 +2635,36 @@ def main():
     ap.add_argument("--feature", type=lambda s: set(s.split(",")), help="comma list of: " + ",".join(f for f, _, _ in FEATURES))
     ap.add_argument("--keep", action="store_true", help="keep the sandbox and print its path")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--watch", action="store_true",
+                    help="one tmux window to watch and film: status pane, Claude left, Codex right (attach: tmux -L selftest attach)")
+    ap.add_argument("--pace", type=float, default=None,
+                    help="watch mode: scale the holds on each step's title (~2 s) and result (~4 s); default 1, 0 = none")
+    ap.add_argument("--step", action="store_true", help="watch mode: hold each step until Enter is pressed in the status pane")
+    ap.add_argument("--leak-terms", metavar="FILE", help="watch mode: also abort when any term in FILE (one per line) is on screen")
+    ap.add_argument("--no-hold-final", action="store_true", help="watch mode: tear down when the run ends instead of waiting for q")
+    ap.add_argument("--status-pane", nargs=2, metavar=("STATUS", "FIFO"), help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.status_pane:
+        status_pane_main(*a.status_pane)
+        return 0
     if a.selftest:
         return selftest()
+    if not a.watch and (a.pace is not None or a.step or a.leak_terms or a.no_hold_final):
+        print("--pace, --step, --leak-terms and --no-hold-final need --watch", file=sys.stderr)
+        return 2
+    if a.pace is not None and a.pace < 0:
+        print("--pace must be 0 or more", file=sys.stderr)
+        return 2
+    if a.leak_terms and not os.path.isfile(a.leak_terms):
+        print("--leak-terms: no such file %s" % a.leak_terms, file=sys.stderr)
+        return 2
     known = {f for f, _, _ in FEATURES}
     if a.feature and not a.feature <= known:
         print("unknown feature(s): %s" % ", ".join(sorted(a.feature - known)), file=sys.stderr)
         return 2
     live = Live(a)
     results, lines, kept = execute(live)
-    out = [render_table(results)] + [redact(ln) for ln in lines]
+    out = [render_table(results, pane_rows=PANE_ROWS if live.watch else ())] + [redact(ln) for ln in lines]
     if kept:
         out.append("sandbox kept: %s" % kept)
     try:
@@ -1572,14 +2698,23 @@ def execute(live):
             err = "interrupted"
         except Exception as exc:  # setup crashed: report it, never hide it
             err = "run crashed: %r" % (exc,)
+        live.stopping = live.stopping or bool(err)
         try:
             live.finish_realdirs()
         except KeyboardInterrupt:
             err = err or "interrupted"
+        except Abort as exc:  # the screen guard can trip while the last step runs
+            err = err or str(exc)
         if err:
             live.results.append({"feature": "realdirs", "title": dict((f, t) for f, t, _ in FEATURES)["realdirs"],
                                  "cli": "both", "status": FAIL, "detail": "run aborted: " + err, "evidence": None})
         lines = fail_lines(live.results)
+        try:
+            live.finish_watch(wait=not err)
+        except KeyboardInterrupt:
+            pass
+        except Abort as exc:
+            err = err or str(exc)
     finally:
         kept = live.teardown(bool(lines) or bool(err))
         for sig, h in old.items():
