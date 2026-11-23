@@ -467,7 +467,8 @@ def main(argv=None):
         print("handoff_session: --cwd is not a directory: %s" % cwd, file=sys.stderr)
         return 2
 
-    if shutil.which("tmux") is None:
+    # --dry-run spawns nothing, so it must not need tmux (a CI container has none).
+    if not a.dry_run and shutil.which("tmux") is None:
         print("handoff_session: tmux not found on PATH", file=sys.stderr)
         return 5
 
