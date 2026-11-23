@@ -41,6 +41,9 @@ plain Python 3.9+ with no dependencies.
 - **`bin/environment_render.py`** turns one private Markdown description of your environment into
   Claude Code's `autoMode.environment` and Codex's `[auto_review]` policy, with a diff before any
   write. Detail: docs/tools.md, docs/codex.md.
+- **Live context** (`bin/live.py`) is one rolling file of what just happened across scopes
+  (merges, decisions), loaded at session start in Claude Code and Codex; a scope can opt out
+  or keep its own file. Detail: docs/tools.md.
 
 A project's store defaults to the folder Claude Code already keeps for it,
 `~/.claude/projects/<project>/memory/`, so auto memory loads its index at

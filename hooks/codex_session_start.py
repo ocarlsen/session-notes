@@ -9,8 +9,10 @@ hook does the same job: on startup, resume and after compaction (Codex reports s
 What it loads, in order (each only if present and non-empty):
   <global store>/MEMORY.md, <global store>/RESUME.md,
   <project store>/MEMORY.md, <project store>/RESUME.md
-where the stores come from notes_config.stores_for(cwd) in codex mode: a configured
-scope that holds cwd, else the cwd's git root. Nothing under ~/.claude is ever read.
+then the live-context block (bin/live.py: what other sessions just did), which only uses
+what is left of the budget after those files. The stores come from
+notes_config.stores_for(cwd) in codex mode: a configured scope that holds cwd, else the cwd's git root. Nothing under ~/.claude is ever read; the live
+file sits outside both agent homes (see bin/live.py).
 
 Budget. Codex spills hook output over ~2,500 tokens (configurable per handler with
 additionalContextLimit) to a temp file and shows the model only a head-and-tail
@@ -38,6 +40,7 @@ sys.path.insert(0, os.path.join(ROOT, "bin"))
 # This hook is Codex-only, whatever the caller's environment says.
 os.environ["SESSION_NOTES_AGENT"] = "codex"
 import notes_config  # noqa: E402
+import live  # noqa: E402
 
 HEADER = ("session-notes memory for this Codex session (loaded at session start, from "
           "the Codex store; it does not update mid-session: run $refresh to re-read it).")
@@ -65,11 +68,11 @@ def build_context(cwd, cfg=None):
             text = _read(path)
             if text:
                 files.append((label, path, text))
-    if not files:
-        return ""
-    parts = [HEADER]
-    if stores["project"]:
-        parts.append("Project store: %s (root %s)" % (stores["project"], stores["root"]))
+    parts = []
+    if files:
+        parts.append(HEADER)
+        if stores["project"]:
+            parts.append("Project store: %s (root %s)" % (stores["project"], stores["root"]))
     used = sum(len(p) + 2 for p in parts)
     for label, path, text in files:
         block = "## %s %s (%s)\n\n%s" % (label, os.path.basename(path), path, text)
@@ -82,6 +85,13 @@ def build_context(cwd, cfg=None):
                                                             path, len(text.encode("utf-8"))))
             parts.append(line)
             used += len(line) + 2
+    try:
+        block = live.render(cwd, cfg, budget=cap - used - 2)
+    except Exception:
+        block = ""
+        _trace("live")
+    if block:
+        parts.append(block)
     return "\n\n".join(parts)
 
 
@@ -90,6 +100,17 @@ def _trace_dir():
         return os.path.join(notes_config.load()["paths"]["state_dir"], "errors")
     except Exception:
         return os.path.expanduser("~/.codex/session-notes/state/errors")
+
+
+def _trace(name="main"):
+    try:
+        d = _trace_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "codex_session_start.txt"), "a") as fh:
+            fh.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()))
+            fh.write("[%s] " % name + traceback.format_exc() + "\n")
+    except OSError:
+        pass
 
 
 def main():
@@ -106,14 +127,7 @@ def main():
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "SessionStart", "additionalContext": text}}))
     except Exception:
-        try:
-            d = _trace_dir()
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "codex_session_start.txt"), "a") as fh:
-                fh.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()))
-                fh.write(traceback.format_exc() + "\n")
-        except OSError:
-            pass
+        _trace()
     return 0
 
 
@@ -131,8 +145,13 @@ def selftest():
         d = os.path.realpath(d)
         cfgf = os.path.join(d, "c.toml")
         with open(cfgf, "w") as fh:
-            fh.write('[paths]\nclaude_home = "%s/claude"\n[agent]\ncodex_home = "%s/codex"\n'
-                     'codex_boot_bytes = 2000\n' % (d, d))
+            fh.write('[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
+                     '[live]\npath = "%s/live/live-context.md"\n'
+                     '[agent]\ncodex_home = "%s/codex"\ncodex_boot_bytes = 2000\n'
+                     '[[scopes]]\nname = "work-client"\nroot = "%s/client"\nlive = "none"\n'
+                     '[[scopes]]\nname = "outer"\nroot = "%s/work"\n'
+                     '[[scopes]]\nname = "inner-none"\nroot = "%s/work/client"\nlive = "none"\n'
+                     % (d, d, d, d, d, d, d))
         cfg = notes_config.load(cfgf)
         repo = os.path.join(d, "repo")
         os.makedirs(repo)
@@ -160,6 +179,43 @@ def selftest():
               and "xxxxx" not in text)
         check("stays under the cap", len(text) <= 2000 + 400)
         check("later files still load after a pointer", "parser fix shipped" in text)
+
+        # live context rides along inside the cap, after the memory files
+        check("no live file: no live block", "Live context" not in text)
+        live.add(repo, "merged PR #3: parser fix", cfg)
+        text = build_context(repo, cfg)
+        check("live line present when there is room", "merged PR #3: parser fix" in text
+              and text.index("parser fix shipped") < text.index("Live context"))
+        for i in range(30):
+            live.add(repo, "event number %d with some padding text to take room" % i, cfg)
+        text = build_context(repo, cfg)
+        check("large live file: total stays under the cap", len(text) <= 2000)
+        check("large live file: newest kept, older counted",
+              "event number 29 " in text and "older entries not shown" in text)
+        check("memory files keep priority over live", "parser fix shipped" in text)
+        client = os.path.join(d, "client")
+        os.makedirs(client)
+        ctext = build_context(client, cfg)
+        check("isolated scope: nothing from the shared file",
+              "event number" not in ctext and "Live context" not in ctext)
+        gitc = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+        subprocess.run(gitc + ["init", "-q", client], check=True)
+        subprocess.run(gitc + ["-C", client, "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        cwt = os.path.join(d, ".client-worktrees", "feat")
+        subprocess.run(gitc + ["-C", client, "worktree", "add", "-q", "-b", "feat", cwt], check=True)
+        # repro A: a none-scope repo nested in a shared scope, worktree under the OUTER root
+        inner = os.path.join(d, "work", "client")
+        os.makedirs(inner)
+        subprocess.run(gitc + ["init", "-q", inner], check=True)
+        subprocess.run(gitc + ["-C", inner, "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        wa = os.path.join(d, "work", ".client-worktrees", "feat")
+        subprocess.run(gitc + ["-C", inner, "worktree", "add", "-q", "-b", "feat", wa], check=True)
+        atext = build_context(wa, cfg)
+        check("worktree under an enclosing shared scope's root: nothing from the shared file",
+              "event number" not in atext and "Live context" not in atext)
+        wtext = build_context(cwt, cfg)
+        check("isolated scope's worktree: nothing from the shared file",
+              "event number" not in wtext and "Live context" not in wtext)
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 

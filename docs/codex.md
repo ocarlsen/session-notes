@@ -215,7 +215,10 @@ entries of your environment file added at the end of its `## Environment Profile
   preview. To keep that from happening silently, the hook caps itself at
   `agent.codex_boot_bytes` (12,000 characters) and replaces a file that does
   not fit with a line naming its path. The install sets the limit to 4,000
-  tokens. With an empty store the hook prints nothing.
+  tokens. After the memory files it adds the live-context block (`bin/live.py`, what
+  other sessions just did) from whatever is left of that cap. With an empty store
+  and no live entries the hook prints nothing. The live file sits outside both agent homes
+  (`~/.local/state/session-notes/` by default), so Codex never reads or writes `~/.claude`.
 - **Skills.** `skills/codex/<name>/SKILL.md` reads the shared Claude Code skill
   and applies the substitutions in `skills/codex/ADAPTER.md`, so a fix to
   `/reflect` reaches both agents. Codex skills do not call each other, so

@@ -32,6 +32,7 @@ uses anything fancier fails loudly instead of being half-read.
 
     python3 notes_config.py            # print the resolved config as JSON
     python3 notes_config.py --stores [--cwd DIR]   # this folder's stores, as JSON
+    python3 notes_config.py --live-path           # the live-context file's path
     python3 notes_config.py --selftest
 """
 import copy
@@ -149,6 +150,16 @@ DEFAULTS = {
         # The source file. Empty = environment.md beside the config file
         # (~/.config/session-notes/environment.md by default).
         "source": "",
+    },
+    # bin/live.py: one machine-wide rolling file of what just happened across scopes.
+    "live": {
+        # Empty = ~/.local/state/session-notes/live-context.md. The same in both agent modes and
+        # outside both agent homes: both agents write it, Codex must never touch ~/.claude.
+        "path": "",
+        # Entries kept, newest first.
+        "max_lines": 30,
+        # Most characters in one entry's text.
+        "max_chars": 240,
     },
     # Each scope is a project folder with its own memory store. `store` may be
     # empty, meaning ~/.claude/projects/<encoded root>/memory.
@@ -334,11 +345,22 @@ def _resolve(cfg, base=None, env=None):
     p["global_store"] = _abs(p["global_store"], base)
     # The home of the running agent: skills/ and skill-feedback/ live here.
     p["agent_home"] = a["codex_home"] if kind == "codex" else p["claude_home"]
+    lv = cfg["live"]
+    if not isinstance(lv["path"], str):
+        raise ConfigError("live.path must be a path string, got %r" % (lv["path"],))
+    if lv["path"].strip():
+        lv["path"] = _abs(lv["path"], base)
+    else:
+        lv["path"] = os.path.join(os.path.expanduser("~/.local/state"),
+                                  "session-notes", "live-context.md")
+    for k in ("max_lines", "max_chars"):
+        if type(lv[k]) is not int or lv[k] <= 0:
+            raise ConfigError("live.%s must be a positive integer, got %r" % (k, lv[k]))
     scopes = []
     for i, s in enumerate(cfg["scopes"]):
         if not isinstance(s, dict) or not s.get("name") or not s.get("root"):
             raise ConfigError("scopes[%d] needs a name and a root" % i)
-        unknown = set(s) - {"name", "root", "store", "manifest", "worktree_root"}
+        unknown = set(s) - {"name", "root", "store", "manifest", "worktree_root", "live", "live_file"}
         if unknown:
             raise ConfigError("scopes[%d]: unknown key(s) %s" % (i, sorted(unknown)))
         root = _abs(s["root"], base)
@@ -353,13 +375,41 @@ def _resolve(cfg, base=None, env=None):
         wtr = s.get("worktree_root", "")
         if not isinstance(wtr, str):
             raise ConfigError("scopes[%d] (%s): worktree_root must be a path string" % (i, s["name"]))
+        live = s.get("live", "shared")
+        if live not in ("shared", "own", "none"):
+            raise ConfigError("scopes[%d] (%s): live must be \"shared\", \"own\" or \"none\", got %r"
+                              % (i, s["name"], live))
+        lf = s.get("live_file", "")
+        if not isinstance(lf, str):
+            raise ConfigError("scopes[%d] (%s): live_file must be a path string, got %r"
+                              % (i, s["name"], lf))
+        if live == "own" and not lf.strip():
+            raise ConfigError("scopes[%d] (%s): live = \"own\" needs a non-empty live_file"
+                              % (i, s["name"]))
+        if live != "own" and lf.strip():
+            raise ConfigError("scopes[%d] (%s): live_file = %r is only allowed with live = \"own\""
+                              " (live is %r)" % (i, s["name"], lf, live))
         # A relative manifest is relative to the scope ROOT, which both agents share.
         scopes.append({"name": s["name"], "root": root,
                        "worktree_root": _abs(wtr, root) if wtr.strip() else "",
                        "store": _abs(store, base),
+                       "live": live,
+                       "live_file": _abs(lf, root) if lf.strip() else "",
                        "store_derived": kind == "codex" or not s.get("store"),
                        "manifest": _abs(manifest, root) if manifest.strip() else ""})
     cfg["scopes"] = scopes
+    seen = {}
+    for s in scopes:
+        if s["live"] != "own":
+            continue
+        real = os.path.realpath(s["live_file"])
+        if real == os.path.realpath(lv["path"]):
+            raise ConfigError("scopes (%s): live_file %s is the shared live-context file; "
+                              "an own file must be a different file" % (s["name"], s["live_file"]))
+        if real in seen:
+            raise ConfigError("scopes (%s) and (%s) resolve live_file to the same file %s; "
+                              "each own scope needs its own" % (seen[real], s["name"], real))
+        seen[real] = s["name"]
     w = cfg["wt"]
     if type(w["size_cap_kb"]) is not int or w["size_cap_kb"] <= 0:
         raise ConfigError("wt.size_cap_kb must be a positive integer, got %r" % (w["size_cap_kb"],))
@@ -398,7 +448,9 @@ def _resolve(cfg, base=None, env=None):
     if kind == "codex":
         # The no-piggyback rule as a mechanism: a codex_home inside claude_home
         # (or a symlink into it) would make "separate memories" false.
-        for where in [p["state_dir"], p["global_store"]] + [s["store"] for s in scopes]:
+        for where in ([p["state_dir"], p["global_store"], lv["path"]]
+                      + [s["store"] for s in scopes]
+                      + [s["live_file"] for s in scopes if s["live_file"]]):
             if _under(where, p["claude_home"]):
                 raise ConfigError("codex mode resolved %s, which is under claude_home %s;"
                                   " point agent.codex_home elsewhere" % (where, p["claude_home"]))
@@ -754,6 +806,30 @@ store = "/tmp/beta-store"
             except ConfigError as exc:
                 check("bad checkout_guard.%s %s refused" % (key, bad),
                       "checkout_guard." + key in str(exc))
+    # [live] default path: same in both agent modes, outside claude_home.
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "l.toml")
+        with open(f, "w") as fh:
+            fh.write("")
+        home = os.path.expanduser("~")
+        cc = load(f, env={})
+        cx = load(f, env={"SESSION_NOTES_AGENT": "codex"})
+        want = os.path.join(home, ".local", "state", "session-notes", "live-context.md")
+        check("live.path default, claude and codex mode identical",
+              cc["live"]["path"] == cx["live"]["path"] == want)
+        check("live.path default is not under claude_home",
+              not _under(cc["live"]["path"], cc["paths"]["claude_home"]))
+        with open(f, "w") as fh:
+            fh.write('[live]\npath = "%s/mine.md"\n' % d)
+        check("explicit live.path wins",
+              load(f, env={})["live"]["path"] == os.path.join(d, "mine.md"))
+        with open(f, "w") as fh:
+            fh.write('[paths]\nclaude_home = "%s/ch"\n[live]\npath = "%s/ch/x.md"\n' % (d, d))
+        try:
+            load(f, env={"SESSION_NOTES_AGENT": "codex"})
+            check("codex mode refuses a live.path under claude_home", False)
+        except ConfigError as exc:
+            check("codex mode refuses a live.path under claude_home", "claude_home" in str(exc))
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)
@@ -779,6 +855,9 @@ if __name__ == "__main__":
             # The stores this session reads and writes, for the cwd (or --cwd DIR).
             i = sys.argv.index("--cwd") + 1 if "--cwd" in sys.argv else 0
             print(json.dumps(stores_for(sys.argv[i] if i else os.getcwd()), indent=2))
+            sys.exit(0)
+        if "--live-path" in sys.argv:
+            print(load()["live"]["path"])
             sys.exit(0)
         print(json.dumps(load(), indent=2))
     except ConfigError as exc:

@@ -512,7 +512,7 @@ def cmd_merge(args, cfg):
             head[:10], branch, remote[:10] or "branch not on origin"))
     gh = Gh(cfg)
     try:
-        view = gh.json(["pr", "view", branch, "--json", "number,headRefOid,state,url"], main)
+        view = gh.json(["pr", "view", branch, "--json", "number,headRefOid,state,url,title"], main)
         owner, repo = _owner_repo(view.get("url"))
         login = gh.run(["api", "user", "--jq", ".login"], main).strip()
         comments = gh.json(["api", "--paginate",
@@ -551,6 +551,24 @@ def cmd_merge(args, cfg):
         remove_worktree(main, path, branch)
         print("merged PR #%s; removed %s and branch %s" % (view["number"], path, branch))
     print(ff_main(main, default))
+    try:
+        import live
+        title = " ".join(str(view.get("title") or branch).split())
+        tail = " (%s)" % view.get("url")
+        num = "merged PR #%s" % view["number"]
+        limit = cfg["live"]["max_chars"]
+        room = limit - len(num) - len(": ") - len(tail)
+        if len(title) <= room:
+            text = "%s: %s%s" % (num, title, tail)
+        elif room >= 4:
+            text = "%s: %s...%s" % (num, title[:room - 3], tail)
+        else:
+            text = num + tail
+            if len(text) > limit:
+                text = num
+        live.add(main, text, cfg)
+    except Exception as exc:
+        print("warning: live context not updated (%s)" % exc, file=sys.stderr)
     return 0
 
 
@@ -996,6 +1014,10 @@ def selftest():
                                            "--match-head-commit", head, "-R", "example/proj"]], (rc, out, err, merge_calls))
         check("merge removed the worktree and the local branch",
               not os.path.exists(P1) and g(R, "branch", "--list", "feat1") == "")
+        lv = os.path.join(env["HOME"], ".local", "state", "session-notes", "live-context.md")
+        check("merge wrote a live-context line",
+              os.path.exists(lv) and "merged PR #7: feat1 (https://github.com/example/proj/pull/7)" in open(lv).read(),
+              open(lv).read() if os.path.exists(lv) else "no file")
         check("merge reports the main checkout fast-forward state",
               "main checkout" in out and ("fast-forwarded" in out or "up to date" in out), out)
 
@@ -1015,9 +1037,14 @@ def selftest():
         head2 = g(P2, "rev-parse", "HEAD")
         setup_gate([cm("me", verdict_line(APPROVE, head2), "2026-01-02T00:00:00Z", 2)], v=dict(view, headRefOid=head2))
         open(os.path.join(R, "stray.txt"), "w").write("s\n")
+        os.remove(lv)
+        os.mkdir(lv)  # the live file path is now a directory: live.add must fail
         rc, out, err = wt(P2, "merge")
         check("merge leaves a dirty main checkout alone and says so",
               rc == 0 and "not fast-forwarded" in out, (rc, out, err))
+        check("a failing live-context write only warns: rc 0, merge output intact",
+              "warning: live context not updated" in err and "merged PR #7" in out, (rc, out, err))
+        os.rmdir(lv)
         os.remove(os.path.join(R, "stray.txt"))
 
         # list / gc / rm

@@ -41,6 +41,10 @@ boot-prefix state that can have gone stale.)
 `<claude_home>/CLAUDE.md`, reading each folder-root `CLAUDE.md` (or `.claude/CLAUDE.md`) that
 exists, and every file their `@import` lines name that is not already in the list above.
 
+**Live context:** `python3 $SESSION_NOTES/bin/live.py show` prints what other sessions just did
+(newest first; prints nothing when empty or when this scope is isolated). Compare it with what
+boot showed and keep the entries that are new for Step 4.
+
 Read whatever is present; silently skip any path that doesn't exist (scopes evolve). These reads
 put the CURRENT disk content into the conversation, overriding the stale start-of-session copy.
 

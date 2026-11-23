@@ -34,3 +34,10 @@ Codex-specific points that matter most here:
   reflect lock itself, so skip the skill's own acquire (Step 5) and release (Step 8).
 - Nothing under `~/.claude` is read or written. If a step seems to need it, skip that step and
   say so in one line.
+- Step 5b's live-context line runs as `SESSION_NOTES_AGENT=codex python3 $SESSION_NOTES/bin/live.py
+  note -` (text on stdin). It writes the live file under `~/.local/state/session-notes/`, not
+  `~/.claude`, and directly, not through `codex_save.py`. In the Codex CLI the write succeeds once
+  `install.sh --codex` added that directory to `writable_roots`; the desktop app ignores
+  `writable_roots`, so there the write fails. Skip the line when nothing was decided. In an isolated
+  scope it refuses (exit 3), which is fine. If it exits 2 (the write failed), say so in one line in
+  the report with the error and move on: never retry, never ask for approval.
