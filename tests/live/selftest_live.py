@@ -2459,10 +2459,11 @@ class Live:
         if seen("NEVER" + tok, self.ctext("codex")):
             return FAIL, "negative control: an unsent token was reported as seen", "handoff-codex.txt"
         stok = "XSTAGED%s" % self.tok
-        r = self.run([sys.executable, script, "--name", "xstaged", "--spec", "SPEC: the word is %s." % stok] + common,
-                     "handoff-codex-staged.txt", timeout=60)
-        if r.returncode != 0:
-            return FAIL, "staged handoff --cli codex rc=%d: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-200:]), "handoff-codex-staged.txt"
+        # the park needs a sender address ($TMUX_PANE), so the launcher runs from its own sandbox pane
+        out = self.pane_run("xlauncher", [sys.executable, script, "--name", "xstaged", "--spec",
+                            "SPEC: the word is %s." % stok] + common, "handoff-codex-staged.txt", timeout=60)
+        if out is None or "parked spec on the bus" not in out:
+            return FAIL, "staged handoff --cli codex did not park: %s" % (out or "timeout").strip()[-200:], "handoff-codex-staged.txt"
         self.panes.add("xstaged")
         self.wait_idle("xstaged", 90)
         if self.hook_injected("codex", stok):
