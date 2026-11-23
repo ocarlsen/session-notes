@@ -1103,6 +1103,8 @@ class _Capture(object):
 
 def selftest():
     ok = [True]
+    # Before ANY report_mode case: keep every selftest off the host's real ~/.codex.
+    globals()["_DEFAULT_CODEX_HOME"] = os.path.join(tempfile.gettempdir(), "no-such-codex-home-selftest")
 
     def check(cond, msg):
         if not cond:
@@ -1756,7 +1758,6 @@ def selftest():
             os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = orig_dis
 
     # --- Codex project AGENTS.md chain vs project_doc_max_bytes ---
-    globals()["_DEFAULT_CODEX_HOME"] = os.path.join(tempfile.gettempdir(), "no-such-codex-home-selftest")
     with tempfile.TemporaryDirectory() as d:
         ch = os.path.join(d, "cxhome")
         root = os.path.join(d, "work", "proj")
