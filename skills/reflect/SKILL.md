@@ -396,7 +396,7 @@ push without the user's ask.** Not a git repo: skip silently.
 before the closing line, never after or skipped.
 
 Users often ask "ok to exit?" after a reflect; answer it pre-emptively, in one line, as the last
-thing `/reflect` says. Default is **`Safe to exit`**. Flag only when exiting would actually
+thing `/reflect` says. Default is **`✅ Safe to exit`**. Flag only when exiting would actually
 lose, kill or clobber something:
 
 1. **Uncommitted work THIS session created** (the user chose "just reflect", or residual code):
@@ -409,9 +409,9 @@ another session's dirty files.
 
 **Always emit exactly one closing line; the state changes the REGISTER, not whether the line
 exists:**
-- Clear (common case): **`Safe to exit`**, plain and unpadded.
-- **`Before you exit: <what + why>`**: one of the cases above, concrete, with the one action that
-  clears it. The warning register belongs to this case ONLY.
+- Clear (common case): **`✅ Safe to exit`**, plain and unpadded, no `⚠️`.
+- **`⚠️ Before you exit: <what + why>`**: one of the cases above, concrete, with the one action
+  that clears it. The `⚠️` and the warning register belong to this case ONLY.
 
 > Two axes, kept separate: whether the line exists, and how it is phrased. Dressing a clear
 > state as a warning is noise; suppressing the clear-case line entirely leaves the user unable to
