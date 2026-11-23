@@ -699,6 +699,104 @@ def codex_boot_findings(cfg):
             for label, n in rows if n >= CODEX_BOOT_WARN_FRACTION * cap]
 
 
+def _codex_doc_settings(codex_home):
+    """(cap, fallback_names) from <codex_home>/config.toml. The cap defaults to
+    rules_block.MAX_BYTES (one source of truth). A present-but-malformed key raises
+    notes_config.ConfigError naming the key and value: no silent default."""
+    import rules_block
+    cap, fallbacks = rules_block.MAX_BYTES, []
+    cfg_path = os.path.join(codex_home, "config.toml")
+    if not os.path.isfile(cfg_path):
+        return cap, fallbacks
+    # Only these two top-level keys matter, so scan for them instead of parsing the whole file:
+    # a real Codex config holds multi-line strings the stdlib-free TOML subset parser cannot read.
+    data = {}
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise notes_config.ConfigError("%s: cannot read Codex config: %s" % (cfg_path, exc)) from None
+    for n, raw in enumerate(lines, 1):
+        line = notes_config._strip_comment(raw)
+        if line.startswith("["):
+            break  # top-level keys end at the first table
+        m = re.match(r"^(project_doc_max_bytes|project_doc_fallback_filenames)\s*=\s*(.+)$", line)
+        if m:
+            try:
+                data[m.group(1)] = notes_config._scalar(m.group(2), n)
+            except notes_config.ConfigError as exc:
+                raise notes_config.ConfigError("%s: %s: %s" % (cfg_path, m.group(1), exc)) from None
+    if "project_doc_max_bytes" in data:
+        v = data["project_doc_max_bytes"]
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise notes_config.ConfigError(
+                "%s: project_doc_max_bytes must be a positive integer, got %r" % (cfg_path, v))
+        cap = v
+    if "project_doc_fallback_filenames" in data:
+        v = data["project_doc_fallback_filenames"]
+        if (not isinstance(v, list) or not all(isinstance(n, str) and n and "/" not in n for n in v)):
+            raise notes_config.ConfigError(
+                "%s: project_doc_fallback_filenames must be a list of file names, got %r"
+                % (cfg_path, v))
+        fallbacks = v
+    return cap, fallbacks
+
+
+def _codex_doc_in_dir(d, fallbacks):
+    """The ONE instruction file Codex reads from directory d: AGENTS.override.md, then
+    AGENTS.md, then the fallback names. An empty (blank) file is skipped. -> (path, bytes) or None."""
+    for name in ["AGENTS.override.md", "AGENTS.md"] + list(fallbacks):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                data = fh.read()
+            if data.strip():
+                return p, len(data)
+    return None
+
+
+def codex_project_doc_findings(cfg):
+    """Codex's project instructions (AGENTS.md chain, git root down to the scope root) are
+    read until project_doc_max_bytes (32 KiB default) and the rest is silently dropped.
+    Per scope root: HARD finding when the project chain is >= CODEX_BOOT_WARN_FRACTION of
+    the cap. SOFT finding when global + project passes the cap (per the openai/codex source
+    the limit applies to project files only, so this is a signal, not a loss).
+    Runs in either agent mode, whenever a Codex home exists; silent when clean."""
+    codex_home = cfg.get("agent", {}).get(
+        "codex_home", notes_config.DEFAULTS["agent"]["codex_home"])
+    if not os.path.isdir(os.path.expanduser(codex_home)):
+        return []
+    cap, fallbacks = _codex_doc_settings(codex_home)
+    g = _codex_doc_in_dir(codex_home, [])
+    g_size = g[1] if g else 0
+    out = []
+    for s in cfg.get("scopes", []):
+        root = os.path.realpath(s["root"])
+        if not os.path.isdir(root):
+            continue
+        top = notes_config._git_root(root)
+        top = os.path.realpath(top) if top else root
+        if not (root == top or root.startswith(top + os.sep)):
+            top = root
+        dirs, cur = [root], root
+        while cur != top:
+            cur = os.path.dirname(cur)
+            dirs.append(cur)
+        total = 0
+        for d in dirs:
+            hit = _codex_doc_in_dir(d, fallbacks)
+            total += hit[1] if hit else 0
+        if total >= CODEX_BOOT_WARN_FRACTION * cap:
+            out.append("CODEX AGENTS.md %s: project chain %d of %d bytes (>= %d%%); Codex stops "
+                       "adding project files at project_doc_max_bytes and drops the rest"
+                       % (s["name"], total, cap, round(CODEX_BOOT_WARN_FRACTION * 100)))
+        elif total + g_size > cap:
+            out.append("CODEX AGENTS.md %s (soft): global %d + project %d = %d bytes, over %d; "
+                       "the limit applies to project files only per the Codex source, so this "
+                       "is a signal, not a loss" % (s["name"], g_size, total, total + g_size, cap))
+    return out
+
+
 def report_mode(cfg, out=None):
     """Run every check. Silent + 0 when clean; report on `out` + EXIT_FINDINGS otherwise."""
     out = sys.stdout if out is None else out
@@ -740,11 +838,13 @@ def report_mode(cfg, out=None):
         ref_imported = reference_imported_findings(cfg, reached)
         orphan_stores = orphan_store_findings(cfg, reached)
     codex_boot = codex_boot_findings(cfg) if kind == "codex" else []
+    # Both agents run on the same folders, so a Codex home alone turns this on.
+    codex_docs = codex_project_doc_findings(cfg)
     # Every file we found but could not read: the checks above are blind to it, so it is
     # a finding in its own right (an orphan verdict that leaned on one is withheld above).
     blind = ["BLIND %s: cannot read (%s); the check is blind for scope %s"
              % (p, r, sc) for p, sc, r in boot_budget.blind_reads()]
-    if ref_imported or orphan_stores or codex_boot or blind:
+    if ref_imported or orphan_stores or codex_boot or codex_docs or blind:
         any_found = True
 
     if not any_found:
@@ -761,6 +861,9 @@ def report_mode(cfg, out=None):
     if codex_boot:
         report += "\n## Codex boot size\n\n"
         report += "\n".join("- " + f for f in codex_boot) + "\n"
+    if codex_docs:
+        report += "\n## Codex AGENTS.md project size\n\n"
+        report += "\n".join("- " + f for f in codex_docs) + "\n"
     if blind:
         report += "\n## Unreadable files (present but cannot be read; the check is blind)\n\n"
         report += "\n".join("- " + f for f in blind) + "\n"
@@ -1471,6 +1574,74 @@ def selftest():
         if orig_dis is not None:
             os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = orig_dis
 
+    # --- Codex project AGENTS.md chain vs project_doc_max_bytes ---
+    with tempfile.TemporaryDirectory() as d:
+        ch = os.path.join(d, "cxhome")
+        root = os.path.join(d, "work", "proj")
+        os.makedirs(root)
+        cfg = _test_cfg(d, [{"name": "proj", "root": root, "store": os.path.join(d, "st")}])
+        cfg["agent"] = {"kind": "claude", "codex_home": ch}
+        import rules_block as _rb
+        cap = _rb.MAX_BYTES
+        _write(os.path.join(root, "AGENTS.md"), "x" * cap)
+        check(codex_project_doc_findings(cfg) == [], "codex docs: no Codex home -> silent even over the cap")
+        os.makedirs(ch)
+        _write(os.path.join(root, "AGENTS.md"), "x" * (int(0.9 * cap) - 1))
+        check(codex_project_doc_findings(cfg) == [], "codex docs: just under 90% of the cap is silent")
+        _write(os.path.join(root, "AGENTS.md"), "x" * int(0.9 * cap + 1))
+        got = codex_project_doc_findings(cfg)
+        check(len(got) == 1 and "project chain" in got[0] and "proj" in got[0] and "(soft)" not in got[0],
+              "codex docs: project chain over 90% fires (hard), in claude mode too")
+        cap_r = _Capture()
+        check(report_mode(cfg, cap_r) == EXIT_FINDINGS and "Codex AGENTS.md project size" in cap_r.text(),
+              "codex docs: report_mode reports it")
+        _write(os.path.join(root, "AGENTS.override.md"), "tiny")
+        check(codex_project_doc_findings(cfg) == [],
+              "codex docs: AGENTS.override.md beats AGENTS.md in the same directory")
+        os.remove(os.path.join(root, "AGENTS.override.md"))
+        _write(os.path.join(ch, "config.toml"), 'project_doc_fallback_filenames = ["TEAM.md"]\n')
+        _write(os.path.join(root, "TEAM.md"), "y" * (cap - 1))
+        check(codex_project_doc_findings(cfg) and "project chain %d " % int(0.9 * cap + 1) in codex_project_doc_findings(cfg)[0],
+              "codex docs: a fallback name is ignored while AGENTS.md exists")
+        os.remove(os.path.join(root, "AGENTS.md"))
+        got = codex_project_doc_findings(cfg)
+        check(len(got) == 1 and "project chain %d " % (cap - 1) in got[0],
+              "codex docs: the fallback name is used once AGENTS.md is missing")
+        os.remove(os.path.join(root, "TEAM.md"))
+        _write(os.path.join(ch, "config.toml"), "project_doc_max_bytes = 100\n")
+        _write(os.path.join(root, "AGENTS.md"), "z" * 90)
+        got = codex_project_doc_findings(cfg)
+        check(len(got) == 1 and "90 of 100 bytes" in got[0], "codex docs: config project_doc_max_bytes is honored")
+        for bad, shown in (('"big"', "'big'"), ("0", "0"), ("-5", "-5"), ("true", "True")):
+            _write(os.path.join(ch, "config.toml"), "project_doc_max_bytes = %s\n" % bad)
+            try:
+                codex_project_doc_findings(cfg)
+                msg = ""
+            except notes_config.ConfigError as exc:
+                msg = str(exc)
+            check("project_doc_max_bytes" in msg and shown in msg,
+                  "codex docs: malformed project_doc_max_bytes %s refuses, naming key and value" % bad)
+        _write(os.path.join(ch, "config.toml"), "project_doc_fallback_filenames = [1]\n")
+        try:
+            codex_project_doc_findings(cfg)
+            msg = ""
+        except notes_config.ConfigError as exc:
+            msg = str(exc)
+        check("project_doc_fallback_filenames" in msg, "codex docs: malformed fallback list refuses")
+        # soft: global + project over the cap while the project alone is under 90%
+        _write(os.path.join(ch, "config.toml"), "project_doc_max_bytes = 1000\n")
+        _write(os.path.join(root, "AGENTS.md"), "p" * 500)
+        _write(os.path.join(ch, "AGENTS.md"), "g" * 600)
+        got = codex_project_doc_findings(cfg)
+        check(len(got) == 1 and "(soft)" in got[0], "codex docs: global + project over the cap is a labelled soft signal")
+        # parent chain: git root above the scope root counts
+        import subprocess
+        subprocess.run(["git", "init", "-q", os.path.join(d, "work")], check=True)
+        _write(os.path.join(d, "work", "AGENTS.md"), "q" * 400)
+        os.remove(os.path.join(ch, "AGENTS.md"))
+        got = codex_project_doc_findings(cfg)
+        check(len(got) == 1 and "900 of 1000" in got[0], "codex docs: AGENTS.md files from the git root down are summed")
+
     print("\nSELFTEST:", "PASS" if ok[0] else "FAIL")
     return 0 if ok[0] else 1
 
@@ -1491,7 +1662,10 @@ def main():
         cfg = notes_config.load()
     except notes_config.ConfigError as exc:
         sys.exit("memory_hygiene_canary: bad config: %s" % exc)
-    return report_mode(cfg)
+    try:
+        return report_mode(cfg)
+    except notes_config.ConfigError as exc:
+        sys.exit("memory_hygiene_canary: bad Codex config: %s" % exc)
 
 
 if __name__ == "__main__":

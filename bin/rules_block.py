@@ -22,8 +22,12 @@ of the snippet's headings and put the block where the first one was; (c) neither
 block. The file is created if missing, a copy named PATH.bak-session-notes-YYYYmmdd-HHMMSS is kept
 before any change (an existing backup is never overwritten; only the newest 3 of these are kept),
 and a second run changes nothing.
-Codex caps the combined size of the global and project AGENTS.md files at 32 KiB, so a result
-over 32768 bytes is refused.
+Codex's project_doc_max_bytes (32 KiB default) caps PROJECT AGENTS.md files: its docs say "Codex
+skips empty files and stops adding files once the combined size reaches the limit". Verified in the
+installed codex-cli 0.171.0 binary: "The total includes global and thread instructions. The limit
+applies only to project files." and, past the cap, "project doc exceeds remaining budget;
+truncating". So the global file counts toward the total but the hard limit is on the project chain.
+A result over 32768 bytes is refused either way, the safe side.
 """
 import argparse
 import difflib
