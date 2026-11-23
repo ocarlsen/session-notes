@@ -202,10 +202,10 @@ offer_environment() {
 if [ "$CODEX" = 1 ]; then
   # Codex keeps its own memory under <codex home>/session-notes; nothing here touches ~/.claude.
   CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
-  echo "Codex skills to link into $(tilde "$CODEX_DIR/skills"): \$reflect \$refresh \$rnr"
-  if [ "$ASK" = 0 ] || ask "Link these 3 skills?"; then
+  echo "Codex skills to link into $(tilde "$CODEX_DIR/skills"): \$reflect \$refresh \$rnr \$review"
+  if [ "$ASK" = 0 ] || ask "Link these 4 skills?"; then
     run mkdir -p "$CODEX_DIR/skills"
-    for name in reflect refresh rnr; do
+    for name in reflect refresh rnr review; do
       link "$REPO/skills/codex/$name" "$CODEX_DIR/skills/$name"
     done
   else

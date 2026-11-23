@@ -105,6 +105,10 @@ exempt_repos = []
 # Extra glob patterns (matched on the absolute real path, ~ expanded) that edits may touch
 # on the default branch. Every scope's memory store below is always exempt.
 exempt_paths = []
+[review]
+# Extra fnmatch globs for files test_edit_check.py treats as tests, fixtures or guards, in
+# addition to its built-in path rules (tests/, test_*.py, fixtures/, evals/, canary and leak files).
+test_globs = []
 
 [live]
 # bin/live.py: one machine-wide rolling file of what just happened across scopes, read
