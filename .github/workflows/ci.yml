@@ -19,7 +19,12 @@ jobs:
         python-version: ["3.9", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
+      - name: Install tmux (the watch-mode selftests drive real panes)
+        run: apt-get update -qq && apt-get install -y -qq tmux >/dev/null && tmux -V
       - name: Self-tests and hook smoke tests (HOME is a temp dir)
+        # a selftest that needs tmux fails here instead of skipping
+        env:
+          SESSION_NOTES_REQUIRE_TMUX: "1"
         run: make test
       - name: Leak scan (public patterns; private terms live on the author's machine)
         run: LEAK_SCAN_PUBLIC_ONLY=1 python3 tests/leak_scan.py

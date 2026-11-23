@@ -88,6 +88,7 @@ for a in "$@"; do
 done
 exec /bin/ls "$@"
 """
+REQUIRE_TMUX_ENV = "SESSION_NOTES_REQUIRE_TMUX"  # set: the selftest fails, not skips, without tmux
 RUN_TITLE = "run finished"  # the row an aborted run is reported on
 FEATURES = [
     ("boot", "boot context + clock line", "cli"),
@@ -1600,8 +1601,11 @@ def selftest():
                       not os.path.lexists(os.path.join(live.sock_dir, SOCKET_LABEL)) and not os.path.exists(live.sock_target)
                       and refused)
                 shutil.rmtree(live.root, ignore_errors=True)
+    elif os.environ.get(REQUIRE_TMUX_ENV) is not None:
+        # CI sets this and installs tmux: a missing tmux there is a broken runner, not a skip
+        check("tmux on PATH (%s is set, so these checks may not be skipped)" % REQUIRE_TMUX_ENV, False)
     else:
-        print("skip layout and guard-through-panes checks: no tmux")
+        print("skip layout and guard-through-panes checks: no tmux (set %s=1 to fail instead)" % REQUIRE_TMUX_ENV)
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
