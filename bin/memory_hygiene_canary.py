@@ -699,77 +699,258 @@ def codex_boot_findings(cfg):
             for label, n in rows if n >= CODEX_BOOT_WARN_FRACTION * cap]
 
 
-def _codex_doc_settings(codex_home):
-    """(cap, fallback_names) from <codex_home>/config.toml. The cap defaults to
-    rules_block.MAX_BYTES (one source of truth). A present-but-malformed key raises
-    notes_config.ConfigError naming the key and value: no silent default."""
-    import rules_block
-    cap, fallbacks = rules_block.MAX_BYTES, []
-    cfg_path = os.path.join(codex_home, "config.toml")
-    if not os.path.isfile(cfg_path):
-        return cap, fallbacks
-    # Only these two top-level keys matter, so scan for them instead of parsing the whole file:
-    # a real Codex config holds multi-line strings the stdlib-free TOML subset parser cannot read.
-    data = {}
+try:  # Python 3.11+
+    import tomllib as _tomllib
+except ImportError:
     try:
-        with open(cfg_path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise notes_config.ConfigError("%s: cannot read Codex config: %s" % (cfg_path, exc)) from None
-    for n, raw in enumerate(lines, 1):
-        line = notes_config._strip_comment(raw)
-        if line.startswith("["):
-            break  # top-level keys end at the first table
-        m = re.match(r"^(project_doc_max_bytes|project_doc_fallback_filenames)\s*=\s*(.+)$", line)
-        if m:
+        import tomli as _tomllib
+    except ImportError:
+        _tomllib = None
+
+_CODEX_KEYS = ("project_doc_max_bytes", "project_doc_fallback_filenames")
+# Where Codex lives when the config carries no agent.codex_home. The selftest points this at
+# a path that does not exist so no host ~/.codex leaks into it.
+_DEFAULT_CODEX_HOME = notes_config.DEFAULTS["agent"]["codex_home"]
+
+
+def _skip_string(text, i):
+    """text[i] opens a TOML string; the index just past it. ValueError if unterminated."""
+    n = len(text)
+    for q in ('"""', "'''"):
+        if text.startswith(q, i):
+            j = i + 3
+            while True:
+                j = text.find(q, j)
+                if j < 0:
+                    raise ValueError("unterminated multi-line string")
+                if q == "'''" or (len(text[:j]) - len(text[:j].rstrip("\\"))) % 2 == 0:
+                    j += 3
+                    while j < n and text[j] == q[0]:  # up to two extra quotes belong to the string
+                        j += 1
+                    return j
+                j += 1
+    q = text[i]
+    j = i + 1
+    while j < n and text[j] != "\n":
+        if q == '"' and text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == q:
+            return j + 1
+        j += 1
+    raise ValueError("unterminated string")
+
+
+def _scan_top_level(text):
+    """[(key, value_text, line)] of the top-level key/value pairs, up to the first table header
+    outside any string or array. Tracks multi-line strings and bracket depth, so a key-looking
+    line inside a string or array is never mistaken for a key. Comments are dropped from the
+    value text. ValueError on text it cannot follow."""
+    out, i, n = [], 0, len(text)
+    while True:
+        while i < n and (text[i].isspace()):
+            i += 1
+        while i < n and text[i] == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            while i < n and text[i].isspace():
+                i += 1
+        if i >= n or text[i] == "[":
+            return out
+        line = text.count("\n", 0, i) + 1
+        parts = []
+        while True:
+            while i < n and text[i] in " \t":
+                i += 1
+            if i < n and text[i] in "\"'":
+                j = _skip_string(text, i)
+                parts.append(_toml_string(text[i:j]))
+                i = j
+            else:
+                m = re.compile(r"[A-Za-z0-9_-]+").match(text, i)
+                if not m:
+                    raise ValueError("cannot parse a key at line %d" % line)
+                parts.append(m.group(0))
+                i = m.end()
+            while i < n and text[i] in " \t":
+                i += 1
+            if i < n and text[i] == ".":
+                i += 1
+                continue
+            break
+        if i >= n or text[i] != "=":
+            raise ValueError("expected '=' at line %d" % line)
+        i += 1
+        buf, depth = [], 0
+        while i < n:
+            c = text[i]
+            if c in "\"'":
+                j = _skip_string(text, i)
+                buf.append(text[i:j])
+                i = j
+                continue
+            if c == "#":
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+            elif c == "\n" and depth <= 0:
+                break
+            buf.append(c)
+            i += 1
+        out.append((".".join(parts), "".join(buf).strip(), line))
+
+
+def _toml_string(tok):
+    if tok.startswith('"""') or tok.startswith("'''"):
+        body = tok[3:-3]
+        return body[1:] if body.startswith("\n") else body
+    if tok[0] == "'":
+        return tok[1:-1]
+    import json
+    try:
+        return json.loads(tok)
+    except ValueError:
+        raise ValueError("bad string %s" % tok) from None
+
+
+def _toml_value(raw):
+    """int, str or list of those from the value text; ValueError for anything else."""
+    raw = raw.strip()
+    if re.fullmatch(r"[+-]?\d+(?:_\d+)*", raw):
+        return int(raw.replace("_", ""))
+    if raw in ("true", "false"):
+        return raw == "true"
+    if raw[:1] in "\"'":
+        if _skip_string(raw, 0) != len(raw):
+            raise ValueError("trailing text")
+        return _toml_string(raw)
+    if raw.startswith("[") and raw.endswith("]"):
+        items, i, body = [], 0, raw[1:-1]
+        while True:
+            while i < len(body) and body[i].isspace():
+                i += 1
+            if i >= len(body):
+                return items
+            if body[i] not in "\"'":
+                raise ValueError("array item is not a string")
+            j = _skip_string(body, i)
+            items.append(_toml_string(body[i:j]))
+            i = j
+            while i < len(body) and body[i].isspace():
+                i += 1
+            if i < len(body):
+                if body[i] != ",":
+                    raise ValueError("expected ',' in array")
+                i += 1
+    raise ValueError("unsupported value")
+
+
+def _codex_config_values(text):
+    """{key: python value or _Bad(reason)} for the two keys, from the Codex config text. Uses
+    tomllib/tomli when importable, else the scanner above. A reason string means unreadable."""
+    found = {}
+    if _tomllib is not None:
+        try:
+            data = _tomllib.loads(text)
+        except _tomllib.TOMLDecodeError as exc:
+            return {"": _Bad("invalid TOML: %s" % exc)}
+        return {k: data[k] for k in _CODEX_KEYS if k in data}
+    try:
+        pairs = _scan_top_level(text)
+    except ValueError as exc:
+        return {"": _Bad("cannot read the config: %s" % exc)}
+    for key, raw, line in pairs:
+        if key in _CODEX_KEYS:
             try:
-                data[m.group(1)] = notes_config._scalar(m.group(2), n)
-            except notes_config.ConfigError as exc:
-                raise notes_config.ConfigError("%s: %s: %s" % (cfg_path, m.group(1), exc)) from None
-    if "project_doc_max_bytes" in data:
-        v = data["project_doc_max_bytes"]
-        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
-            raise notes_config.ConfigError(
-                "%s: project_doc_max_bytes must be a positive integer, got %r" % (cfg_path, v))
-        cap = v
-    if "project_doc_fallback_filenames" in data:
-        v = data["project_doc_fallback_filenames"]
-        if (not isinstance(v, list) or not all(isinstance(n, str) and n and "/" not in n for n in v)):
-            raise notes_config.ConfigError(
-                "%s: project_doc_fallback_filenames must be a list of file names, got %r"
-                % (cfg_path, v))
-        fallbacks = v
-    return cap, fallbacks
+                found[key] = _toml_value(raw)
+            except ValueError as exc:
+                found[key] = _Bad("%s (value %s)" % (exc, raw))
+    return found
+
+
+class _Bad(object):
+    def __init__(self, reason):
+        self.reason = reason
+
+
+def _codex_home_of(cfg):
+    home = cfg.get("agent", {}).get("codex_home", _DEFAULT_CODEX_HOME)
+    return os.path.expanduser(home)
+
+
+def _codex_doc_settings(codex_home):
+    """(cap, fallback_names, problem) from <codex_home>/config.toml. The cap defaults to
+    rules_block.MAX_BYTES (one source of truth). 0 means Codex reads no project docs. A key
+    that is present but unreadable or invalid yields a problem string (file, key, value and
+    reason) and the defaults; it never raises, so one bad config cannot kill the other checks."""
+    import rules_block
+    import boot_budget
+    cap, fallbacks, problems = rules_block.MAX_BYTES, [], []
+    cfg_path = os.path.join(codex_home, "config.toml")
+    data = boot_budget.read_bytes_or_blind(cfg_path, "codex")
+    if data is None:
+        return cap, fallbacks, None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return cap, fallbacks, "CODEX CONFIG %s: not valid UTF-8; project_doc_max_bytes unknown, " \
+            "assuming %d" % (cfg_path, cap)
+    for key, v in _codex_config_values(text).items():
+        where = "CODEX CONFIG %s: %s" % (cfg_path, key or "config")
+        if isinstance(v, _Bad):
+            problems.append("%s: %s" % (where, v.reason))
+        elif key == "project_doc_max_bytes":
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                problems.append("%s = %r: must be a non-negative integer" % (where, v))
+            else:
+                cap = v
+        elif key == "project_doc_fallback_filenames":
+            if not isinstance(v, list) or not all(isinstance(x, str) and x and "/" not in x for x in v):
+                problems.append("%s = %r: must be a list of file names" % (where, v))
+            else:
+                fallbacks = v
+    return cap, fallbacks, "; ".join(problems) or None
 
 
 def _codex_doc_in_dir(d, fallbacks):
-    """The ONE instruction file Codex reads from directory d: AGENTS.override.md, then
-    AGENTS.md, then the fallback names. An empty (blank) file is skipped. -> (path, bytes) or None."""
+    """(path, bytes) of the file Codex reads from directory d, or None. Codex takes the FIRST
+    existing file among AGENTS.override.md, AGENTS.md and the fallback names, then judges it:
+    a blank one means the directory contributes nothing (no fall-through)."""
+    import boot_budget
     for name in ["AGENTS.override.md", "AGENTS.md"] + list(fallbacks):
         p = os.path.join(d, name)
         if os.path.isfile(p):
-            with open(p, "rb") as fh:
-                data = fh.read()
-            if data.strip():
-                return p, len(data)
+            data = boot_budget.read_bytes_or_blind(p, "codex")
+            if data is None:  # unreadable: recorded as a blind read, counts as nothing
+                return None
+            return (p, len(data)) if data.strip() else None
     return None
 
 
 def codex_project_doc_findings(cfg):
-    """Codex's project instructions (AGENTS.md chain, git root down to the scope root) are
-    read until project_doc_max_bytes (32 KiB default) and the rest is silently dropped.
-    Per scope root: HARD finding when the project chain is >= CODEX_BOOT_WARN_FRACTION of
-    the cap. SOFT finding when global + project passes the cap (per the openai/codex source
-    the limit applies to project files only, so this is a signal, not a loss).
-    Runs in either agent mode, whenever a Codex home exists; silent when clean."""
-    codex_home = cfg.get("agent", {}).get(
-        "codex_home", notes_config.DEFAULTS["agent"]["codex_home"])
-    if not os.path.isdir(os.path.expanduser(codex_home)):
+    """Codex's project instructions (AGENTS.md chain) are read until project_doc_max_bytes
+    (32 KiB default) and the rest is dropped. Per scope root: HARD finding when the project
+    chain is >= CODEX_BOOT_WARN_FRACTION of the cap; SOFT finding when global + project passes
+    the cap (per the openai/codex source the limit applies to project files only, so that is a
+    signal, not a loss). A cap of 0 is Codex's off switch: silent. A config this cannot read
+    is ONE finding line, never an exception. Runs in either agent mode whenever a Codex home
+    exists; silent when clean.
+    The chain: Codex walks up from the working directory to the project root (.git, or
+    project_root_markers) and reads one file per directory on the way down. This uses git for
+    the root and degrades to the scope root alone when it is not in a repo."""
+    codex_home = _codex_home_of(cfg)
+    if not os.path.isdir(codex_home):
         return []
-    cap, fallbacks = _codex_doc_settings(codex_home)
+    cap, fallbacks, problem = _codex_doc_settings(codex_home)
+    out = [problem] if problem else []
+    if cap == 0:
+        return out
     g = _codex_doc_in_dir(codex_home, [])
     g_size = g[1] if g else 0
-    out = []
     for s in cfg.get("scopes", []):
         root = os.path.realpath(s["root"])
         if not os.path.isdir(root):
@@ -790,7 +971,7 @@ def codex_project_doc_findings(cfg):
             out.append("CODEX AGENTS.md %s: project chain %d of %d bytes (>= %d%%); Codex stops "
                        "adding project files at project_doc_max_bytes and drops the rest"
                        % (s["name"], total, cap, round(CODEX_BOOT_WARN_FRACTION * 100)))
-        elif total + g_size > cap:
+        elif total > 0 and total + g_size > cap:
             out.append("CODEX AGENTS.md %s (soft): global %d + project %d = %d bytes, over %d; "
                        "the limit applies to project files only per the Codex source, so this "
                        "is a signal, not a loss" % (s["name"], g_size, total, total + g_size, cap))
@@ -1575,6 +1756,7 @@ def selftest():
             os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = orig_dis
 
     # --- Codex project AGENTS.md chain vs project_doc_max_bytes ---
+    globals()["_DEFAULT_CODEX_HOME"] = os.path.join(tempfile.gettempdir(), "no-such-codex-home-selftest")
     with tempfile.TemporaryDirectory() as d:
         ch = os.path.join(d, "cxhome")
         root = os.path.join(d, "work", "proj")
@@ -1598,10 +1780,14 @@ def selftest():
         _write(os.path.join(root, "AGENTS.override.md"), "tiny")
         check(codex_project_doc_findings(cfg) == [],
               "codex docs: AGENTS.override.md beats AGENTS.md in the same directory")
+        _write(os.path.join(root, "AGENTS.override.md"), "  \n")
+        check(codex_project_doc_findings(cfg) == [],
+              "codex docs: a blank override means the directory contributes nothing (no fall-through)")
         os.remove(os.path.join(root, "AGENTS.override.md"))
         _write(os.path.join(ch, "config.toml"), 'project_doc_fallback_filenames = ["TEAM.md"]\n')
         _write(os.path.join(root, "TEAM.md"), "y" * (cap - 1))
-        check(codex_project_doc_findings(cfg) and "project chain %d " % int(0.9 * cap + 1) in codex_project_doc_findings(cfg)[0],
+        got = codex_project_doc_findings(cfg)
+        check(got and "project chain %d " % int(0.9 * cap + 1) in got[0],
               "codex docs: a fallback name is ignored while AGENTS.md exists")
         os.remove(os.path.join(root, "AGENTS.md"))
         got = codex_project_doc_findings(cfg)
@@ -1612,28 +1798,86 @@ def selftest():
         _write(os.path.join(root, "AGENTS.md"), "z" * 90)
         got = codex_project_doc_findings(cfg)
         check(len(got) == 1 and "90 of 100 bytes" in got[0], "codex docs: config project_doc_max_bytes is honored")
-        for bad, shown in (('"big"', "'big'"), ("0", "0"), ("-5", "-5"), ("true", "True")):
-            _write(os.path.join(ch, "config.toml"), "project_doc_max_bytes = %s\n" % bad)
+
+        # config.toml reading: every case below is checked against the real TOML meaning.
+        long_str = 'prompt = """\n' + "".join("line %d\n" % i for i in range(88)) + '"""\n'
+        cases = [
+            ("key inside a top-level \"\"\" string is not a key",
+             'prompt = """\nproject_doc_max_bytes = 100\n"""\n', (cap, [])),
+            ("fallback key inside a ''' string is not a key",
+             "note = '''\nproject_doc_fallback_filenames = [\"EVIL.md\"]\n'''\n", (cap, [])),
+            ("a line starting with [ inside a string does not end the scan",
+             'p = """\n[not a table]\n"""\nproject_doc_max_bytes = 65536\n', (65536, [])),
+            ("a nested multi-line array before the key",
+             'x = [\n  [1, 2],\n  [3]\n]\nproject_doc_max_bytes = 65536\n', (65536, [])),
+            ("a quoted key", '"project_doc_max_bytes" = 65536\n', (65536, [])),
+            ("a key after an 88-line string", long_str + "project_doc_max_bytes = 65536\n", (65536, [])),
+            ("a multi-line fallback array with comments",
+             'project_doc_fallback_filenames = [\n  "A.md", # one\n  \'B.md\',\n]\n', (cap, ["A.md", "B.md"])),
+            ("an integer with underscores", "project_doc_max_bytes = 65_536 # bytes\n", (65536, [])),
+            ("a key under a table is not top-level",
+             '[profile]\nproject_doc_max_bytes = 5\n', (cap, [])),
+        ]
+        for name, text, want in cases:
+            _write(os.path.join(ch, "config.toml"), text)
+            c, fb, prob = _codex_doc_settings(ch)
+            check((c, fb) == want and prob is None, "codex config: %s" % name)
+        # The scanner alone, so the tomllib branch cannot hide a scanner defect.
+        for name, text, want in cases:
             try:
-                codex_project_doc_findings(cfg)
-                msg = ""
-            except notes_config.ConfigError as exc:
-                msg = str(exc)
-            check("project_doc_max_bytes" in msg and shown in msg,
-                  "codex docs: malformed project_doc_max_bytes %s refuses, naming key and value" % bad)
-        _write(os.path.join(ch, "config.toml"), "project_doc_fallback_filenames = [1]\n")
-        try:
-            codex_project_doc_findings(cfg)
-            msg = ""
-        except notes_config.ConfigError as exc:
-            msg = str(exc)
-        check("project_doc_fallback_filenames" in msg, "codex docs: malformed fallback list refuses")
+                vals = {k: v for k, v, _ in _scan_top_level(text) if k in _CODEX_KEYS}
+                got_cap = _toml_value(vals["project_doc_max_bytes"]) if "project_doc_max_bytes" in vals else cap
+                got_fb = _toml_value(vals["project_doc_fallback_filenames"]) if "project_doc_fallback_filenames" in vals else []
+            except ValueError:
+                got_cap, got_fb = None, None
+            check((got_cap, got_fb) == want, "codex config scanner: %s" % name)
+
+        _write(os.path.join(ch, "config.toml"), "project_doc_max_bytes = 0\n")
+        _write(os.path.join(root, "AGENTS.md"), "z" * (cap * 2))
+        check(codex_project_doc_findings(cfg) == [], "codex docs: project_doc_max_bytes = 0 (Codex off switch) is silent")
+        for text, key, shown in (('project_doc_max_bytes = "big"\n', "project_doc_max_bytes", "big"),
+                                 ("project_doc_max_bytes = -5\n", "project_doc_max_bytes", "-5"),
+                                 ("project_doc_max_bytes = true\n", "project_doc_max_bytes", "true"),
+                                 ("project_doc_fallback_filenames = [1]\n", "project_doc_fallback_filenames", "1"),
+                                 ('project_doc_fallback_filenames = "A.md"\n', "project_doc_fallback_filenames", "A.md")):
+            _write(os.path.join(ch, "config.toml"), text)
+            try:
+                got = codex_project_doc_findings(cfg)
+            except Exception as exc:  # a bad config must never raise
+                got = ["RAISED %r" % exc]
+            check(any("CODEX CONFIG" in f and key in f and shown.lower() in f.lower() for f in got),
+                  "codex config: invalid %s is one finding naming key and value" % text.strip())
+        _write(os.path.join(ch, "config.toml"), 'project_doc_max_bytes = "big"\n')
+        cap_r = _Capture()
+        rc = report_mode(cfg, cap_r)
+        check(rc == EXIT_FINDINGS and "CODEX CONFIG" in cap_r.text() and "STORE MISSING" in cap_r.text(),
+              "codex config: a bad config prints its finding AND the other findings still print")
+        _write(os.path.join(ch, "config.toml"), 'x = """\nunterminated\n')
+        check(any("CODEX CONFIG" in f for f in codex_project_doc_findings(cfg)),
+              "codex config: an unterminated string is a finding, not a crash")
+        os.remove(os.path.join(ch, "config.toml"))
+
         # soft: global + project over the cap while the project alone is under 90%
         _write(os.path.join(ch, "config.toml"), "project_doc_max_bytes = 1000\n")
         _write(os.path.join(root, "AGENTS.md"), "p" * 500)
         _write(os.path.join(ch, "AGENTS.md"), "g" * 600)
         got = codex_project_doc_findings(cfg)
         check(len(got) == 1 and "(soft)" in got[0], "codex docs: global + project over the cap is a labelled soft signal")
+        os.remove(os.path.join(root, "AGENTS.md"))
+        _write(os.path.join(ch, "AGENTS.md"), "g" * 1200)
+        check(codex_project_doc_findings(cfg) == [], "codex docs: no project docs -> no soft signal from the global file alone")
+        _write(os.path.join(root, "AGENTS.md"), "p" * 500)
+        # unreadable project file: no exception, recorded as a blind read
+        os.chmod(os.path.join(root, "AGENTS.md"), 0)
+        if not os.access(os.path.join(root, "AGENTS.md"), os.R_OK):
+            bb.blind_reset()
+            try:
+                codex_project_doc_findings(cfg)
+                raised = False
+            except Exception:
+                raised = True
+            check(not raised and len(bb.blind_reads()) >= 1, "codex docs: an unreadable AGENTS.md is a blind read, not a crash")
+        os.chmod(os.path.join(root, "AGENTS.md"), 0o644)
         # parent chain: git root above the scope root counts
         import subprocess
         subprocess.run(["git", "init", "-q", os.path.join(d, "work")], check=True)
@@ -1641,6 +1885,8 @@ def selftest():
         os.remove(os.path.join(ch, "AGENTS.md"))
         got = codex_project_doc_findings(cfg)
         check(len(got) == 1 and "900 of 1000" in got[0], "codex docs: AGENTS.md files from the git root down are summed")
+        cfg["agent"]["codex_home"] = "~/no-such-dir-selftest"
+        check(_codex_home_of(cfg) == os.path.expanduser("~/no-such-dir-selftest"), "codex docs: ~ in codex_home is expanded")
 
     print("\nSELFTEST:", "PASS" if ok[0] else "FAIL")
     return 0 if ok[0] else 1
@@ -1662,10 +1908,7 @@ def main():
         cfg = notes_config.load()
     except notes_config.ConfigError as exc:
         sys.exit("memory_hygiene_canary: bad config: %s" % exc)
-    try:
-        return report_mode(cfg)
-    except notes_config.ConfigError as exc:
-        sys.exit("memory_hygiene_canary: bad Codex config: %s" % exc)
+    return report_mode(cfg)
 
 
 if __name__ == "__main__":
