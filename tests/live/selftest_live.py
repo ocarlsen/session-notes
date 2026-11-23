@@ -37,8 +37,8 @@ every captured log, and the sandbox Codex auth.json is wiped at teardown.
 
 Watch mode (--watch). One tmux session `watch` in the sandbox server: a 3-row status pane on top,
 the Claude session under test on the left and the Codex one on the right (each a read-only nested
-attach of the real session), in a window fixed at 180x50. Attach with `tmux -L selftest attach`
-(a symlink named `selftest` in the default tmux socket directory points at the sandbox socket and
+attach of the real session), in a window fixed at 180x50. Attach with `tmux -L sn-watch attach`
+(a symlink named `sn-watch` in the default tmux socket directory points at the sandbox socket and
 is removed at teardown). Every step shows a chapter title, holds (--pace), can wait for Enter
 (--step), and writes a status JSON a film storyboard can follow. Because the run is public, every
 visible pane is scanned at each step for the real home path, the username, the hostname, key-shaped
@@ -64,6 +64,7 @@ import time
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+SOCKET_LABEL = "sn-watch"  # `tmux -L sn-watch attach` reaches the sandbox server through this link
 SRC_REPO = os.path.dirname(os.path.dirname(HERE))
 
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_*-]{20,}")
@@ -293,8 +294,22 @@ def call_commands(item):
                 except ValueError:
                     pass
             else:
-                cmds.append(lit[1:-1])
+                cmds.append(_js_subst(lit[1:-1], src))
     return cmds
+
+
+def _js_subst(tmpl, src):
+    """Resolve `${name}` in a JS template literal from plain string bindings in the same input
+    (`let|const|var name = "..."`, as Codex writes `let p="/repo/bin/codex_save.py"`). A name with
+    no such binding, or bound twice, stays as written, so it can never match a command."""
+    binds = {}
+    for m in re.finditer(r'\b(?:let|const|var)\s+([A-Za-z_$][\w$]*)\s*=\s*("(?:[^"\\]|\\.)*")\s*[;,\n]', src):
+        try:
+            v = json.loads(m.group(2))
+        except ValueError:
+            continue
+        binds[m.group(1)] = None if m.group(1) in binds else v
+    return re.sub(r"\$\{([A-Za-z_$][\w$]*)\}", lambda m: binds.get(m.group(1)) or m.group(0), tmpl)
 
 
 def is_codex_save_commit(cmd, _depth=0):
@@ -553,7 +568,7 @@ def _stale_note(link):
             c.settimeout(1)
             try:
                 c.connect(link)
-                return " (a tmux server answers on it: another `tmux -L selftest` is running)"
+                return " (a tmux server answers on it: another `tmux -L sn-watch` is running)"
             except ConnectionRefusedError:
                 return " (a stale socket, nothing answers on it: remove it with rm if it is not yours)"
             except OSError:
@@ -566,9 +581,9 @@ def _stale_note(link):
 
 
 def link_selftest_socket(sock_dir, target):
-    """Make `tmux -L selftest` reach the sandbox server: symlink <sock_dir>/selftest -> target.
+    """Make `tmux -L sn-watch` reach the sandbox server: symlink <sock_dir>/sn-watch -> target.
     Refuses (Abort) when anything named selftest is already there. -> True when sock_dir was created."""
-    link = os.path.join(sock_dir, "selftest")
+    link = os.path.join(sock_dir, SOCKET_LABEL)
     if os.path.lexists(link):
         raise Abort("%s already exists%s; refusing to start a second watch run on top of it" % (link, _stale_note(link)))
     created = False
@@ -581,7 +596,7 @@ def link_selftest_socket(sock_dir, target):
 
 def unlink_selftest_socket(sock_dir, target, created):
     """Remove the symlink only if it is still ours (points at `target`); drop sock_dir if we made it."""
-    link = os.path.join(sock_dir, "selftest")
+    link = os.path.join(sock_dir, SOCKET_LABEL)
     try:
         if os.path.islink(link) and os.readlink(link) == target:
             os.remove(link)
@@ -868,6 +883,21 @@ def selftest():
                 {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": commit_js},
                 {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text(release)})
         check("commit proof (d): custom_tool_call commit + paired release output passes", codex_commit_proven(d))
+    var_js = 'let p="/x/repo/bin/codex_save.py"; let r=await tools.exec_command({cmd:`python3 ${p} commit`});'
+    with tempfile.TemporaryDirectory() as d:
+        rollout(d, "dv.jsonl",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": var_js},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text(release)})
+        check("commit proof (d): a ${p} template bound to the codex_save path passes", codex_commit_proven(d))
+    for bad, why in ((var_js.replace('let p=', 'let q='), "an unbound ${p}"),
+                     (var_js.replace('commit`', 'stage`'), "a bound ${p} running stage"),
+                     ('let p="/x/repo/bin/other.py"; ' + var_js[len('let p="/x/repo/bin/codex_save.py"; '):], "${p} bound to another script"),
+                     ('let p="/x/a/bin/codex_save.py"; ' + var_js, "${p} bound twice")):
+        with tempfile.TemporaryDirectory() as d:
+            rollout(d, "dn.jsonl",
+                    {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": bad},
+                    {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text(release)})
+            check("commit proof: NEGATIVE control, %s fails" % why, not codex_commit_proven(d))
     with tempfile.TemporaryDirectory() as d:
         rollout(d, "e.jsonl",
                 {"type": "function_call", "call_id": "c2", "name": "shell",
@@ -1104,7 +1134,7 @@ def selftest():
         check("socket: dir follows TMUX_TMPDIR", tmux_socket_dir({"TMUX_TMPDIR": d}).startswith(d + os.sep)
               and tmux_socket_dir({}).startswith("/tmp/tmux-"))
         created = link_selftest_socket(sd, "/x/target")
-        check("socket: link created (and the missing dir)", created and os.readlink(os.path.join(sd, "selftest")) == "/x/target")
+        check("socket: link created (and the missing dir)", created and os.readlink(os.path.join(sd, SOCKET_LABEL)) == "/x/target")
         try:
             link_selftest_socket(sd, "/x/other")
             refused = False
@@ -1112,11 +1142,11 @@ def selftest():
             refused = "already exists" in str(exc)
         check("socket: NEGATIVE control, an existing `selftest` makes the start refuse", refused)
         unlink_selftest_socket(sd, "/not/ours", False)
-        check("socket: a link that is not ours is left alone", os.path.islink(os.path.join(sd, "selftest")))
+        check("socket: a link that is not ours is left alone", os.path.islink(os.path.join(sd, SOCKET_LABEL)))
         unlink_selftest_socket(sd, "/x/target", created)
         check("socket: removed with the dir we made", not os.path.exists(sd))
         os.makedirs(sd)
-        with open(os.path.join(sd, "selftest"), "w") as fh:
+        with open(os.path.join(sd, SOCKET_LABEL), "w") as fh:
             fh.write("a regular file")
         try:
             link_selftest_socket(sd, "/x/t")
@@ -1146,7 +1176,7 @@ def selftest():
                 execute(live)
             finally:
                 shutil.rmtree(live.root, ignore_errors=True)
-            return os.path.lexists(os.path.join(live.sock_dir, "selftest")) or os.path.exists(live.sock_dir)
+            return os.path.lexists(os.path.join(live.sock_dir, SOCKET_LABEL)) or os.path.exists(live.sock_dir)
         for label, exc in (("a normal run", None), ("an Abort", Abort("x")), ("Ctrl-C", KeyboardInterrupt()),
                            ("a crash", RuntimeError("boom")), ("q in the status pane", Quit("q"))):
             check("socket: link removed after %s" % label, not link_then(exc))
@@ -1292,7 +1322,7 @@ def selftest():
                     refused = True
                 check("teardown: the selftest link and the sandbox socket are gone; with the sandbox dir gone tmux is "
                       "refused, never redirected to the default server",
-                      not os.path.lexists(os.path.join(live.sock_dir, "selftest")) and not os.path.exists(live.sock_target)
+                      not os.path.lexists(os.path.join(live.sock_dir, SOCKET_LABEL)) and not os.path.exists(live.sock_target)
                       and refused)
                 shutil.rmtree(live.root, ignore_errors=True)
     else:
@@ -1401,7 +1431,7 @@ class Live:
         self.plan = []
         self.status_log = []               # every status dict written (the selftest reads it)
         self.last_scan = 0.0
-        self.sock_dir = tmux_socket_dir()  # where `tmux -L selftest` looks (the user's default dir)
+        self.sock_dir = tmux_socket_dir()  # where `tmux -L sn-watch` looks (the user's default dir)
         self.sock_created = False
         self.sock_linked = False
         self.sock_target = None
@@ -1595,7 +1625,7 @@ class Live:
                      ("-g", "remain-on-exit", "off"), ("-g", "mouse", "off"),
                      ("-g", "pane-border-style", "fg=colour238"), ("-g", "pane-active-border-style", "fg=colour238"),
                      ("-s", "escape-time", "0"),
-                     # a bare `tmux -L selftest attach` lands on the watch window, not the newest session
+                     # a bare `tmux -L sn-watch attach` lands on the watch window, not the newest session
                      ("-s", "command-alias[100]", "attach=attach-session -t =watch")):
             self.tmux("set", *args)
         self.tmux("resize-window", "-t", "=watch:", "-x", str(WATCH_W), "-y", str(WATCH_H))
@@ -2533,7 +2563,7 @@ class Live:
 
     def go(self):
         if self.watch:  # refuse before any cost: a leftover `selftest` link means another run (or a killed one)
-            link = os.path.join(self.sock_dir, "selftest")
+            link = os.path.join(self.sock_dir, SOCKET_LABEL)
             if os.path.lexists(link):
                 link_selftest_socket(self.sock_dir, "/nonexistent")  # raises the Abort naming the link
         self.before = snapshot(self.real_home)
@@ -2562,7 +2592,7 @@ class Live:
         self.start_tmux()
         if self.watch:
             self.link_socket()
-            print("watch: attach with   tmux -L selftest attach\nwatch: status file %s" % self.status_path)
+            print("watch: attach with   tmux -L sn-watch attach\nwatch: status file %s" % self.status_path)
             sys.stdout.flush()
         if any(self.want(f) for f in ("peers", "bcast", "bus", "refresh", "live")):
             if self.have["claude"]:
@@ -2636,7 +2666,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the sandbox and print its path")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--watch", action="store_true",
-                    help="one tmux window to watch and film: status pane, Claude left, Codex right (attach: tmux -L selftest attach)")
+                    help="one tmux window to watch and film: status pane, Claude left, Codex right (attach: tmux -L sn-watch attach)")
     ap.add_argument("--pace", type=float, default=None,
                     help="watch mode: scale the holds on each step's title (~2 s) and result (~4 s); default 1, 0 = none")
     ap.add_argument("--step", action="store_true", help="watch mode: hold each step until Enter is pressed in the status pane")

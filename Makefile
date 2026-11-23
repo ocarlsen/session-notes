@@ -23,7 +23,7 @@ hooks:
 selftest-live:
 	python3 tests/live/selftest_live.py
 
-# The same live run built to be watched and filmed: `tmux -L selftest attach` while it runs.
+# The same live run built to be watched and filmed: `tmux -L sn-watch attach` while it runs.
 # Pass options through ARGS, e.g. make selftest-watch ARGS="--pace 2 --step".
 selftest-watch:
 	python3 tests/live/selftest_live.py --watch $(ARGS)

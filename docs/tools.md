@@ -504,11 +504,11 @@ left (89x46) and the Codex one on the right (90x46), each a read-only nested att
 (`tmux attach -r -f ignore-size`) of the real session. The side follows the step's focus session.
 Attach from another terminal with
 
-    tmux -L selftest attach
+    tmux -L sn-watch attach
 
-(a symlink named `selftest` in your default tmux socket directory, `$TMUX_TMPDIR` or `/tmp`
+(a symlink named `sn-watch` in your default tmux socket directory, `$TMUX_TMPDIR` or `/tmp`
 followed by `tmux-<uid>/`, points at the sandbox socket; a sandbox `attach` alias lands on the
-`watch` window. The run refuses to start if `selftest` already exists there, and removes the link
+`watch` window. The run refuses to start if `sn-watch` already exists there, and removes the link
 in the same teardown as everything else, on every exit path). Needs a terminal of at least 180x50.
 
 Steps that run as headless one-shots in CI mode (boot, reflect, em dash, checkout) run as
