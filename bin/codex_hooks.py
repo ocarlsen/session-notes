@@ -532,6 +532,8 @@ def selftest():
         d["hooks"]["Stop"].append({"hooks": [foreign]})
         d["hooks"]["UserPromptSubmit"][0]["hooks"].insert(0, foreign)
         d["hooks"]["PermissionRequest"] = [{"matcher": "Bash", "hooks": [foreign]}]
+        # now that PreToolUse is ours too: a user's own PreToolUse group must survive beside it
+        d["hooks"]["PreToolUse"].append({"matcher": "Bash", "hooks": [foreign]})
         d["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = 99  # a stale edit of ours
         d["model"] = "keep-me"
         with open(path, "w") as fh:
@@ -544,6 +546,9 @@ def selftest():
         check("foreign: other events and keys untouched", n["hooks"]["PermissionRequest"] == d["hooks"]["PermissionRequest"]
               and n["model"] == "keep-me")
         check("foreign: Stop keeps the private hook", foreign["command"] in cmds(n, "Stop"))
+        check("foreign: a private PreToolUse group survives beside the checkout guard",
+              {"matcher": "Bash", "hooks": [foreign]} in n["hooks"]["PreToolUse"]
+              and sum(c.endswith(" checkout_guard") for c in cmds(n, "PreToolUse")) == 1)
         check("foreign: mixed group keeps the private hook", foreign["command"] in cmds(n, "UserPromptSubmit"))
         check("foreign: our hooks restored once, not duplicated", sum(
             "session_bus_hook" in c for c in cmds(n, "UserPromptSubmit")) == 1
