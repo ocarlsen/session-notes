@@ -129,7 +129,7 @@ review verdict (also in docs/tools.md).
 ## Works with Codex
 
 The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
-`sh install.sh --codex` links `$refresh`, `$reflect` and `$rnr` into
+`sh install.sh --codex` links `$refresh`, `$reflect`, `$rnr` and `$review` into
 `~/.codex/skills` and registers hooks in `~/.codex/hooks.json`: the boot load of the index
 and RESUME (startup, resume, compaction) plus the per-prompt hooks Claude Code gets (time
 sense, pane registry, bus mail, em-dash guard). Trust them once in `/hooks`. Codex keeps its own store

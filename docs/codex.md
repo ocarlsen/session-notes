@@ -36,7 +36,7 @@ sh install.sh --codex
 
 It asks `[y/N]` before each step:
 
-1. Link the three Codex skills into `~/.codex/skills/`.
+1. Link the four Codex skills (`$reflect`, `$refresh`, `$rnr`, `$review`) into `~/.codex/skills/`.
 2. Write the hook launcher, `~/.local/bin/session-notes`: a small generated script with
    this checkout's path baked in (see Hooks below). It refuses to overwrite a file at that
    path that is not a session-notes launcher.
