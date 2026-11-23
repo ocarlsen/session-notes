@@ -82,6 +82,7 @@ LS_SHIM = """#!/bin/sh
 for a in "$@"; do
   case "$a" in
     --) break ;;
+    --*) ;;
     -*[lgo]*) exec /bin/ls -n "$@" ;;
   esac
 done
@@ -542,27 +543,105 @@ def host_names():
     return sorted(names)
 
 
-def screen_needles(real_home, user, hosts, leak_terms):
-    """The screen guard's needles by class. A class with no needle is simply not scanned."""
-    return {"home": [real_home] if real_home and real_home not in ("/", "") else [],
-            "username": [user] if user and len(user) >= 3 else [],
+def _names(x):
+    """A str or an iterable of str -> a de-duplicated list, empties dropped."""
+    items = [x] if isinstance(x, str) else list(x or [])
+    out = []
+    for i in items:
+        if i and i not in out:
+            out.append(i)
+    return out
+
+
+def real_identity():
+    """(home dirs, user names) of the REAL account. The passwd entry of the real uid comes first, so
+    an unset or overridden USER/HOME cannot make a class vanish; the environment adds to it."""
+    homes, names = [], []
+    try:
+        pw = pwd.getpwuid(os.getuid())
+        homes.append(pw.pw_dir)
+        names.append(pw.pw_name)
+    except (KeyError, OSError):
+        pass
+    homes.append(os.path.expanduser("~"))
+    names += [os.environ.get("USER", ""), os.environ.get("LOGNAME", "")]
+    return _names(homes), _names(names)
+
+
+def screen_needles(real_home, user, hosts, leak_terms, words=(), allow=()):
+    """The screen guard's needles by class. A class with no needle is simply not scanned.
+    `real_home` and `user` are a str or a list. `words` (compiled regexes) and `allow` (lowercase
+    phrases) come from tests/leak_scan.py's reader, so a terms file means the same thing here."""
+    return {"home": [h for h in _names(real_home) if h not in ("/", "")],
+            "username": [u for u in _names(user) if len(u) >= 3],
             "hostname": list(hosts),
-            "terms": [t for t in leak_terms if t]}
+            "terms": [t for t in leak_terms if t],
+            "words": list(words), "allow": [p for p in allow if p]}
+
+
+def empty_classes(needles, want_terms=False):
+    """Needle classes that would scan nothing; the watch run refuses to start with any of these."""
+    out = [c for c in ("home", "username", "hostname") if not needles.get(c)]
+    if want_terms and not (needles.get("terms") or needles.get("words")):
+        out.append("terms")
+    return out
+
+
+def _screen_views(text):
+    """The screen as read in rows, and with the row breaks removed: a needle that crosses the
+    pane's right edge arrives as two fragments, and the viewer reads it across the wrap."""
+    t = text or ""
+    return [t, t.replace("\r", "").replace("\n", "")]
 
 
 def screen_hits(text, needles):
     """Classes (never the matched text) of everything in `text` the guard forbids on screen."""
     hits = []
-    low = (text or "").lower()
-    for cls in ("home", "username", "hostname", "terms"):
-        if any(n.lower() in low for n in needles.get(cls, [])):
-            hits.append("leak term" if cls == "terms" else cls)
-    if KEY_RE.search(text or ""):
+    views = _screen_views(text)
+    lows = [v.lower() for v in views]
+    for cls in ("home", "username", "hostname"):
+        if any(n.lower() in low for n in needles.get(cls, []) for low in lows):
+            hits.append(cls)
+    allow = needles.get("allow", [])
+    term_hit = any(rx.search(v) for rx in needles.get("words", []) for v in views)
+    for low in lows:
+        for t in needles.get("terms", []):
+            t = t.lower()
+            i = low.find(t)
+            while i != -1 and not term_hit:
+                if not leak_scan_ref()._inside_allowed(low, i, i + len(t), allow):
+                    term_hit = True
+                i = low.find(t, i + 1)
+    if term_hit:
+        hits.append("leak term")
+    if any(KEY_RE.search(v) for v in views):
         hits.append("key shaped string")
     return hits
 
 
+def leak_scan_ref():
+    """tests/leak_scan.py, the one reader of the leak-terms file format (loaded by path)."""
+    mod = sys.modules.get("_sn_leak_scan")
+    if mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_sn_leak_scan", os.path.join(os.path.dirname(HERE), "leak_scan.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_sn_leak_scan"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+def load_leak_spec(path):
+    """(terms, allow, words) from a leak-terms file, read by leak_scan.load_terms (`w:` word entries,
+    `!` allowed phrases, comments)."""
+    spec = leak_scan_ref().load_terms(path)
+    if spec is None:
+        raise Abort("--leak-terms: cannot read %s" % path)
+    return spec
+
+
 def load_leak_terms(path):
+    """Plain term lines only, case kept (kept for callers of the old name; the guard uses load_leak_spec)."""
     with open(path, encoding="utf-8") as fh:
         return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
 
@@ -574,7 +653,7 @@ def tmux_socket_dir(environ=None):
 
 
 def _stale_note(link):
-    """Say what an existing `selftest` is: a dangling link, a socket nothing answers on, or live."""
+    """Say what an existing `sn-watch` link is: a dangling link, a socket nothing answers on, or live."""
     try:
         if os.path.islink(link) and not os.path.exists(link):
             return " (a dangling link left by a killed run: remove it with rm)"
@@ -597,7 +676,7 @@ def _stale_note(link):
 
 def link_selftest_socket(sock_dir, target):
     """Make `tmux -L sn-watch` reach the sandbox server: symlink <sock_dir>/sn-watch -> target.
-    Refuses (Abort) when anything named selftest is already there. -> True when sock_dir was created."""
+    Refuses (Abort) when anything named sn-watch is already there. -> True when sock_dir was created."""
     link = os.path.join(sock_dir, SOCKET_LABEL)
     if os.path.lexists(link):
         raise Abort("%s already exists%s; refusing to start a second watch run on top of it" % (link, _stale_note(link)))
@@ -1143,7 +1222,7 @@ def selftest():
             fh.write("# comment\nAlphaCorp\n\n  BetaCo  \n")
         check("guard: leak-terms file: comments and blanks skipped", load_leak_terms(lt) == ["AlphaCorp", "BetaCo"])
 
-    # the `selftest` socket link: refuse when present, remove on every exit path
+    # the `sn-watch` socket link: refuse when present, remove on every exit path
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
         sd = os.path.join(d, "tmux-1")
         check("socket: dir follows TMUX_TMPDIR", tmux_socket_dir({"TMUX_TMPDIR": d}).startswith(d + os.sep)
@@ -1155,7 +1234,7 @@ def selftest():
             refused = False
         except Abort as exc:
             refused = "already exists" in str(exc)
-        check("socket: NEGATIVE control, an existing `selftest` makes the start refuse", refused)
+        check("socket: NEGATIVE control, an existing `sn-watch` makes the start refuse", refused)
         unlink_selftest_socket(sd, "/not/ours", False)
         check("socket: a link that is not ours is left alone", os.path.islink(os.path.join(sd, SOCKET_LABEL)))
         unlink_selftest_socket(sd, "/x/target", created)
@@ -1168,7 +1247,7 @@ def selftest():
             refused = False
         except Abort:
             refused = True
-        check("socket: a regular file named selftest also refuses", refused)
+        check("socket: a regular file named sn-watch also refuses", refused)
 
         def watch_ns(**kw):
             base = dict(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0, step=False,
@@ -1203,7 +1282,7 @@ def selftest():
                 refused = False
             except Abort as exc:
                 refused = "already exists" in str(exc)
-            check("socket: go() refuses before any setup when `selftest` exists", refused and live.before is None)
+            check("socket: go() refuses before any setup when `sn-watch` exists", refused and live.before is None)
         finally:
             shutil.rmtree(live.root, ignore_errors=True)
 
@@ -1223,8 +1302,160 @@ def selftest():
         real = subprocess.run(["/bin/ls", "-la", d], capture_output=True, text=True).stdout
         check("ls shim: NEGATIVE control, plain /bin/ls -la does show it", me in real)
         check("ls shim: a short listing stays short", subprocess.run([sh, d], capture_output=True, text=True).stdout.strip() == "ls")
+        check("ls shim: a long option such as --color=auto does not make a long listing",
+              subprocess.run([sh, "--color=auto", d], capture_output=True, text=True).stdout.strip() == "ls"
+              and subprocess.run([sh, "--color=auto", "-la", d], capture_output=True, text=True).stdout.count(me) == 0)
+    # ---- fix round 1: wrapped needles, leak-terms syntax, [wt] config, identity, abort paths ----
+    nd2 = screen_needles(FAKE_HOME, "zedname", ["zedhost"], [])
+    check("guard: NEGATIVE control, a home path wrapped across the pane edge is flagged",
+          screen_hits("x" * 80 + FAKE_HOME[:-1] + "\n" + FAKE_HOME[-1:] + "/Projects", nd2) == ["home"])
+    check("guard: NEGATIVE control, a user name wrapped across the pane edge is flagged",
+          "username" in screen_hits("by zed\nname today", nd2))
+    check("guard: unwrapped clean text over several rows stays clean", screen_hits("a\\nb\\nzed\\nhost2", nd2) == [])
+    with tempfile.TemporaryDirectory() as d:
+        lt = os.path.join(d, "terms.txt")
+        with open(lt, "w") as fh:
+            fh.write("# c\nAlphaCorp\nw:Zed\n!alphacorp is fine here\n")
+        terms, allow, words = load_leak_spec(lt)
+        nd3 = screen_needles(FAKE_HOME, "zedname", ["zedhost"], terms, words, allow)
+        check("guard: leak-terms syntax is leak_scan's: a `w:` entry flags the whole word",
+              screen_hits("call Zed today", nd3) == ["leak term"], str(screen_hits("call Zed today", nd3)))
+        check("guard: a `w:` entry does not flag a longer word or another case",
+              screen_hits("Zedekiah and zed", nd3) == [])
+        check("guard: a plain term flags, in any case", screen_hits("see ALPHACORP", nd3) == ["leak term"])
+        check("guard: an allowed phrase is not flagged", screen_hits("alphacorp is fine here", nd3) == [])
+        check("guard: NEGATIVE control, the old plain-line reading would have missed the `w:` entry",
+              screen_hits("call Zed today", screen_needles(FAKE_HOME, "zedname", ["zedhost"], load_leak_terms(lt))) == [])
+        check("guard: needle classes: a comments-only terms file leaves the terms class empty",
+              (lambda sp: empty_classes(screen_needles(FAKE_HOME, "zedname", ["h3"], sp[0], sp[2], sp[1]), True))(
+                  (lambda: (open(os.path.join(d, "e.txt"), "w").write("# only\n"), load_leak_spec(os.path.join(d, "e.txt")))[1])())
+              == ["terms"])
+    check("guard: a class with no needle is named by empty_classes",
+          empty_classes(screen_needles("", "", [], [])) == ["home", "username", "hostname"])
+    saved_env = dict(os.environ)
+    try:
+        for k in ("USER", "LOGNAME"):
+            os.environ.pop(k, None)
+        os.environ["HOME"] = "/nonexistent-home"
+        homes_, names_ = real_identity()
+        pw_ = pwd.getpwuid(os.getuid())
+        check("guard: needles come from the passwd entry when USER is unset and HOME is overridden",
+              pw_.pw_name in names_ and pw_.pw_dir in homes_ and "/nonexistent-home" in homes_, str((homes_, names_)))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+    # B3: one `[wt]` table, however many rows add it; parsed by tomllib where the interpreter has it
+    live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False))
+    try:
+        for _ in range(2):  # the review row runs once per CLI
+            live.ensure_wt_token_command()
+        with open(live.cfg) as fh:
+            cfg_text = fh.read()
+        check("config: the review row leaves exactly one [wt] table", cfg_text.count("[wt]") == 1, cfg_text)
+        sys.path.insert(0, os.path.join(SRC_REPO, "bin"))
+        import notes_config
+        check("config: notes_config parses the sandbox config after two review rows",
+              notes_config.parse_toml(cfg_text).get("wt", {}).get("token_command") == "echo faketoken")
+        toml_py = [p for p in (sys.executable, shutil.which("python3.13"), shutil.which("python3.12"),
+                               shutil.which("python3.11"), "/opt/homebrew/bin/python3.12") if p and os.path.exists(p)]
+        ran = 0
+        for py in toml_py:
+            r = subprocess.run([py, "-c", "import sys\ntry:\n import tomllib\nexcept ImportError:\n sys.exit(7)\n"
+                                "tomllib.load(open(sys.argv[1], 'rb'))", live.cfg], capture_output=True, text=True)
+            if r.returncode != 7:
+                ran += 1
+                check("config: tomllib (%s) accepts the sandbox config" % os.path.basename(py), r.returncode == 0, r.stderr[-200:])
+                break
+        if not ran:
+            print("skip tomllib parse of the sandbox config: no Python 3.11+ found")
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
+    # N10: a signal between makedirs and the end of link_socket must not leak the link or the made dir
+    with tempfile.TemporaryDirectory() as d:
+        live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0,
+                                       step=False, leak_terms=None, no_hold_final=True))
+        live.sock_dir = os.path.join(d, "tmux-atomic")
+        live.tmux = lambda *a, **k: argparse.Namespace(stdout="/x/t\n", returncode=0)
+        real_symlink = os.symlink
+
+        def boom(src, dst):
+            real_symlink(src, dst)  # the link lands, then the signal arrives
+            raise KeyboardInterrupt("signal 15")
+        os.symlink = boom
+        try:
+            link_failed = False
+            try:
+                live.link_socket()
+            except KeyboardInterrupt:
+                link_failed = True
+        finally:
+            os.symlink = real_symlink
+        live.unlink_socket()
+        check("socket: a signal right after the link is created still removes the link and the dir we made",
+              link_failed and not os.path.lexists(os.path.join(live.sock_dir, SOCKET_LABEL)) and not os.path.exists(live.sock_dir))
+        shutil.rmtree(live.root, ignore_errors=True)
+    # N6: every abort path writes phase `aborted` with the reason, and nothing overwrites it
+    for label, exc, want in (("an Abort", Abort("because x"), "because x"), ("Ctrl-C", KeyboardInterrupt(), "interrupted"),
+                             ("a crash", RuntimeError("boom"), "crashed"), ("q", Quit("stopped from q"), "stopped from q")):
+        live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0,
+                                       step=False, leak_terms=None, no_hold_final=True))
+        try:
+            def go_raise(exc=exc):
+                raise exc
+            live.go = go_raise
+            live.installed, live.before = True, {}
+            live.begin_step = lambda *a, **k: None
+            execute(live)
+            live.write_status(phase="done", title="late")  # a later transition must not rewrite the file
+            with open(live.status_path) as fh:
+                st = json.load(fh)
+            check("status: %s writes phase aborted with the reason, and it stays" % label,
+                  st.get("phase") == "aborted" and want in st.get("note", "") and live.status_log[-1].get("phase") == "aborted", str(st))
+        finally:
+            shutil.rmtree(live.root, ignore_errors=True)
+    # N2: a guard trip in the final hold is a failed run with its message
+    live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0,
+                                   step=False, leak_terms=None, no_hold_final=True))
+    try:
+        live.go = lambda: None
+
+        def hold_trips(wait=True):
+            raise Abort("screen guard: the status pane showed username; the watch panes were cleared and the run stopped")
+        live.finish_watch = hold_trips
+        res2, lines2, _ = execute(live)
+        check("guard trip in the final hold: the run fails, with the message in the failure lines",
+              bool(lines2) and any("screen guard" in ln for ln in lines2) and any(r["feature"] == "run" for r in res2), str(lines2))
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
+    # N1: after a trip the cleared panes are never re-attached by the next step
+    live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0,
+                                   step=False, leak_terms=None, no_hold_final=True))
+    try:
+        calls = []
+        live.default_focus = lambda: calls.append(1)
+        live.stopping = True
+        live.begin_step("realdirs", "both", quick=True)
+        after_trip = len(calls)
+        live.stopping = False
+        live.begin_step("realdirs", "both", quick=True)
+        check("guard: begin_step does not re-attach sessions once the run is stopping (and does otherwise)",
+              after_trip == 0 and len(calls) == 1, str((after_trip, len(calls))))
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
+    # N3: the watch run refuses to start when a class has nothing to scan for
+    live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0,
+                                   step=False, leak_terms=None, no_hold_final=True))
+    try:
+        live.needles = screen_needles("", "", [], [])
+        try:
+            live.go()
+            refused = False
+        except Abort as exc:
+            refused = "nothing to scan for" in str(exc) and "username" in str(exc)
+        check("guard: --watch refuses to start with an empty needle class", refused and live.before is None)
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
     # status file, pace, keys, step mode (no tmux)
-    live = Live(watch_ns(pace=0.0)) if False else None
     ns = argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0, step=False,
                             leak_terms=None, no_hold_final=True)
     live = Live(ns)
@@ -1344,6 +1575,19 @@ def selftest():
                     blank = all(not live.tmux("capture-pane", "-p", "-t", pid).stdout.strip() for pid in live.panes_of.values())
                     check("guard through a real pane: planted %s trips, names pane and class, not the text, and clears the panes" % cls,
                           bool(msg) and "claude pane" in msg and cls in msg and text not in msg and blank, str(msg))
+                # fix round 1: a needle that crosses column 89 of a real 89 column pane
+                live.stopping = False
+                wrapped = "x" * 80 + " " + FAKE_HOME + "name/more"
+                show(wrapped)
+                plain = live.tmux("capture-pane", "-p", "-t", live.panes_of["claude"]).stdout
+                try:
+                    live.guard()
+                    msg = None
+                except Abort as exc:
+                    msg = str(exc)
+                check("guard through a real pane: NEGATIVE control, a home path and user name crossing column 89 trip",
+                      FAKE_HOME not in plain and "zedname" not in plain and bool(msg) and "home" in msg and "username" in msg,
+                      "plain capture split: %s; msg=%s" % (FAKE_HOME not in plain, msg))
             finally:
                 live.teardown(False)
                 try:
@@ -1351,7 +1595,7 @@ def selftest():
                     refused = False
                 except FileNotFoundError:
                     refused = True
-                check("teardown: the selftest link and the sandbox socket are gone; with the sandbox dir gone tmux is "
+                check("teardown: the sn-watch link and the sandbox socket are gone; with the sandbox dir gone tmux is "
                       "refused, never redirected to the default server",
                       not os.path.lexists(os.path.join(live.sock_dir, SOCKET_LABEL)) and not os.path.exists(live.sock_target)
                       and refused)
@@ -1445,9 +1689,11 @@ class Live:
         self.pace = float(getattr(a, "pace", None) if getattr(a, "pace", None) is not None else 1.0)
         self.step_mode = bool(getattr(a, "step", False))
         self.hold_final = not getattr(a, "no_hold_final", False)
-        self.leak_terms = load_leak_terms(a.leak_terms) if getattr(a, "leak_terms", None) else []
-        self.user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-        self.needles = screen_needles(self.real_home, self.user, host_names(), self.leak_terms)
+        spec = load_leak_spec(a.leak_terms) if getattr(a, "leak_terms", None) else ([], [], [])
+        self.leak_terms = spec[0]
+        homes, names = real_identity()
+        self.user = names[0] if names else ""
+        self.needles = screen_needles([self.real_home] + homes, names, host_names(), spec[0], spec[2], spec[1])
         self.status_path = j("status.json")
         self.fifo = j("keys.fifo")
         self.fifo_rd = self.fifo_wr = None
@@ -1460,7 +1706,7 @@ class Live:
         self.state = {"claude": "idle", "codex": "idle"}
         self.cur = {"step": 0, "total": 0, "id": "", "title": "", "phase": "title"}
         self.plan = []
-        self.status_log = []               # every status dict written (the selftest reads it)
+        self.status_log = []               # every status dict written (--selftest reads it)
         self.last_scan = 0.0
         self.sock_dir = tmux_socket_dir()  # where `tmux -L sn-watch` looks (the user's default dir)
         self.sock_created = False
@@ -1469,6 +1715,7 @@ class Live:
         self.step_no = 0
         self.stopping = False             # the run is ending (abort, guard, quit): no more holds
         self.guard_tripped = False
+        self.aborted = False              # the status file carries phase `aborted` and is final
         self.tmux_bin = shutil.which("tmux") or "tmux"
 
     # -- environment ----------------------------------------------------------------------
@@ -1678,9 +1925,12 @@ class Live:
 
     def link_socket(self):
         target = os.path.realpath(self.tmux("display", "-p", "#{socket_path}").stdout.strip())
+        # Ownership is recorded BEFORE the link exists: unlink_selftest_socket removes only a link
+        # that points at `target`, so a signal anywhere in here can neither leak ours nor touch another.
         self.sock_target = target
-        self.sock_created = link_selftest_socket(self.sock_dir, target)
+        self.sock_created = not os.path.isdir(self.sock_dir)
         self.sock_linked = True
+        link_selftest_socket(self.sock_dir, target)
 
     def unlink_socket(self):
         if self.sock_linked:
@@ -1771,7 +2021,7 @@ class Live:
             return
         self.last_scan = now
         for name in ("status", "claude", "codex"):
-            r = self.tmux("capture-pane", "-p", "-t", self.panes_of[name])
+            r = self.tmux("capture-pane", "-p", "-J", "-t", self.panes_of[name])
             hits = screen_hits(r.stdout if r.returncode == 0 else "", self.needles)
             if hits:
                 self.trip_guard(name, hits)
@@ -1783,7 +2033,7 @@ class Live:
             self.tmux("clear-history", "-t", pid)
         msg = "screen guard: the %s pane showed %s; the watch panes were cleared and the run stopped" % (
             name, ", ".join(hits))
-        self.write_status(phase="aborted", note="screen guard tripped (%s)" % ", ".join(hits))
+        self.mark_aborted("screen guard tripped (%s)" % ", ".join(hits))
         raise Abort(msg)
 
     def counts(self):
@@ -1795,7 +2045,10 @@ class Live:
         return c
 
     def write_status(self, **kw):
-        """Atomically rewrite the status file at a transition. See docs/tools.md for the format."""
+        """Atomically rewrite the status file at a transition. See docs/tools.md for the format.
+        Once the run is marked aborted the file is final: later transitions do not rewrite it."""
+        if self.aborted:
+            return
         self.cur.update(kw)
         st = dict(self.cur, claude=self.state["claude"], codex=self.state["codex"], paused=self.paused,
                   t=int(time.time()), **self.counts())
@@ -1804,6 +2057,13 @@ class Live:
             json.dump(st, fh)
         os.replace(tmp, self.status_path)
         self.status_log.append(st)
+
+    def mark_aborted(self, note):
+        """Phase `aborted` with the reason, on every abort path; written once, never overwritten."""
+        if not self.watch or self.aborted:
+            return
+        self.write_status(phase="aborted", note=redact(str(note))[:160])
+        self.aborted = True
 
     def hold(self, base):
         secs = 0.0 if self.stopping else base * self.pace
@@ -1819,7 +2079,8 @@ class Live:
         self.state = {"claude": "idle", "codex": "idle"}
         self.write_status(step=self.step_no, total=len(self.plan), id=fid, cli=cli, title=CHAPTERS[fid],
                           phase="title", result="")
-        self.default_focus()
+        if not self.stopping:  # after a trip the panes stay cleared: never re-attach a session
+            self.default_focus()
         self.guard()
         if quick or self.stopping:
             return
@@ -1846,7 +2107,7 @@ class Live:
         if not self.watch or not self.panes_of:
             return
         table = render_table(self.results, pane_rows=PANE_ROWS).splitlines()
-        if self.guard_tripped or self.quit:  # the panes were blanked or the viewer left: nothing to show
+        if self.guard_tripped or self.quit or self.aborted:  # the panes were blanked or the viewer left: nothing to show
             return
         self.write_status(phase="done", title="Finished", table=table, step=self.cur.get("total", 0))
         self.tmux("resize-pane", "-Z", "-t", self.panes_of["status"])
@@ -2391,13 +2652,22 @@ class Live:
         except (OSError, ValueError):
             return []
 
+    def ensure_wt_token_command(self):
+        """Put `[wt] token_command` in the sandbox config exactly once. This row runs once per CLI;
+        a second `[wt]` table is a TOML error on Python 3.11+ (tomllib), which every tool reads."""
+        with open(self.cfg) as fh:
+            text = fh.read()
+        if re.search(r"(?m)^\[wt\]\s*$", text):
+            return
+        with open(self.cfg, "a") as fh:
+            fh.write('\n[wt]\ntoken_command = "echo faketoken"\n')
+
     def row_review(self, cli):
         pr = self.make_review_pr(cli)
         self.trust_path(pr["path"])
         # Codex runs its commands in a login shell, whose PATH a real `gh` can win; a token command
         # that needs no gh keeps review.py on the stub (WT_GH names it for the other calls).
-        with open(self.cfg, "a") as fh:
-            fh.write('\n[wt]\ntoken_command = "echo faketoken"\n')
+        self.ensure_wt_token_command()
         rules = ("This is a throwaway test repo with no checks: skip Step 1. In Step 3 spawn the reviewer with "
                  "%s instead of the model the skill names (a cost capped test). The change is one correct added "
                  "line, so the reviewer's verdict is APPROVE unless it finds a real defect. In Step 4 post "
@@ -2447,16 +2717,12 @@ class Live:
             r.returncode, (r.stderr or r.stdout).strip()[-160:])
         return self._env_applied or None
 
-    def show_command(self, cli, name, shell_cmd, outfile, timeout=60):
-        """Run a shell command in its own pane (visible in watch mode), output copied to `outfile`."""
+    def show_command(self, cli, name, shell_cmd, timeout=60):
+        """Run a shell command in its own pane (visible in watch mode) until it ends. The command
+        writes its own output file; the caller reads that."""
         self.launch_eph(name, ["sh", "-c", "%s; sleep 4" % shell_cmd])
         self.focus(cli, name)
         self.wait_for(lambda: self.tmux("has-session", "-t", "=" + name).returncode != 0, timeout, 0.5)
-        try:
-            with open(outfile, encoding="utf-8", errors="replace") as fh:
-                return redact(fh.read())
-        except OSError:
-            return ""
 
     def row_env(self, cli):
         bad = self.env_apply()
@@ -2465,9 +2731,9 @@ class Live:
         mark = "ENVMARK" + self.tok
         if cli == "claude":
             out = os.path.join(self.logs, "env-claude.txt")
-            text = self.show_command(
+            self.show_command(
                 "claude", "envC", "%s auto-mode config > %s 2>&1; echo 'auto mode environment entries with the marker:'; "
-                "grep -c %s %s" % (shlex.quote(self.claude_bin), shlex.quote(out), mark, shlex.quote(out)), out + ".show")
+                "grep -c %s %s" % (shlex.quote(self.claude_bin), shlex.quote(out), mark, shlex.quote(out)))
             try:
                 with open(out, encoding="utf-8", errors="replace") as fh:
                     cfg = fh.read()
@@ -2604,7 +2870,12 @@ class Live:
         return plan + [("realdirs", "both")]
 
     def go(self):
-        if self.watch:  # refuse before any cost: a leftover `selftest` link means another run (or a killed one)
+        if self.watch:
+            gone = empty_classes(self.needles, bool(getattr(self.a, "leak_terms", None)))
+            if gone:  # a class with nothing to look for would let that kind of leak onto a public frame
+                raise Abort("screen guard: nothing to scan for in class(es) %s (no passwd entry, hostname or "
+                            "usable term found); refusing to start --watch" % ", ".join(gone))
+        if self.watch:  # refuse before any cost: a leftover `sn-watch` link means another run (or a killed one)
             link = os.path.join(self.sock_dir, SOCKET_LABEL)
             if os.path.lexists(link):
                 link_selftest_socket(self.sock_dir, "/nonexistent")  # raises the Abort naming the link
@@ -2677,7 +2948,7 @@ class Live:
 
     def teardown(self, failed):
         try:
-            self.unlink_socket()  # first: the `selftest` link must not outlive any exit path
+            self.unlink_socket()  # first: the `sn-watch` link must not outlive any exit path
         except Exception:
             pass
         try:
@@ -2771,12 +3042,15 @@ def execute(live):
         except Exception as exc:  # setup crashed: report it, never hide it
             err = "run crashed: %r" % (exc,)
         live.stopping = live.stopping or bool(err)
+        if err:
+            live.mark_aborted(err)  # q, Ctrl-C, a crash, any Abort: the status file says why
         try:
             live.finish_realdirs()
         except KeyboardInterrupt:
             err = err or "interrupted"
         except Abort as exc:  # the screen guard can trip while the last step runs
             err = err or str(exc)
+            live.mark_aborted(err)
         if err:
             # its own row: filing it under realdirs read as "the real dirs were touched" when no
             # CLI had a key and nothing ran (realdirs keeps its own row, when it was measured)
@@ -2787,8 +3061,12 @@ def execute(live):
             live.finish_watch(wait=not err)
         except KeyboardInterrupt:
             pass
-        except Abort as exc:
-            err = err or str(exc)
+        except Abort as exc:  # a guard trip in the final hold: still a failed run, with its message
+            if not err:
+                err = str(exc)
+                live.results.append({"feature": "run", "title": RUN_TITLE, "cli": "both", "status": FAIL,
+                                     "detail": "run aborted: " + err, "evidence": None})
+            lines = fail_lines(live.results)
     finally:
         kept = live.teardown(bool(lines) or bool(err))
         for sig, h in old.items():

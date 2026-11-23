@@ -516,8 +516,9 @@ interactive panes here, with the same checks, and carry "(pane)" in the final ta
 
 Flags: `--pace X` scales the holds (default 1: about 2 s on each chapter title before the step and
 4 s on its result after; 0 = none); `--step` holds each step until Enter is pressed in the status
-pane; `p` pauses and resumes; `q` aborts with full teardown; `--leak-terms FILE` adds one term per
-line to the screen guard; `--no-hold-final` tears down when the run ends instead of waiting for
+pane; `p` pauses and resumes; `q` aborts with full teardown; `--leak-terms FILE` adds the terms of a
+leak-terms file to the screen guard, read with the same syntax as `tests/leak_scan.py` (`w:` whole
+word entries, `!` allowed phrases, `#` comments); `--no-hold-final` tears down when the run ends instead of waiting for
 `q` with the final table in the status pane. The status pane only forwards keys (through a FIFO
 under the sandbox); it never types into another pane.
 
@@ -526,11 +527,16 @@ Nothing private on screen, because the run is public. The panes get only sandbox
 a plain `$ ` prompt, and no tmux status line or hostname titles. The Claude `apiKeyHelper` names no
 keychain path: a sandbox `home/Library/Keychains/login.keychain-db` symlink to the real login
 keychain lets `security find-generic-password -s <service> -w` work under the temp HOME (without
-the link it exits 44). A screen guard captures every visible pane about once a second and at each
-step transition and looks for the real home path, the user name, the short and full hostname,
-key shaped strings (`sk-` plus 20 characters) and, with `--leak-terms`, each term. A hit blanks the
-watch panes and aborts the run (teardown runs); the message names the pane and the class of hit,
-never the matched text. A hit can be on screen for up to a second before it is seen.
+the link it exits 44). A screen guard captures every visible pane (rows joined across the pane edge, and also read with
+the row breaks removed, so a path that wraps is still seen) about once a second while the runner
+waits, and at each step transition. It looks for the real home path, the user name (both taken from
+the passwd entry of the real user as well as `$HOME` and `$USER`), the short and full hostname, key
+shaped strings (`sk-` plus 20 characters) and, with `--leak-terms`, each term. It does not scan
+while the runner is inside a blocking call (bcast, handoff, the `wt` row, review PR setup,
+`environment_render apply`: up to two minutes), only before and after it. `--watch` refuses to
+start when a class has nothing to look for. A hit blanks the watch panes and aborts the run
+(teardown runs; a trip in the final hold exits nonzero); the message names the pane and the class
+of hit, never the matched text. A hit can be on screen for up to a second before it is seen.
 
 #### Status file
 
@@ -545,7 +551,8 @@ atomically at each transition, so a storyboard can time chapter cards off it:
 
 `phase` is `title` (the chapter title is up, before the step runs), `running`, `result` (the step
 finished; `result` is PASS, FAIL or SKIP), `done` (the final table, in `table`, is up until `q`) or
-`aborted` (screen guard or abort; `note` says why). `id` is the feature id and `cli` is `claude`,
+`aborted` (screen guard, `q`, Ctrl-C or any other abort; `note` says why; once written the file is
+final). `id` is the feature id and `cli` is `claude`,
 `codex` or `both`; `claude` and `codex` are `idle`, `working`, `pass`, `fail` or `skip`; `step` is 0
 during setup and `total` counts every step including the last one (`realdirs`). Chapter titles
 have no dashes, at most 8 words and no internal jargon; the table in `CHAPTERS` in
