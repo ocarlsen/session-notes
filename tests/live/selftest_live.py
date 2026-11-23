@@ -2453,6 +2453,9 @@ class Live:
                      + common, "handoff-codex.txt", timeout=60)
         if r.returncode != 0:
             return FAIL, "handoff_session --cli codex rc=%d: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-200:]), "handoff-codex.txt"
+        if self.watch:
+            self.ephemeral.append("xchild")
+            self.focus("codex", "xchild")
         if not self.wait_for(lambda: seen(tok, self.ctext("codex")), 150) or "xchild" not in self.tmux("ls").stdout:
             return FAIL, "codex child never answered %s (or its pane is gone)" % tok, "handoff-codex.txt"
         # negative control: the same check on a token no child was given must come back empty
@@ -2465,6 +2468,9 @@ class Live:
         if out is None or "parked spec on the bus" not in out:
             return FAIL, "staged handoff --cli codex did not park: %s" % (out or "timeout").strip()[-200:], "handoff-codex-staged.txt"
         self.panes.add("xstaged")
+        if self.watch:
+            self.ephemeral.append("xstaged")
+            self.focus("codex", "xstaged")
         self.wait_idle("xstaged", 90)
         if self.hook_injected("codex", stok):
             return FAIL, "negative control: the parked spec reached the staged pane before anyone typed", "handoff-codex-staged.txt"
