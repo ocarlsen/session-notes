@@ -187,46 +187,107 @@ def clock_ok(text, now=None, slack_min=5):
     return abs((stamp - (now or datetime.now())).total_seconds()) <= slack_min * 60
 
 
-def executed_commands(root):
-    """Text of every EXECUTED tool/command item in transcripts under root (function-call and exec
-    items, never user or assistant message text, so a prompt that merely names a script cannot match)."""
-    out = []
+def _strings(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from _strings(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _strings(v)
+    elif isinstance(o, str):
+        yield o
 
-    def strings(o):
-        if isinstance(o, dict):
-            for v in o.values():
-                yield from strings(v)
-        elif isinstance(o, list):
-            for v in o:
-                yield from strings(v)
-        elif isinstance(o, str):
-            yield o
 
-    def walk(o):
-        if isinstance(o, dict):
-            t = str(o.get("type", ""))
-            if o.get("role") in ("user", "assistant") or t in ("message", "user", "assistant", "text"):
-                return
-            if any(k in t for k in ("call", "exec")) or t == "tool_use":
-                out.append("\n".join(strings(o)))
-                return
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v)
+def _strip_heredocs(text):
+    """Drop heredoc bodies, so a stage call whose body mentions a command line is not that command."""
+    out, end = [], None
+    for ln in text.splitlines():
+        if end is not None:
+            if ln.strip() == end:
+                end = None
+            continue
+        out.append(ln)
+        m = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", ln)
+        if m:
+            end = m.group(1)
+    return "\n".join(out)
 
+
+def call_commands(item):
+    """Command lines a Codex call item runs. Handles function_call (`arguments` JSON: a `command`
+    argv list or a `cmd` string) and custom_tool_call (`input`: JS calling tools.exec_command with
+    a `cmd:` string). Unknown shapes yield nothing."""
+    cmds = []
+    args = item.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = None
+    if isinstance(args, dict):
+        c = args.get("command", args.get("cmd"))
+        if isinstance(c, list) and all(isinstance(x, str) for x in c):
+            cmds.append(shlex.join(c))
+        elif isinstance(c, str):
+            cmds.append(c)
+    src = item.get("input")
+    if isinstance(src, str):
+        for m in re.finditer(r"cmd\s*:\s*(\"(?:[^\"\\\\]|\\\\.)*\"|`[^`]*`)", src):
+            lit = m.group(1)
+            if lit.startswith('"'):
+                try:
+                    cmds.append(json.loads(lit))
+                except ValueError:
+                    pass
+            else:
+                cmds.append(lit[1:-1])
+    return cmds
+
+
+def is_codex_save_commit(cmd, _depth=0):
+    """True when a command line IS `python3 <path>/bin/codex_save.py commit`: argv of exactly that
+    shape (env assignments and a /bin/sh -c wrapper allowed), last argument exactly `commit`."""
+    for ln in _strip_heredocs(cmd).splitlines():
+        try:
+            toks = shlex.split(ln)
+        except ValueError:
+            continue
+        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks = toks[1:]
+        if len(toks) >= 3 and os.path.basename(toks[0]) in ("zsh", "bash", "sh") and toks[1] in ("-c", "-lc") and _depth < 2:
+            if is_codex_save_commit(toks[2], _depth + 1):
+                return True
+            continue
+        if (len(toks) == 3 and os.path.basename(toks[0]).startswith("python3")
+                and toks[1].endswith("bin/codex_save.py") and toks[2] == "commit"):
+            return True
+    return False
+
+
+def codex_commit_proven(root):
+    """True when a rollout under root holds a CALL item that runs `codex_save.py commit` AND the
+    paired output item (same call_id) printed codex_save's release line. Outputs (including a skill
+    file that merely quotes the command) and message text never count."""
+    calls, outputs = set(), {}
     for f in sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)):
         try:
             with open(f, encoding="utf-8", errors="replace") as fh:
                 for ln in fh:
                     try:
-                        walk(json.loads(ln))
+                        o = json.loads(ln)
                     except ValueError:
-                        pass
+                        continue
+                    it = o.get("payload") if isinstance(o, dict) and isinstance(o.get("payload"), dict) else o
+                    if not isinstance(it, dict) or not it.get("call_id"):
+                        continue
+                    t = str(it.get("type", ""))
+                    if t.endswith("_output"):
+                        outputs.setdefault(it["call_id"], []).extend(_strings(it.get("output")))
+                    elif "call" in t and any(is_codex_save_commit(c) for c in call_commands(it)):
+                        calls.add(it["call_id"])
         except OSError:
             pass
-    return "\n".join(out)
+    return any("released the reflect lock" in "\n".join(outputs.get(c, [])) for c in calls)
 
 
 def seen(token, text):
@@ -287,8 +348,10 @@ def snapshot(real_home):
         try:
             with open(f, "rb") as fh:
                 snap[f] = hashlib.sha256(fh.read()).hexdigest()
-        except OSError:
+        except FileNotFoundError:
             snap[f] = None
+        except OSError:
+            snap[f] = "unreadable"
     for d in dirs:
         try:
             snap[d] = sorted(os.listdir(d))
@@ -304,20 +367,28 @@ def compare_snapshots(before, after):
 def fatal_diffs(before, after, needles):
     """compare_snapshots, minus hashed FILES whose new content does not mention the sandbox or run
     token: a real settings.json churns under other live sessions, while an install that leaked
-    into it would name the sandbox. Directory listings stay fatal. -> (fatal, benign)."""
+    into it would name the sandbox. Only a file present and readable both times can be benign; an
+    appearing, disappearing or unreadable one, and any directory listing change, is fatal.
+    -> (fatal, benign)."""
     fatal, benign = [], []
     for k in before:
-        if before[k] == after.get(k):
+        b, a = before[k], after.get(k)
+        if b == a:
             continue
-        if isinstance(before[k], list) or isinstance(after.get(k), list):
+        if isinstance(b, list) or isinstance(a, list):
             fatal.append("%s changed" % k)
-            continue
-        try:
-            with open(k, "rb") as fh:
-                data = fh.read()
-        except OSError:
-            data = b""
-        (fatal if any(n.encode() in data for n in needles if n) else benign).append("%s changed" % k)
+        elif b is None or a is None:
+            fatal.append("%s %s" % (k, "appeared" if b is None else "disappeared"))
+        elif b == "unreadable" or a == "unreadable":
+            fatal.append("%s unreadable, cannot be judged" % k)
+        else:
+            try:
+                with open(k, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                fatal.append("%s unreadable, cannot be judged" % k)
+                continue
+            (fatal if any(n.encode() in data for n in needles if n) else benign).append("%s changed" % k)
     return fatal, benign
 
 
@@ -521,18 +592,53 @@ def selftest():
     check("clock: NEGATIVE control, stale time fails", not clock_ok("NOW=Sun 2026-11-22 13:00 PST", nowdt))
     check("clock: NEGATIVE control, no NOW fails", not clock_ok("2026-11-22 14:51", nowdt))
 
-    # reflect (codex): only an EXECUTED command counts, never prompt text that names the script
+    # reflect (codex): only an executed commit CALL paired with its release output counts
+    def rollout(d, name, *items):
+        with open(os.path.join(d, name), "w") as fh:
+            for it in items:
+                fh.write(json.dumps({"type": "response_item", "payload": it}) + "\n")
+
+    commit_js = 'text(await tools.exec_command({cmd:"python3 /x/repo/bin/codex_save.py commit"}))\n'
+    stage_js = ("const r=await tools.exec_command({cmd:`SESSION_NOTES_AGENT=codex python3 /x/repo/bin/codex_save.py "
+                "stage --store global --file f.md <<'EOF'\nit was committed\nEOF`})\n")
+    out_text = lambda t: [{"type": "input_text", "text": t}]
+    release = '{"output":"wrote f.md\\nreleased the reflect lock\\n"}'
+    adapter = "run: python3 $SESSION_NOTES/bin/codex_save.py commit"
     with tempfile.TemporaryDirectory() as d:
-        with open(os.path.join(d, "a.jsonl"), "w") as fh:
-            fh.write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user",
-                                 "content": [{"type": "input_text", "text": "run codex_save.py commit"}]}}) + "\n")
-        check("executed: NEGATIVE control, a prompt naming codex_save.py is not execution",
-              "codex_save" not in executed_commands(d))
-        with open(os.path.join(d, "b.jsonl"), "w") as fh:
-            fh.write(json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "shell",
-                                 "arguments": json.dumps({"command": ["python3", "x/codex_save.py", "commit"]})}}) + "\n")
-        check("executed: a function_call running codex_save.py commit is seen",
-              re.search(r"codex_save\.py[^\n]*commit", executed_commands(d)) is not None)
+        rollout(d, "a.jsonl",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": "text(await tools.exec_command({cmd:\"cat ADAPTER.md\"}))\n"},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text(adapter + " released the reflect lock")})
+        check("commit proof: NEGATIVE control (a), a skill file's output quoting the command is not execution",
+              not codex_commit_proven(d))
+    with tempfile.TemporaryDirectory() as d:
+        rollout(d, "b.jsonl",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": stage_js},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text("staged " + release)})
+        check("commit proof: NEGATIVE control (b), a stage call whose heredoc says committed does not match",
+              not codex_commit_proven(d))
+    with tempfile.TemporaryDirectory() as d:
+        rollout(d, "c.jsonl",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": commit_js},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text("python3: warning only")})
+        check("commit proof: NEGATIVE control (c), a commit call without the release line fails",
+              not codex_commit_proven(d))
+    with tempfile.TemporaryDirectory() as d:
+        rollout(d, "d.jsonl",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": commit_js},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": out_text(release)})
+        check("commit proof (d): custom_tool_call commit + paired release output passes", codex_commit_proven(d))
+    with tempfile.TemporaryDirectory() as d:
+        rollout(d, "e.jsonl",
+                {"type": "function_call", "call_id": "c2", "name": "shell",
+                 "arguments": json.dumps({"command": ["/bin/zsh", "-lc", "python3 /x/repo/bin/codex_save.py commit"]})},
+                {"type": "function_call_output", "call_id": "c2", "output": release})
+        check("commit proof (d): function_call commit + paired release output passes", codex_commit_proven(d))
+    with tempfile.TemporaryDirectory() as d:
+        rollout(d, "f.jsonl",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": commit_js},
+                {"type": "custom_tool_call_output", "call_id": "other", "output": out_text(release)})
+        check("commit proof: NEGATIVE control, a release line paired with a different call_id fails",
+              not codex_commit_proven(d))
 
     # hook-path check: positive control, and NEGATIVE control (a copy naming a missing file goes red)
     with tempfile.TemporaryDirectory() as d:
@@ -631,6 +737,48 @@ def selftest():
             fh.write("TOK12345 in a parent transcript")
         check("realdirs: a transcript outside the stores is not scanned", len(scan_for_sandbox(h, needles, t0)) == 2)
         check("realdirs: files older than the run are ignored", scan_for_sandbox(h, needles, time.time() + 100) == [])
+
+    # real-dirs: presence flips and unreadable files are fatal, never benign
+    with tempfile.TemporaryDirectory() as h:
+        os.makedirs(os.path.join(h, ".claude"))
+        sj = os.path.join(h, ".claude", "settings.json")
+        with open(sj, "w") as fh:
+            fh.write("{}")
+        before = snapshot(h)
+        os.remove(sj)
+        fat, ben = fatal_diffs(before, snapshot(h), ["sn-live-ZZZ"])
+        check("realdirs: NEGATIVE control, a deleted target is fatal", len(fat) == 1 and not ben and "disappeared" in fat[0], str((fat, ben)))
+        fat, ben = fatal_diffs(snapshot(h), {**snapshot(h), sj: "x" * 64}, ["sn-live-ZZZ"])
+        check("realdirs: NEGATIVE control, a created target is fatal", len(fat) == 1 and not ben and "appeared" in fat[0], str((fat, ben)))
+        with open(sj, "w") as fh:
+            fh.write("{}")
+        before = snapshot(h)
+        with open(sj, "w") as fh:
+            fh.write('{"changed":1}')
+        os.chmod(sj, 0)
+        try:
+            after = snapshot(h)
+            fat, ben = fatal_diffs(before, after, ["sn-live-ZZZ"])
+            check("realdirs: NEGATIVE control, an unreadable target is fatal", len(fat) == 1 and not ben and "unreadable" in fat[0], str((fat, ben)))
+        finally:
+            os.chmod(sj, 0o600)
+        fat, ben = fatal_diffs(before, snapshot(h), ["sn-live-ZZZ"])
+        check("realdirs: a readable changed file with no needle is benign", not fat and len(ben) == 1, str((fat, ben)))
+
+    # a rejected Codex login is a FAIL on every Codex row, not a SKIP
+    live = Live(argparse.Namespace(only=None, feature=None, keep=False, selftest=False))
+    try:
+        live.have["codex"], live.login_failed = False, True
+        live.do("boot", "codex", lambda cli: (PASS, "", None), "codex")
+        r0 = live.results[0] if live.results else {}
+        check("codex login failed: row is FAIL naming it", r0.get("status") == FAIL and r0.get("detail") == "codex login failed", str(r0))
+        live.results.clear()
+        live.login_failed = False
+        live.why["codex"] = "keychain item missing"
+        live.do("boot", "codex", lambda cli: (PASS, "", None), "codex")
+        check("missing keychain item: row is SKIP", live.results[0]["status"] == SKIP, str(live.results))
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
 
     # teardown always runs: interrupted go() must still wipe the Codex auth.json
     ns = argparse.Namespace(only=None, feature=None, keep=False, selftest=False)
@@ -756,6 +904,7 @@ class Live:
         self.why = {}
         self.installed = False
         self.before = None
+        self.login_failed = False  # a key was found but Codex rejected it: FAIL, not SKIP
 
     # -- environment ----------------------------------------------------------------------
     def env(self, **extra):
@@ -1162,13 +1311,13 @@ class Live:
         if cli == "codex":
             d = self.scoped("codex", tok)
             try:
-                ran = executed_commands(d)
+                proven = codex_commit_proven(d)
             finally:
                 shutil.rmtree(d, ignore_errors=True)
-            if not re.search(r"codex_save\.py[^\n]*commit|commit[^\n]*codex_save\.py", ran):
-                return FAIL, "store gained the fact but no executed `codex_save.py commit` is in the rollout", "reflect-codex.txt"
+            if not proven:
+                return FAIL, "store gained the fact but the rollout has no executed `codex_save.py commit` call with its release output", "reflect-codex.txt"
         return PASS, "store file %s gained the fact%s" % (os.path.basename(hit),
-                                                         "; codex_save.py commit was executed" if cli == "codex" else ""), None
+                                                         "; codex_save.py commit was executed and released the lock" if cli == "codex" else ""), None
 
     def row_emdash(self, cli):
         tok = "EMD%s%s" % (self.tok, cli[:2].upper())
@@ -1281,6 +1430,9 @@ class Live:
     def do(self, fid, cli, fn, *args):
         if not self.want(fid):
             return
+        if cli == "codex" and self.login_failed:
+            self.record(fid, cli, FAIL, "codex login failed", self.evid("codex-login.txt"))
+            return
         if cli in ("claude", "codex") and not self.have[cli]:
             self.record(fid, cli, SKIP, self.why.get(cli, "cli unavailable"))
             return
@@ -1313,7 +1465,7 @@ class Live:
         self.seed_claude()
         self.seed_codex()
         if self.have["codex"] and not self.codex_login(ok):
-            self.have["codex"], self.why["codex"] = False, "codex login failed"
+            self.have["codex"], self.login_failed = False, True
         ok = None
         self.start_tmux()
         if any(self.want(f) for f in ("peers", "bcast", "bus", "refresh")):
