@@ -12,6 +12,10 @@ session and `wt merge` can check it.
 `$SESSION_NOTES` below is the session-notes checkout (set by `install.sh`). Run every command from
 inside a checkout of the PR's repo.
 
+If `review.py` (or a helper it imports) fails, stop and report the command and its error to the
+user. Never patch it, wrap it or work around it to get past the failure: a review that ran
+through modified tooling is not the contract review.
+
 ## Step 1: checks pass, and the branch is rebased
 
 Run the repo's checks (`make check`, or the repo's equivalent) and get them green. Rebase the
