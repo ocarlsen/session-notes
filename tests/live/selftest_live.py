@@ -57,6 +57,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import pwd
 import sys
 import tempfile
 import threading
@@ -75,6 +76,18 @@ FAKE_HOME = "/" + "Users" + "/zed"   # a planted home path for the screen guard'
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
 # feature id, title, scope. "both" rows are CLI-independent and run once.
+# Watch mode's `ls`: a long listing (-l, -g, -o in any short-option cluster) gets -n, numeric
+# owner and group, so no real user name reaches a filmed pane.
+LS_SHIM = """#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    --) break ;;
+    -*[lgo]*) exec /bin/ls -n "$@" ;;
+  esac
+done
+exec /bin/ls "$@"
+"""
+RUN_TITLE = "run finished"  # the row an aborted run is reported on
 FEATURES = [
     ("boot", "boot context + clock line", "cli"),
     ("bus", "bus send, delivered next prompt", "cli"),
@@ -384,6 +397,8 @@ def render_table(results, pane_rows=()):
                 s = "SKIP (%s)" % r["detail"]
             cells.append(s + (" [both]" if r["cli"] == "both" else ""))
         rows.append((title + (" (pane)" if fid in pane_rows else ""), cells[0], cells[1]))
+    if "run" in by:  # an aborted run: not a feature, so it is not in FEATURES
+        rows.append((RUN_TITLE, "FAIL [both]", "FAIL [both]"))
     widths = [max(len(r[i]) for r in rows) for i in range(3)]
     lines = []
     for n, r in enumerate(rows):
@@ -1192,6 +1207,22 @@ def selftest():
         finally:
             shutil.rmtree(live.root, ignore_errors=True)
 
+    aborted = [{"feature": "run", "title": RUN_TITLE, "cli": "both", "status": FAIL,
+                "detail": "run aborted: nothing live ran", "evidence": None}]
+    t = render_table(aborted)
+    check("abort: an aborted run shows its own row, not a real-dirs FAIL",
+          RUN_TITLE in t and "FAIL [both]" in t and "real dirs" not in t)
+    with tempfile.TemporaryDirectory() as d:
+        sh = os.path.join(d, "ls")
+        with open(sh, "w") as fh:
+            fh.write(LS_SHIM)
+        os.chmod(sh, 0o755)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        out = subprocess.run([sh, "-la", d], capture_output=True, text=True).stdout
+        check("ls shim: a long listing shows no user name", out and me not in out and str(os.getuid()) in out)
+        real = subprocess.run(["/bin/ls", "-la", d], capture_output=True, text=True).stdout
+        check("ls shim: NEGATIVE control, plain /bin/ls -la does show it", me in real)
+        check("ls shim: a short listing stays short", subprocess.run([sh, d], capture_output=True, text=True).stdout.strip() == "ls")
     # status file, pace, keys, step mode (no tmux)
     live = Live(watch_ns(pace=0.0)) if False else None
     ns = argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0, step=False,
@@ -1854,6 +1885,17 @@ class Live:
                 real = shutil.which(n)
                 if real and not os.path.lexists(os.path.join(self.bin, n)):
                     os.symlink(real, os.path.join(self.bin, n))
+            # `ls -l` prints the real owner name (the 08:25 11/23 take tripped the screen guard on
+            # it): the shim adds -n, so a long listing shows the numeric uid instead
+            with open(os.path.join(self.bin, "ls"), "w") as fh:
+                fh.write(LS_SHIM)
+            os.chmod(os.path.join(self.bin, "ls"), 0o755)
+            # a login zsh (Codex runs its commands in one) lets path_helper put /bin first, so the
+            # shim would lose: put the sandbox bin back in front after it
+            line = 'export PATH="%s:$PATH"\n' % self.bin
+            for rc in (".zshenv", ".zprofile"):
+                with open(os.path.join(self.home, rc), "a") as fh:
+                    fh.write(line)
 
     def clone_and_install(self):
         head = subprocess.run(["git", "-C", SRC_REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -2736,7 +2778,9 @@ def execute(live):
         except Abort as exc:  # the screen guard can trip while the last step runs
             err = err or str(exc)
         if err:
-            live.results.append({"feature": "realdirs", "title": dict((f, t) for f, t, _ in FEATURES)["realdirs"],
+            # its own row: filing it under realdirs read as "the real dirs were touched" when no
+            # CLI had a key and nothing ran (realdirs keeps its own row, when it was measured)
+            live.results.append({"feature": "run", "title": RUN_TITLE,
                                  "cli": "both", "status": FAIL, "detail": "run aborted: " + err, "evidence": None})
         lines = fail_lines(live.results)
         try:
