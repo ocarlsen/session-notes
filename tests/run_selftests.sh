@@ -23,7 +23,7 @@ for v in $(env | sed -n 's/^\(SESSION_NOTES_PARENT_[A-Za-z0-9_]*\)=.*/\1/p'); do
 # (install.sh --codex), and the bus reads CLAUDE_SESSION_BUS_DELIVERIES at import.
 unset SESSION_NOTES_AGENT CLAUDE_SESSION_BUS_DELIVERIES
 fail=0
-for f in "$ROOT"/bin/*.py "$ROOT"/hooks/*.py "$ROOT"/skills/*/*.py "$ROOT"/tools/*.py "$ROOT"/tests/leak_scan.py; do
+for f in "$ROOT"/bin/*.py "$ROOT"/hooks/*.py "$ROOT"/skills/*/*.py "$ROOT"/tools/*.py "$ROOT"/tests/live/*.py "$ROOT"/tests/leak_scan.py; do
   [ -f "$f" ] || continue
   grep -q -- "--selftest" "$f" || continue
   if out=$(python3 "$f" --selftest 2>&1); then
