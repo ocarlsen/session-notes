@@ -38,6 +38,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+from environment_render import CODEX_END  # noqa: E402  (one source for the marker)
+
 BEGIN = "<!-- session-notes:begin (install.sh rewrites this block; edit outside it) -->"
 END = "<!-- session-notes:end -->"
 ADDENDUM_HEADING = "## Local addendum (private rules)"
@@ -219,17 +221,28 @@ def backup_path(path):
 KEEP_BACKUPS = 3
 
 
-def prune_backups(path, keep):
-    """Keep the newest KEEP_BACKUPS of this tool's own timestamped backups of PATH, newest by
-    file mtime (ties by name), and always the one just written (`keep`). Only names of exactly
-    that pattern are touched; install.sh's PATH.bak-session-notes never is."""
+def prune_backups(path, keep, bak=BAK):
+    """Keep exactly KEEP_BACKUPS of this tool's own timestamped backups of PATH: `keep` (the one
+    just written) plus the newest others. Newest is decided by the stamp in the NAME
+    (YYYYmmdd-HHMMSS, then the -N suffix, which comes after the unsuffixed same-second name),
+    never by file mtime: older releases copied with copy2, so a backup carries its source's
+    old mtime. Both name formats in use (this tool's and environment_render's) carry the stamp.
+    Only names of exactly that pattern are touched; install.sh's PATH.bak-session-notes never
+    is. `bak` is the backup-name prefix (environment_render passes its own)."""
     d, base = os.path.split(path)
     d = d or "."
-    pat = re.compile(r"^%s%s-\d{8}-\d{6}(?:-\d+)?$" % (re.escape(base), re.escape(BAK)))
-    found = sorted(((os.stat(os.path.join(d, n)).st_mtime, n) for n in os.listdir(d)
-                    if pat.match(n)), reverse=True)
-    for _, name in found[KEEP_BACKUPS:]:
-        if os.path.join(d, name) != keep:
+    pat = re.compile(r"^%s%s-(\d{8}-\d{6})(?:-(\d+))?$" % (re.escape(base), re.escape(bak)))
+    found = []
+    for n in os.listdir(d):
+        m = pat.match(n)
+        if m:
+            found.append(((m.group(1), int(m.group(2) or 0)), n))
+    found.sort(reverse=True)
+    keep_name = os.path.basename(keep)
+    others = [n for _, n in found if n != keep_name]
+    survivors = set(others[:max(0, KEEP_BACKUPS - (1 if any(n == keep_name for _, n in found) else 0))])
+    for _, name in found:
+        if name != keep_name and name not in survivors:
             os.unlink(os.path.join(d, name))
 
 
@@ -431,12 +444,16 @@ def codex_defaults(old):
     # A comment block right above the first table belongs to that table: go above it.
     at = first
     # Only lines the scanner saw at depth 0 outside a string may be stepped over.
-    while at > 0 and clean[at - 1] and (
+    # Never past the end marker of environment_render's block: that block sits right above
+    # the first table, and the next `environment_render.py apply` rewrites what is inside.
+    while at > 0 and clean[at - 1] and lines[at - 1].strip() != CODEX_END and (
             not lines[at - 1].strip() or lines[at - 1].lstrip().startswith("#")):
         at -= 1
     before, after = lines[:at], lines[at:]
     if before and not before[-1].endswith("\n"):
         before[-1] += "\n"
+    if before and clean[at - 1] and before[-1].strip() == CODEX_END:
+        before.append("\n")
     new = before + ["# session-notes defaults (change freely)\n"] + add
     if after and after[0].strip():
         new.append("\n")
@@ -777,6 +794,131 @@ def selftest():
         none = os.path.join(tmp, "sub", "config.toml")
         quiet(lambda: cmd_codex_defaults(none, False))
         check("defaults create a missing config", 'model = "%s"' % DEFAULT_MODEL in open(none).read())
+
+        # F1: defaults never land inside environment_render's block (it is rewritten on apply)
+        import environment_render as er
+        ed = os.path.join(tmp, "envloop")
+        os.makedirs(os.path.join(ed, "claude"))
+        os.makedirs(os.path.join(ed, "codex"))
+        esrc = os.path.join(ed, "environment.md")
+        open(esrc, "w").write("- Organization: Example Co\n")
+        ectx = er.Ctx(esrc, os.path.join(ed, "claude"), os.path.join(ed, "codex"),
+                      bin_dirs=[os.path.join(ed, "bin")])
+        for label, start in (("a comment above the table", '# about tui\n[tui]\nx = 1\n'),
+                             ("no comment", '[tui]\nx = 1\n'),
+                             ("approval key above", 'approval_policy_note = 1\n\n[tui]\nx = 1\n')):
+            open(ectx.config_toml, "w").write(start)
+            quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+            quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+            t1 = open(ectx.config_toml).read()
+            end_at = t1.index(er.CODEX_END)
+            check("env block + defaults (%s): defaults land after the block's end marker" % label,
+                  'model = "%s"' % DEFAULT_MODEL in t1 and t1.index("model =") > end_at
+                  and t1.count("model =") == 1 and t1.index("[tui]") > t1.index("model_reasoning_effort"))
+            rc, out = quiet(lambda: er.cmd_diff(ectx, "codex"))
+            check("env block + defaults (%s): environment_render diff is clean" % label, rc == 0 and out == "")
+            quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+            check("env block + defaults (%s): re-apply keeps the defaults (no loop)" % label,
+                  open(ectx.config_toml).read() == t1)
+            rc, out = quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+            check("env block + defaults (%s): defaults second run unchanged" % label,
+                  "unchanged" in out and open(ectx.config_toml).read() == t1)
+            try:
+                import tomllib
+            except ImportError:
+                tomllib = None
+            if tomllib is None:
+                if label == "no comment":   # one notice per run is enough
+                    print("tomllib unavailable: TOML validity asserts skipped (run under python3.11+)")
+            else:
+                d1 = tomllib.loads(t1)
+                check("env block + defaults (%s): parses, model and sandbox_mode top-level" % label,
+                      d1["model"] == DEFAULT_MODEL and d1["sandbox_mode"] == "workspace-write"
+                      and d1["tui"] == {"x": 1})
+        # the reverse order: defaults first, then the block: the block goes above the defaults' neighbours
+        open(ectx.config_toml, "w").write('# about tui\n[tui]\nx = 1\n')
+        quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+        quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+        t2 = open(ectx.config_toml).read()
+        quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))
+        check("defaults first, then the block: both survive, diff clean, defaults still top-level",
+              open(ectx.config_toml).read() == t2 and t2.count("model =") == 1
+              and t2.index("model =") < t2.index("[tui]") and t2.count(er.CODEX_BEGIN) == 1
+              and quiet(lambda: er.cmd_diff(ectx, "codex"))[0] == 0
+              and not (t2.index(er.CODEX_BEGIN) < t2.index("model =") < t2.index(er.CODEX_END)))
+
+        # upgrade: 91c581a's codex-defaults put its group INSIDE the block, just before END
+        open(ectx.config_toml, "w").write('# about tui\n[tui]\nx = 1\n')
+        quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+        good = open(ectx.config_toml).read()
+        stray = ("# session-notes defaults (change freely)\nmodel = \"%s\"\n"
+                 "model_reasoning_effort = \"high\"\n\n" % DEFAULT_MODEL)   # 91c581a's text
+        bad = good.replace(er.CODEX_END + "\n", stray + er.CODEX_END + "\n")
+        check("upgrade: the bad state really has the keys inside the block", bad != good
+              and bad.index("model_reasoning_effort") < bad.index(er.CODEX_END))
+        open(ectx.config_toml, "w").write(bad)
+        rc, out = quiet(lambda: er.cmd_diff(ectx, "codex"))
+        check("upgrade: diff names the move", rc == 1 and "moves them" in out and "high" in out)
+        quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))
+        t3 = open(ectx.config_toml).read()
+        check("upgrade: comment and both keys (customized value kept) survive after the END marker",
+              t3.count("model_reasoning_effort") == 1 and 'model_reasoning_effort = "high"' in t3
+              and t3.count("# session-notes defaults (change freely)") == 1
+              and t3.index("# session-notes defaults") > t3.index(er.CODEX_END)
+              and t3.index("model =") < t3.index("[tui]") and "# about tui\n[tui]" in t3)
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        if tomllib:
+            d3 = tomllib.loads(t3)
+            check("upgrade: parses; model keys top-level",
+                  d3["model_reasoning_effort"] == "high" and d3["model"] == DEFAULT_MODEL
+                  and d3["tui"] == {"x": 1})
+        check("upgrade: second apply is a no-op, diff clean, codex-defaults a no-op",
+              quiet(lambda: er.cmd_apply(ectx, "codex", True, allow_worktree=True))[1].count("already match") == 1
+              and open(ectx.config_toml).read() == t3 and quiet(lambda: er.cmd_diff(ectx, "codex")) == (0, "")
+              and "unchanged" in quiet(lambda: cmd_codex_defaults(ectx.config_toml, False))[1]
+              and open(ectx.config_toml).read() == t3)
+        # a multi-line construct in that spot is refused, never deleted
+        weird = good.replace(er.CODEX_END + "\n", 'extra = """\nx\n"""\n' + er.CODEX_END + "\n")
+        open(ectx.config_toml, "w").write(weird)
+        try:
+            er.cmd_apply(ectx, "codex", True, allow_worktree=True)
+            refused = False
+        except er.EnvError:
+            refused = True
+        check("upgrade: a multi-line construct inside the block is refused and the file untouched",
+              refused and open(ectx.config_toml).read() == weird)
+
+        # prune ranks by the stamp in the NAME, not mtime (older releases made copy2 backups)
+        pd = os.path.join(tmp, "prune")
+        os.makedirs(pd)
+        pf = os.path.join(pd, "f.toml")
+        open(pf, "w").write("x")
+        names = ["f.toml.bak-session-notes-20260101-000001", "f.toml.bak-session-notes-20260101-000002",
+                 "f.toml.bak-session-notes-20260101-000002-1", "f.toml.bak-session-notes-20260101-000002-2",
+                 "f.toml.bak-session-notes-20260101-000003", "f.toml.bak-session-notes-20250101-000009"]
+        for i, n in enumerate(names):          # mtimes inverted: the newest name is the oldest file
+            fp = os.path.join(pd, n)
+            open(fp, "w").write(n)
+            os.utime(fp, (1000000000 + (len(names) - i) * 1000,) * 2)
+        keep_n = os.path.join(pd, names[2])    # the just-written one is a tie member, not the newest
+        prune_backups(pf, keep_n)
+        left = sorted(n for n in os.listdir(pd) if ".bak-" in n)
+        check("prune by name: keep + the 2 newest others (3 total), whatever the mtimes",
+              left == sorted([names[2], names[4], names[3]]))
+        prune_backups(pf, os.path.join(pd, names[3]))
+        check("prune by name: pruning again with the newest tie member as keep",
+              sorted(n for n in os.listdir(pd) if ".bak-" in n) == sorted([names[2], names[3], names[4]]))
+        env_names = ["g.json.bak-environment-20260101-000001-2", "g.json.bak-environment-20260101-000001",
+                     "g.json.bak-environment-20260101-000001-1", "g.json.bak-environment-20260101-000000",
+                     "g.json.bak-environment-20250101-000000"]
+        for n in env_names:
+            open(os.path.join(pd, n), "w").write("x")
+        prune_backups(os.path.join(pd, "g.json"), os.path.join(pd, env_names[0]), ".bak-environment")
+        check("prune by name: environment_render's name format, same rule",
+              sorted(n for n in os.listdir(pd) if n.startswith("g.json")) == sorted(env_names[:3]))
 
         # B2: the scanner
         def defaults_of(text):

@@ -20,6 +20,9 @@
 #     git worktree (install from the main checkout)
 #   - with --codex, also sets Codex's default model and reasoning effort when unset, and
 #     offers build and review profiles (codex -p build, codex -p review)
+#   - offers a blank copy of the environment file (templates/environment.md) that describes your
+#     setup to both agents' auto-approval reviewers; it never applies it, `bin/environment_render.py
+#     apply` does, after showing a diff
 #   - on macOS, offers two background jobs: the nightly memory checks and the bus_nudge loop
 #
 # What it never does: change settings.json or a CLAUDE.md without a yes, touch

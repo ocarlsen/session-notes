@@ -16,7 +16,9 @@ still hold the template placeholder, and headings with nothing under them, are d
 
     environment_render.py render [--target claude|codex] [--diff]
     environment_render.py diff [--target claude|codex|all]    silent rc 0 when equal, rc 1 + diff
-    environment_render.py apply [--target ...] [--yes]        confirm, back up, atomic write
+    environment_render.py apply [--target ...] [--yes] [--allow-worktree]
+                                                              confirm, back up, atomic write
+                                                              (codex: refuses from a linked git worktree)
     environment_render.py check                               drift check (nightly_check runs it)
     environment_render.py upstream [--codex-version X]        did Codex's bundled policy change?
     environment_render.py selftest
@@ -363,6 +365,47 @@ def codex_block_lines(policy):
     return out
 
 
+def stray_tail(inner, where):
+    """Lines inside the block after the closing quotes of auto_review.policy that
+    environment_render did not render: what an older `rules_block.py codex-defaults` put
+    there (its `# session-notes defaults` comment and top-level `key = value` lines). Returns
+    them with blank edges trimmed, to be kept after the END marker; [] when there are none.
+    Refuses (EnvError) on anything but comments, blanks and one-line top-level keys, rather
+    than delete it."""
+    body = "\n".join(inner)
+    k = body.find('auto_review.policy = """')
+    if k < 0:
+        return []
+    try:
+        _, end = toml_ml_decode(body, k + len("auto_review.policy = "))
+    except ValueError:
+        return []
+    tail = body[end:].split("\n")[1:]          # the rest of the closing-quotes line is dropped
+    tail = [ln for ln in tail]
+    while tail and not tail[0].strip():
+        tail.pop(0)
+    while tail and not tail[-1].strip():
+        tail.pop()
+    if not tail:
+        return []
+    headers, clean = scan_toml(tail, where + " (inside the session-notes block)")
+    bad = None
+    for no, ln in enumerate(tail):
+        t = ln.strip()
+        if not t or t.startswith("#"):
+            continue
+        path = _line_key(ln)
+        if no in headers or not clean[no] or not path or path[0] in (
+                set(k2 for k2, _ in CODEX_SETTINGS) | {"auto_review"}):
+            bad = ln
+            break
+    if bad is not None:
+        raise EnvError("%s: the session-notes block holds %r after the policy, which is not "
+                       "something this tool can move out of the block safely; move or remove "
+                       "that line by hand and apply again" % (where, bad.strip()))
+    return tail
+
+
 def place_codex_block(text, policy, where):
     """config.toml text with the block set to `policy`. Refuses on a conflicting setting."""
     lines = text.split("\n")
@@ -389,7 +432,12 @@ def place_codex_block(text, policy, where):
                                "by hand (remove it, or move it out of the way) and apply again"
                                % (where, orig_no(k), ln.strip()))
     new = codex_block_lines(policy)
+    moved = stray_tail(inner, where) if inner is not None else []
+    if moved:
+        new = new + [""] + moved       # kept, top-level, right after the END marker
     if inner is not None and h >= len(before):
+        if moved and after and after[0].strip():
+            after = [""] + after
         res = before + new + after                      # replace in place
     else:
         rest = before + after
@@ -398,7 +446,10 @@ def place_codex_block(text, policy, where):
             sep = [""] if rest and rest[-1].strip() else []
             res = rest + sep + new
         else:
-            while p > 0 and rest[p - 1].lstrip().startswith("#"):
+            # Step over a comment block above the first table (it belongs to that table), but
+            # only lines outside any multi-line string or array: a string that closes on a
+            # `#` line must not have the block inserted into it.
+            while p > 0 and clean[p - 1] and rest[p - 1].lstrip().startswith("#"):
                 p -= 1
             pre = rest[:p]
             sep = [""] if pre and pre[-1].strip() else []
@@ -415,7 +466,7 @@ def read_codex_block(text, where):
         return None
     before = split_block(lines, CODEX_BEGIN, CODEX_END, where)[0]
     hs, _ = scan_toml(before, where)
-    inside = before[hs[0]].strip() if hs else None
+    inside = before[hs[-1]].strip() if hs else None   # the nearest table header above
     settings = {}
     for ln in inner:
         m = re.match(r'^(sandbox_mode|approval_policy|approvals_reviewer) = "(.*)"$', ln)
@@ -478,11 +529,22 @@ def atomic_write(path, data, backup=True):
         if backup:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             bak = path + BAK + stamp
-            n = 0
-            while os.path.exists(bak):
-                n += 1
-                bak = "%s%s%s-%d" % (path, BAK, stamp, n)
-            shutil.copy2(real, bak)
+            # On a same-second clash: the number after every existing one (never a pruned
+            # lower name), so ranking backups by name stays correct.
+            d0, name0 = os.path.split(bak)
+            top = -1
+            for other in os.listdir(d0 or "."):
+                if other == name0:
+                    top = max(top, 0)
+                elif other.startswith(name0 + "-") and other[len(name0) + 1:].isdigit():
+                    top = max(top, int(other[len(name0) + 1:]))
+            if top >= 0:
+                bak = "%s-%d" % (bak, top + 1)
+            shutil.copyfile(real, bak)     # not copy2: prune orders by when the copy was made
+            shutil.copymode(real, bak)
+    if bak:
+        import rules_block      # lazy: rules_block imports this module for CODEX_END
+        rules_block.prune_backups(path, bak, BAK.rstrip("-"))
     d = os.path.dirname(real) or "."
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".environment-", dir=d)
@@ -550,6 +612,11 @@ def codex_diff(ctx, entries):
     elif blk[3]:
         out.append("codex: the session-notes block in %s is inside table %s; Codex does not "
                    "read it as top-level (run apply to move it)" % (ctx.config_toml, blk[3]))
+    moved = stray_tail(blk[2], ctx.config_toml) if blk else []
+    if moved:
+        out.append("codex: %d line(s) inside the block are not ours (an older codex-defaults put "
+                   "them there); apply moves them, unchanged, to just after the END marker:\n%s"
+                   % (len(moved), "\n".join("  " + ln for ln in moved)))
     if have_cfg != want_cfg:
         out.append(udiff(have_cfg, want_cfg, "installed " + ctx.config_toml,
                          "rendered " + ctx.config_toml))
@@ -617,6 +684,9 @@ def apply_claude(ctx, entries, yes):
     doc = json.loads(raw) if raw is not None else {}
     if raw is not None and not isinstance(doc, dict):
         raise EnvError("%s is not a JSON object" % ctx.settings)
+    if "autoMode" in doc and not isinstance(doc["autoMode"], dict):
+        raise EnvError("%s: autoMode is not an object; fix or remove that key by hand"
+                       % ctx.settings)
     emit(text)
     if not yes and not confirm("Write autoMode.environment to %s?" % ctx.settings):
         emit("claude: not written")
@@ -648,11 +718,44 @@ def apply_codex(ctx, entries, yes):
         emit("codex: wrote %s%s" % (path, " (backup %s)" % bak if bak else ""))
 
 
-def cmd_apply(ctx, target, yes):
+def linked_worktree(path):
+    """True when path sits in a linked git worktree (its .git is a file, or its git dir is not
+    the common dir): a checkout that is deleted when its branch merges."""
+    if not os.path.isdir(path):
+        return False
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--git-dir", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=20,
+                           env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+    except (OSError, subprocess.SubprocessError):
+        r = None
+    if r is not None and r.returncode == 0 and len(r.stdout.split("\n")) >= 2:
+        gd, cd = r.stdout.split("\n")[:2]
+        gd, cd = (os.path.realpath(os.path.join(path, x)) for x in (gd, cd))
+        return gd != cd
+    cur = os.path.realpath(path)
+    while True:                       # no usable git: look for a .git FILE up the tree
+        if os.path.isfile(os.path.join(cur, ".git")):
+            return True
+        if os.path.exists(os.path.join(cur, ".git")) or os.path.dirname(cur) == cur:
+            return False
+        cur = os.path.dirname(cur)
+
+
+def cmd_apply(ctx, target, yes, allow_worktree=False):
     entries = load_entries(ctx)
     if not entries:
         raise EnvError("%s renders to nothing (an untouched template, or all comments); "
                        "refusing to apply an empty environment" % ctx.source)
+    codex_applies = "codex" in target_list(ctx, target) and not (
+        target == "all" and not os.path.isdir(ctx.codex_home))
+    if codex_applies and not allow_worktree:      # before ANY write, Claude's included
+        for d in ctx.send_bin_dirs():
+            if linked_worktree(d):
+                raise EnvError("%s is in a linked git worktree, and the Codex allow rules "
+                               "would name it (deleted when the branch merges); apply from "
+                               "the main checkout, or pass --allow-worktree to test a "
+                               "branch" % d)
     for t in target_list(ctx, target):
         home = ctx.claude_home if t == "claude" else ctx.codex_home
         if target == "all" and not os.path.isdir(home):
@@ -772,6 +875,8 @@ def main(argv=None):
     a = sub.add_parser("apply")
     a.add_argument("--target", choices=TARGETS + ("all",), default="all")
     a.add_argument("--yes", "-y", action="store_true")
+    a.add_argument("--allow-worktree", action="store_true",
+                   help="codex target: allow rules naming a linked git worktree's bin")
     sub.add_parser("check")
     u = sub.add_parser("upstream")
     u.add_argument("--codex-version")
@@ -792,7 +897,7 @@ def main(argv=None):
         if args.cmd == "diff":
             return cmd_diff(ctx, args.target)
         if args.cmd == "apply":
-            return cmd_apply(ctx, args.target, args.yes)
+            return cmd_apply(ctx, args.target, args.yes, args.allow_worktree)
         if args.cmd == "check":
             _, rc, text = check()
             sys.stdout.write(text)
@@ -804,6 +909,13 @@ def main(argv=None):
 
 
 # --------------------------------------------------------------- selftest
+try:
+    import tomllib
+    HAVE_TOMLLIB = True
+except ImportError:     # Python < 3.11: the selftest's TOML validity asserts are skipped, loudly
+    tomllib = None
+    HAVE_TOMLLIB = False
+
 FIXTURE = """<!-- header
 spans lines -->
 ### Org-wide
@@ -936,11 +1048,8 @@ def selftest():
 
     # ---- table headers and strings (B1, N1, N2)
     def tomlcheck(text):
-        try:
-            import tomllib
-        except ImportError:
-            return True
-        tomllib.loads(text)
+        if HAVE_TOMLLIB:
+            tomllib.loads(text)
         return True
     for name, src in (
             ("odd header chars", '[projects."/srv/data/Sync Folder/cloud~store/proj"]\ntrust = "x"\n'),
@@ -1096,8 +1205,13 @@ def selftest():
         check("diff: a foreign line inside the block shows as a removal",
               rc == 1 and "-model = 'foreign'" in out)
         rc, out = run(cmd_apply, ctx, "codex", True)
-        check("apply shows it and removes it", "-model = 'foreign'" in out
-              and "model = 'foreign'" not in open(ctx.config_toml).read())
+        moved_cfg = open(ctx.config_toml).read()
+        check("apply shows the move and keeps the foreign key, now after the END marker",
+              "-model = 'foreign'" in out and "moves them" in out
+              and moved_cfg.count("model = 'foreign'") == 1
+              and moved_cfg.index("model = 'foreign'") > moved_cfg.index(CODEX_END)
+              and moved_cfg.index("model = 'foreign'") < moved_cfg.index("[sandbox_workspace_write]")
+              and run(cmd_diff, ctx, "codex") == (0, ""))
 
         # nightly check + upstream, injected
         with open(srcf, "w") as fh:
@@ -1164,7 +1278,11 @@ def selftest():
             VERSION_FN = lambda: "0.171.0"
             FETCH = lambda url: policy
 
-            # through nightly_check, with a real config in a temp HOME
+            # through nightly_check, with a real config in a temp HOME. nightly_check does its
+            # own `import environment_render`; make that resolve to THIS module so the FETCH /
+            # VERSION_FN stubs reach it (never the real codex or network).
+            saved_mod = sys.modules.get("environment_render")
+            sys.modules["environment_render"] = sys.modules[__name__]
             import nightly_check
             conf = os.path.join(d, "config.toml")
             with open(conf, "w") as fh:
@@ -1181,10 +1299,21 @@ def selftest():
             rc = nightly_check.run_all(env, NoRun(), buf)
             check("nightly_check reports the environment drift (rc 3)",
                   rc == 3 and "environment_render" in buf.getvalue())
-            run(cmd_apply, context(env), "all", True)
+            run(cmd_apply, context(env), "all", True, allow_worktree=linked_worktree(BIN))   # a worktree needs the flag
             buf = io.StringIO()
             rc = nightly_check.run_all(env, NoRun(), buf)
             check("nightly_check silent when the environment is in sync", rc == 0 and buf.getvalue() == "")
+            def failing_fetch(url):
+                raise OSError("offline")
+            FETCH = failing_fetch
+            buf = io.StringIO()
+            rc = nightly_check.run_all(env, NoRun(), buf)
+            doc = json.load(open(os.path.join(d, "state", "last-check.json")))
+            envc = [c for c in doc["checks"] if c["check"] == "environment_render"]
+            check("nightly_check: a failed upstream fetch puts the note in the report, rc 0, 0 findings",
+                  rc == 0 and "could not check" in buf.getvalue()
+                  and envc and envc[0]["findings"] == 0 and envc[0]["status"] == "clean")
+            FETCH = lambda url: policy
             os.unlink(srcf)
             buf = io.StringIO()
             rc = nightly_check.run_all(env, NoRun(), buf)
@@ -1193,6 +1322,133 @@ def selftest():
                   rc == 0 and buf.getvalue() == "" and all(c["check"] != "environment_render" for c in doc["checks"]))
         finally:
             FETCH = VERSION_FN = None
+            if saved_mod is None:
+                sys.modules.pop("environment_render", None)
+            else:
+                sys.modules["environment_render"] = saved_mod
+
+    # ---- review follow-ups (PR #49)
+    # a multi-line string closing on a `#` line right before the first table
+    src = 'instructions = """\ndo\n# notes"""\n[tbl]\nk=1\n'
+    o = place_codex_block(src, "P\n", "c.toml")
+    check("a string closing on a # line: block lands top-level, before the table, not in the string",
+          o.index(CODEX_BEGIN) > o.index('# notes"""') and o.index(CODEX_END) < o.index("[tbl]")
+          and read_codex_block(o, "c")[3] is None and place_codex_block(o, "P\n", "c.toml") == o)
+    if HAVE_TOMLLIB:
+        data = tomllib.loads(o)
+        check("... and the result parses with the string intact and the settings top-level",
+              data["instructions"] == "do\n# notes" and data["sandbox_mode"] == "workspace-write"
+              and data["tbl"] == {"k": 1})
+    # a plain comment above the first table still stays with that table
+    o = place_codex_block("# about tbl\n[tbl]\nk=1\n", "P\n", "c.toml")
+    check("a comment block above the first table stays with it",
+          o.index(CODEX_END) < o.index("# about tbl") < o.index("[tbl]"))
+    # the "inside table" message names the nearest header above the block
+    two = "[a]\nk = 1\n[b]\nj = 1\n" + "\n".join(codex_block_lines("P\n")) + "\n"
+    check("a block under two tables names the nearest one", read_codex_block(two, "c")[3] == "[b]")
+
+    # N-e: autoMode that is not an object is a loud refusal naming the key
+    with tempfile.TemporaryDirectory() as d:
+        ch2 = os.path.join(d, "claude")
+        os.makedirs(ch2)
+        srcf2 = os.path.join(d, "environment.md")
+        with open(srcf2, "w") as fh:
+            fh.write(FIXTURE)
+        ctx2 = Ctx(srcf2, ch2, os.path.join(d, "codex"), bin_dirs=[os.path.join(d, "bin")])
+        for bad in (None, "x", [1]):
+            with open(ctx2.settings, "w") as fh:
+                json.dump({"autoMode": bad, "z": 1}, fh)
+            msg = None
+            try:
+                run(cmd_apply, ctx2, "claude", True)
+            except EnvError as exc:
+                msg = str(exc)
+            check("apply refuses autoMode=%r naming the key, settings untouched" % (bad,),
+                  msg is not None and "autoMode" in msg
+                  and json.load(open(ctx2.settings)) == {"autoMode": bad, "z": 1})
+
+        # N-g: only the newest 3 .bak-environment-* copies of each file are kept
+        with open(ctx2.settings, "w") as fh:
+            json.dump({"autoMode": {"environment": ["old"]}}, fh)
+        for i in range(6):
+            run(cmd_apply, ctx2, "claude", True)
+            with open(ctx2.settings, "w") as fh:
+                json.dump({"autoMode": {"environment": ["old%d" % i]}}, fh)
+            time.sleep(0.02)
+        baks2 = sorted(f for f in os.listdir(ch2) if ".bak-environment-" in f)
+        lookalike = os.path.join(ch2, "settings.json.bak-environment-notes")
+        open(lookalike, "w").write("keep\n")
+        run(cmd_apply, ctx2, "claude", True)
+        left = [f for f in os.listdir(ch2) if f.startswith("settings.json.bak-environment-2")]
+        survivors = sorted(open(os.path.join(ch2, f)).read() for f in left)
+        check("backups pruned to the newest 3; a lookalike name is never touched",
+              len(baks2) <= 3 and len(left) == 3 and open(lookalike).read() == "keep\n")
+        check("the newest three backups are the ones kept",
+              all(json.loads(t)["autoMode"]["environment"][0] in ("old3", "old4", "old5") for t in survivors)
+              and len(set(survivors)) == 3)
+
+    # F2: codex apply from a linked git worktree refuses unless --allow-worktree
+    if shutil.which("git"):
+        with tempfile.TemporaryDirectory() as d:
+            main_co, wt = os.path.join(d, "main"), os.path.join(d, "wt")
+            clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            g = lambda *a, cwd=main_co: subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                 "-c", "commit.gpgsign=false", "-C", cwd] + list(a),
+                capture_output=True, text=True, check=True, env=clean_env)
+            os.makedirs(os.path.join(main_co, "bin"))
+            open(os.path.join(main_co, "bin", "x"), "w").write("x\n")
+            g("init", "-q")
+            g("add", ".")
+            g("commit", "-q", "-m", "init")
+            g("worktree", "add", "-q", "-b", "b", wt)
+            check("linked_worktree: true in a worktree, false in the main checkout",
+                  linked_worktree(os.path.join(wt, "bin")) and not linked_worktree(os.path.join(main_co, "bin"))
+                  and not linked_worktree(os.path.join(d, "nowhere")))
+            other = os.path.join(d, "other")
+            os.makedirs(other)
+            g("init", "-q", cwd=other)
+            saved_git = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("GIT_")}
+            os.environ["GIT_DIR"] = os.path.join(other, ".git")
+            try:
+                check("linked_worktree ignores an inherited GIT_DIR pointing at another repo",
+                      linked_worktree(os.path.join(wt, "bin")) and not linked_worktree(os.path.join(main_co, "bin")))
+            finally:
+                os.environ.pop("GIT_DIR", None)
+                os.environ.update(saved_git)
+            srcf3, xh3 = os.path.join(d, "environment.md"), os.path.join(d, "codex")
+            os.makedirs(xh3)
+            with open(srcf3, "w") as fh:
+                fh.write(FIXTURE)
+            ctx3 = Ctx(srcf3, os.path.join(d, "claude"), xh3, bin_dirs=[os.path.join(wt, "bin")])
+            msg = raises(cmd_apply, ctx3, "codex", True) or ""
+            check("apply --target codex from a worktree refuses, naming the fix, writes nothing",
+                  "linked git worktree" in msg and "main checkout" in msg and "--allow-worktree" in msg
+                  and not os.path.exists(ctx3.config_toml) and not os.path.exists(ctx3.rules))
+            os.makedirs(ctx3.claude_home)
+            with open(ctx3.settings, "w") as fh:
+                json.dump({"z": 1}, fh)
+            buf3 = io.StringIO()
+            with contextlib.redirect_stdout(buf3):
+                msg = raises(cmd_apply, ctx3, "all", True) or ""
+            check("apply --target all refuses before writing anything, Claude's settings included",
+                  "linked git worktree" in msg and json.load(open(ctx3.settings)) == {"z": 1}
+                  and not [f for f in os.listdir(ctx3.claude_home) if ".bak" in f])
+            rc, out = run(cmd_diff, ctx3, "codex")
+            check("diff from a worktree still runs", rc == 1 and "no session-notes block" in out)
+            run(cmd_apply, ctx3, "codex", True, allow_worktree=True)
+            check("--allow-worktree applies", os.path.exists(ctx3.config_toml)
+                  and os.path.join(wt, "bin") in open(ctx3.rules).read())
+            ctx4 = Ctx(srcf3, os.path.join(d, "claude"), os.path.join(d, "codex4"),
+                       bin_dirs=[os.path.join(main_co, "bin")])
+            os.makedirs(ctx4.codex_home)
+            run(cmd_apply, ctx4, "codex", True)
+            check("the main checkout applies without the flag", os.path.exists(ctx4.config_toml))
+    else:
+        print("git unavailable: worktree guard asserts skipped")
+
+    if not HAVE_TOMLLIB:
+        print("tomllib unavailable: TOML validity asserts skipped (run under python3.11+)")
 
     dash = chr(0x2014)
     import glob

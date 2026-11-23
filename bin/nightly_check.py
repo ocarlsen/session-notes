@@ -10,7 +10,7 @@ prefix. Codex has no boot-budget check yet; its AGENTS.md has its own cap.
 An agent counts as installed when its home directory exists: paths.claude_home
 for Claude, agent.codex_home for Codex.
 
-    python3 nightly_check.py               # silent + exit 0 when every check is clean
+    python3 nightly_check.py               # silent + exit 0 when every check is clean (a could-not-check note may print)
     python3 nightly_check.py status        # one line (or nothing) from the last run's record
     python3 launch_agents.py install nightly-check   # run it every night (macOS)
     python3 nightly_check.py --selftest
@@ -204,6 +204,8 @@ def _environment_check(env, out, checks):
     if rc == 0:
         checks.append({"agent": "all", "check": "environment_render", "status": "clean",
                        "findings": 0})
+        if text.strip():   # a could-not-check note: in the report, never a finding
+            out.write("== all: environment_render (note) ==\n%s\n" % text.rstrip())
         return 0
     findings = sum(1 for ln in text.splitlines() if ln.startswith(("claude: ", "codex: ", "upstream ")))
     checks.append({"agent": "all", "check": "environment_render", "status": "findings",
@@ -326,6 +328,21 @@ def selftest():
         buf = _Buf()
         check("a boot_budget BLIND line is a finding, not a crash",
               run_all(env, run, buf) == 3 and "(findings)" in buf.text)
+
+        # --- environment_render's could-not-check note reaches the report, not the rc
+        import environment_render
+        saved_check = environment_render.check
+        environment_render.check = lambda env=None: (True, 0, "upstream: could not check (no codex)\n")
+        try:
+            nbuf = _Buf()
+            nchecks = []
+            nrc = _environment_check({}, nbuf, nchecks)
+        finally:
+            environment_render.check = saved_check
+        check("environment note: in the report text, rc 0, recorded clean not as a finding",
+              nrc == 0 and "could not check" in nbuf.text
+              and nchecks == [{"agent": "all", "check": "environment_render", "status": "clean",
+                               "findings": 0}])
 
         # --- the status record ---
         status_file = os.path.join(d, "state", "last-check.json")
