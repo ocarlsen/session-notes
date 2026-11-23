@@ -57,7 +57,9 @@ except Exception as _exc:  # fail open, reported by main()
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 PATCH_TOOLS = ("apply_patch",)
-# UNVERIFIED until a live Codex run: the names Codex gives its shell tool. Claude's is "Bash".
+# Recorded from Codex 0.171 (tests/fixtures/codex_pretooluse_*.json): its shell tool is named
+# "Bash" with tool_input {"command": "<string>"}, and apply_patch carries the whole patch text in
+# tool_input {"command": "*** Begin Patch\n..."}. The other names are older/other Codex builds.
 SHELL_TOOLS = ("shell", "exec_command", "local_shell", "container.exec", "Bash")
 
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
@@ -1232,6 +1234,37 @@ def selftest():
         r = run({"tool_name": "shell", "cwd": main_repo,
                  "tool_input": {"command": ["bash", "-lc", "apply_patch <<'EOF'\n" + patch + "EOF"]}})
         check("codex: apply_patch run through the shell is an edit", refused(r), r.stderr)
+
+        # The payloads Codex 0.171 really sends (recorded, scrubbed fixtures).
+        fx = os.path.join(ROOT, "tests", "fixtures")
+
+        def recorded(name, cwd, **tool_input):
+            with open(os.path.join(fx, name)) as fh:
+                pl = json.load(fh)
+            pl["cwd"] = cwd
+            pl["tool_input"].update(tool_input)
+            return pl
+
+        r = run(recorded("codex_pretooluse_apply_patch.json", main_repo,
+                         command=patch))
+        check("codex recorded: apply_patch on a tracked file of main refused", refused(r), r.stderr)
+        pl = recorded("codex_pretooluse_apply_patch.json", main_repo)
+        pl["tool_input"]["command"] = pl["tool_input"]["command"].replace("tracked.txt", "a.txt")
+        r = run(pl)
+        check("codex recorded: the fixture's own patch (path swapped) refused, names the file",
+              refused(r) and "a.txt" in r.stderr, r.stderr)
+        r = run(recorded("codex_pretooluse_apply_patch.json", wt1))
+        check("codex recorded: apply_patch in a linked worktree passes", passed(r), r.stderr)
+        r = run(recorded("codex_pretooluse_apply_patch.json", nongit))
+        check("codex recorded: apply_patch outside a repo passes", passed(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", nongit, command="gh pr merge 1 --squash"))
+        check("codex recorded: Bash `gh pr merge` refused", refused(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", dirty_repo, command="git reset --hard"))
+        check("codex recorded: Bash `git reset --hard` on a dirty tree refused", refused(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", mkrepo("cx_clean"), command="git reset --hard"))
+        check("codex recorded: Bash `git reset --hard` on a clean tree passes", passed(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", main_repo))
+        check("codex recorded: the fixture's own `git status --short` passes", passed(r), r.stderr)
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0

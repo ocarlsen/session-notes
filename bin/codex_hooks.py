@@ -18,7 +18,7 @@ script's marker line is refused untouched. `session-notes hook <name>` runs
 `<repo>/hooks/<name>.py` with stdin, environment and arguments passed through. When the repo
 or the script is missing, the guard hooks (GUARDS below) fail closed with exit 2; every other hook
 prints one warning line and exits 0 so prompts keep working. For a PreToolUse guard
-(checkout_guard, once registered) exit 2 blocks the tool call. em_dash_guard is PostToolUse:
+(checkout_guard) exit 2 blocks the tool call. em_dash_guard is PostToolUse:
 the edit has already happened, and the model is told the check did not run. `session-notes repo` prints the baked path.
 
 `merge` is a refresh, not a one-shot write: it replaces only session-notes entries and
@@ -38,6 +38,7 @@ What gets registered (every command is prefixed SESSION_NOTES_AGENT=codex):
   SessionStart      codex_session_start (boot load), session_pane_registry
   UserPromptSubmit  time_sense, session_bus_hook
   Stop              session_bus_hook
+  PreToolUse        Bash|apply_patch: checkout_guard
   PostToolUse       apply_patch: em_dash_guard
 session_pane_registry is SessionStart only: it is not on UserPromptSubmit or Stop
 because nothing reads a Codex pane's turn state (session_peers skips non-Claude panes).
@@ -59,7 +60,7 @@ import sys
 import tempfile
 
 OWNED = ("codex_session_start.py", "time_sense.py", "session_bus_hook.py",
-         "session_pane_registry.py", "em_dash_guard.py")
+         "session_pane_registry.py", "em_dash_guard.py", "checkout_guard.py")
 # Hooks that fail CLOSED (exit 2) when their script is missing. One source: the launcher
 # script is generated from this tuple.
 GUARDS = ("em_dash_guard", "checkout_guard")
@@ -95,6 +96,11 @@ def desired(launcher):
         "Stop": [
             # no additionalContextLimit: Stop cannot add context, and Codex warns on it
             {"hooks": [h("session_bus_hook.py", timeout=10)]},
+        ],
+        "PreToolUse": [
+            # Codex 0.171 names its shell tool "Bash" and its patch tool "apply_patch"
+            # (recorded payloads: tests/fixtures/codex_pretooluse_*.json)
+            {"matcher": "Bash|apply_patch", "hooks": [h("checkout_guard.py", timeout=10)]},
         ],
         "PostToolUse": [
             {"matcher": "apply_patch", "hooks": [h("em_dash_guard.py", timeout=10)]},
@@ -503,6 +509,11 @@ def selftest():
                                          for c in cmds(d, e))] == ["SessionStart"])
         check("fresh: em dash guard on apply_patch",
               d["hooks"]["PostToolUse"][0]["matcher"] == "apply_patch")
+        check("fresh: checkout guard on PreToolUse for the recorded tool names Bash and apply_patch",
+              d["hooks"]["PreToolUse"][0]["matcher"] == "Bash|apply_patch"
+              and [c.rsplit(" ", 1)[1] for c in cmds(d, "PreToolUse")] == ["checkout_guard"]
+              and all(re.search(d["hooks"]["PreToolUse"][0]["matcher"], t) for t in ("Bash", "apply_patch"))
+              and not re.search("^(?:%s)$" % d["hooks"]["PreToolUse"][0]["matcher"], "Read"))
         check("fresh: every command carries the agent prefix", all(
             c.startswith("SESSION_NOTES_AGENT=codex ")
             for e in d["hooks"] for c in cmds(d, e)))
@@ -520,7 +531,7 @@ def selftest():
         d = load()
         d["hooks"]["Stop"].append({"hooks": [foreign]})
         d["hooks"]["UserPromptSubmit"][0]["hooks"].insert(0, foreign)
-        d["hooks"]["PreToolUse"] = [{"matcher": "Bash", "hooks": [foreign]}]
+        d["hooks"]["PermissionRequest"] = [{"matcher": "Bash", "hooks": [foreign]}]
         d["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = 99  # a stale edit of ours
         d["model"] = "keep-me"
         with open(path, "w") as fh:
@@ -530,7 +541,7 @@ def selftest():
               and load()["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] == 99)
         refresh(path, launcher)
         n = load()
-        check("foreign: other events and keys untouched", n["hooks"]["PreToolUse"] == d["hooks"]["PreToolUse"]
+        check("foreign: other events and keys untouched", n["hooks"]["PermissionRequest"] == d["hooks"]["PermissionRequest"]
               and n["model"] == "keep-me")
         check("foreign: Stop keeps the private hook", foreign["command"] in cmds(n, "Stop"))
         check("foreign: mixed group keeps the private hook", foreign["command"] in cmds(n, "UserPromptSubmit"))
@@ -590,7 +601,7 @@ def selftest():
                     name = x["command"].rsplit(" ", 1)[1]
                     x["command"] = "%spython3 %s/hooks/%s.py" % (pre, legacy_checkout, name)
         mig["hooks"]["Stop"].append({"hooks": [foreign]})
-        mig["hooks"]["PreToolUse"] = [{"hooks": [foreign]}]
+        mig["hooks"]["PermissionRequest"] = [{"hooks": [foreign]}]
         mig["model"] = "keep-me"
         with open(path, "w") as fh:
             fh.write(render(mig))
@@ -603,7 +614,7 @@ def selftest():
               and cmds(m, "Stop") == fresh_cmds["Stop"] + [foreign["command"]]
               and not any(legacy_checkout in c for e in m["hooks"] for c in cmds(m, e)))
         check("migrate: foreign and private entries untouched, no duplicates",
-              m["hooks"]["PreToolUse"] == [{"hooks": [foreign]}] and m["model"] == "keep-me"
+              m["hooks"]["PermissionRequest"] == [{"hooks": [foreign]}] and m["model"] == "keep-me"
               and sum(c == new("session_bus_hook") for e in m["hooks"] for c in cmds(m, e)) == 2
               and all(len(cmds(m, e)) == len(set(cmds(m, e)))
                       for e in ("SessionStart", "PostToolUse")))
@@ -625,11 +636,11 @@ def selftest():
 
         # foreign empty events survive; unexpected shapes are refused untouched
         e = load()
-        e["hooks"]["PreToolUse"] = []
+        e["hooks"]["PermissionRequest"] = []
         with open(path, "w") as fh:
             fh.write(render(e))
         refresh(path, launcher)
-        check("foreign empty event preserved", load()["hooks"].get("PreToolUse") == [])
+        check("foreign empty event preserved", load()["hooks"].get("PermissionRequest") == [])
         for bad in ({"hooks": {"Stop": {"a": 1}}}, {"hooks": {"Stop": ["x"]}},
                     {"hooks": {"Stop": [{"hooks": ["x"]}]}}, {"hooks": []}):
             with open(path, "w") as fh:

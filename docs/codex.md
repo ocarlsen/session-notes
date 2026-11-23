@@ -79,6 +79,7 @@ desktop app's PATH lacks `~/.local/bin`):
 | SessionStart | `codex_session_start` (boot load), `session_pane_registry` |
 | UserPromptSubmit | `time_sense`, `session_bus_hook` |
 | Stop | `session_bus_hook` |
+| PreToolUse (`Bash`, `apply_patch`) | `checkout_guard`: refuses an edit of a tracked file on the default branch of a main checkout (the patch text is read for its target paths), a raw `gh pr merge`, and destructive git on a dirty tree. A refusal blocks the tool call and the model is shown the reason |
 | PostToolUse (`apply_patch`) | `em_dash_guard`, which checks only the lines a patch adds |
 
 **The launcher.** `python3 bin/codex_hooks.py launcher --repo <checkout>` writes the script
@@ -94,7 +95,7 @@ idle-prompt hook; `time_sense.py` tells Codex to run `$refresh` where it tells C
 
 **Refresh.** Rerunning the install updates the file in place through `bin/codex_hooks.py`.
 It replaces only this repo's entries: a command with the `SESSION_NOTES_AGENT=codex` prefix
-that runs `<launcher> hook <name>` for one of the five hooks above (the launcher may be at any
+that runs `<launcher> hook <name>` for one of the hooks above (the launcher may be at any
 path), or the older form that ran `python3 <checkout>/hooks/<script>.py` (so entries from a
 moved or removed checkout are migrated, not duplicated). Everything else, including your
 private hooks, is kept, and nothing is written when nothing changed, so a second run is a
@@ -116,10 +117,20 @@ skill links, the `SESSION_NOTES` value in config.toml and the lines in `rules/de
 A later change moves them to the launcher; until then, fix them by hand when you move a
 checkout. Until you reinstall, a missing checkout is survivable: an informational hook prints
 one warning line and passes, so prompts keep working. A guard hook fails closed with exit 2.
-For a PreToolUse guard (`checkout_guard`, once registered) that blocks the tool call. For
+For a PreToolUse guard (`checkout_guard`) that blocks the tool call. For
 `em_dash_guard`, which is PostToolUse, the edit has already happened, and the model is told
 the check did not run. `codex_hooks.py merge` warns about any entry, ours or not, whose script
 or launcher is missing, or whose launcher's checkout lacks the script.
+
+**The checkout guard.** Codex 0.171 sends `checkout_guard` a PreToolUse payload with
+`tool_name` `Bash` and `tool_input.command` (a string) for a shell command, and `tool_name`
+`apply_patch` with the whole patch text in `tool_input.command`; both carry `cwd`. The guard
+exits 2 with one paragraph on stderr, and Codex then refuses the tool call and shows the model
+that text ("Command blocked by PreToolUse hook: checkout_guard: ..."). The recorded payloads
+(identifiers scrubbed) are `tests/fixtures/codex_pretooluse_*.json`, and the guard's selftest
+runs against them. It is a new hook, so trust it once after installing (`/hooks`). To refuse
+nothing it should not, exempt repos in the config's `[checkout_guard]` section; see
+`docs/tools.md`.
 
 ## Sessions and the bus
 

@@ -1,0 +1,14 @@
+{
+  "cwd": "{CWD}",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-6.2-sol",
+  "permission_mode": "bypassPermissions",
+  "session_id": "SESSION_ID",
+  "tool_input": {
+    "command": "git status --short"
+  },
+  "tool_name": "Bash",
+  "tool_use_id": "TOOL_USE_ID",
+  "transcript_path": "TRANSCRIPT_PATH",
+  "turn_id": "TURN_ID"
+}

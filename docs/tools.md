@@ -191,7 +191,7 @@ nothing is written and the command says so; wt never sets or changes `core.hooks
 ## checkout_guard: keep work out of the main checkout
 
 `hooks/checkout_guard.py` is a PreToolUse hook (installed by default for Claude Code, matcher
-`Edit|Write|MultiEdit|NotebookEdit|Bash`). It reads the tool payload and either exits 0 (allow,
+`Edit|Write|MultiEdit|NotebookEdit|Bash`, and for Codex by `install.sh --codex`). It reads the tool payload and either exits 0 (allow,
 silent) or exits 2 with one paragraph on stderr (refuse; the model sees the reason).
 
 **Arm A, edits.** `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are
@@ -253,10 +253,10 @@ not expanded: a `-C "$VAR"` or `cd "$VAR"` that cannot be resolved is judged aga
 existing parent directory, and `> "$CFG"` is not recognised as a config write. The `gh pr merge`
 exemption is keyed on the current directory's repo. `gh api` merges are not covered.
 
-**Codex.** The hook already understands Codex `apply_patch` and shell payloads, but the shell
-tool's name is not verified: the accepted names live in one constant (`SHELL_TOOLS`) and are
-guesses until a live Codex run. For that reason `install.sh --codex` does not register the hook
-yet.
+**Codex.** `install.sh --codex` registers the hook on PreToolUse for the tool names `Bash` and
+`apply_patch`, the names and payload shapes recorded from Codex 0.171
+(`tests/fixtures/codex_pretooluse_*.json`; see `docs/codex.md`). Codex honours exit 2 and
+refuses the tool call. The other names in `SHELL_TOOLS` are kept for other Codex builds.
 
 ## live: what just happened, across scopes
 
@@ -492,7 +492,7 @@ launching anything.
 Limits worth knowing: Codex runs with `--dangerously-bypass-hook-trust`, so hook trust is not
 covered; tmux is reached only through a sandbox `TMUX_TMPDIR` (asserted before any pane-listing
 tool runs); `launchctl` and `gh` are stubs; `em_dash_guard` is advisory, so its row checks that the
-flag reached the session, not that the file was refused.
+flag reached the session, not that the file was refused. The `checkout` row checks both CLIs: the tracked file is unchanged and the guard's own text reached the session, and for Codex a new file in the same repo is still allowed (negative control).
 
 ### Watch mode: `make selftest-watch`
 

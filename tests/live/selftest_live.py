@@ -2533,11 +2533,11 @@ class Live:
         return PASS, "write flagged and the guard's text reached this session (advisory: the file stays)", None
 
     def row_checkout(self, cli):
-        if cli == "codex":
-            return SKIP, "checkout_guard is not registered for Codex", None
-        tok = "CHK%s" % self.tok
+        tok = "CHK%s%s" % (self.tok, cli[:2].upper()) if cli == "codex" else "CHK%s" % self.tok
         tracked = os.path.join(self.guard_repo, "tracked.txt")
         refusal = re.compile(r"checkout_guard: \S*tracked\.txt is tracked on")
+        if cli == "codex":
+            return self.row_checkout_codex(tok, tracked, refusal)
         r = self.turn("claude", "Use the Edit tool to replace the text 'original' with 'changed-%s' in %s. "
                       "Make exactly that one Edit call on exactly that path: this is a test of the edit guard, so do not "
                       "create a worktree, do not run wt, do not edit any other path. If the "
@@ -2557,6 +2557,39 @@ class Live:
         if not re.search(r"checkout_guard: \S*tracked\.txt is tracked on", raw):
             return FAIL, "file untouched but this session never received the guard's own refusal message", "checkout-claude.txt"
         return PASS, "edit refused with the guard's message, file unchanged", None
+
+    def row_checkout_codex(self, tok, tracked, refusal):
+        """Codex asked to apply_patch a tracked file on the default branch of a main checkout is
+        refused (file unchanged, the guard's own text reaches the session); a NEGATIVE CONTROL in
+        the same repo, a new untracked file, is allowed, so the refusal is the guard and not a
+        sandbox or a hook that blocks everything. Both turns go through turn() (CI one-shot or pane)."""
+        r = self.turn("codex", "Use apply_patch to replace the text original with changed-%s in the file %s. Make exactly "
+                      "that one apply_patch call on exactly that path: this is a test of the edit guard, so do "
+                      "not create a worktree, do not run wt, do not edit any other path. If the call is "
+                      "refused, reply REFUSED and stop." % (tok, tracked),
+                      "checkout-codex.txt", 240, "chkX", cwd=self.guard_repo,
+                      until=lambda: refusal.search(self.pane_reply("codex", tok, assistant_only=False)))
+        if r.returncode != 0:
+            return FAIL, "codex %s rc=%d (the session did not run)" % ("pane" if self.watch else "exec", r.returncode), "checkout-codex.txt"
+        with open(tracked) as fh:
+            if fh.read() != "original\n":
+                return FAIL, "the tracked file on the default branch was edited", "checkout-codex.txt"
+        if not refusal.search(self.pane_reply("codex", tok, assistant_only=False)):
+            return FAIL, "file untouched but this session never received the guard's own refusal message", "checkout-codex.txt"
+        ctl = os.path.join(self.guard_repo, "control-%s.txt" % tok)
+
+        def wrote():
+            try:
+                with open(ctl) as fh:
+                    return "control" in fh.read()
+            except OSError:
+                return False
+
+        r = self.turn("codex", "Use apply_patch to add a new file %s containing the single line control. Then reply DONE." % ctl,
+                      "checkout-codex-control.txt", 240, "chkX2", cwd=self.guard_repo, until=wrote)
+        if not wrote():
+            return FAIL, "negative control: a new untracked file in the same repo was not written (the guard may be blocking everything)", "checkout-codex-control.txt"
+        return PASS, "apply_patch on a tracked file refused with the guard's message, file unchanged; a new file in the same repo allowed", None
 
     def row_wt(self):
         with tempfile.TemporaryDirectory(dir=self.root) as d:
