@@ -2220,7 +2220,8 @@ class Live:
         with open(os.path.join(gstore, "MEMORY.md"), "w") as fh:
             fh.write("# Memory Index\n\n- [Marker](marker.md) - the selftest marker word is CODEXMARK%s\n" % self.tok)
         with open(os.path.join(self.codex_dir, "config.toml"), "a") as fh:
-            for p in sorted({self.work, os.path.realpath(self.work)}):
+            # guard_repo too: the checkout row's Codex pane runs there and would stop at the trust prompt
+            for p in sorted({self.work, os.path.realpath(self.work), self.guard_repo, os.path.realpath(self.guard_repo)}):
                 fh.write('\n[projects."%s"]\ntrust_level = "trusted"\n' % p)
 
     def codex_login(self, key):
