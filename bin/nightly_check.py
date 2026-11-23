@@ -229,6 +229,9 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
         ran = datetime.fromisoformat(doc["timestamp"])
         if ran.tzinfo is None:
             raise ValueError("no UTC offset")
+        if ran < datetime(1970, 1, 1, tzinfo=timezone.utc):
+            # Explicit, not left to astimezone(): that overflows only in zones west of UTC.
+            raise ValueError("timestamp before the epoch")
         rc, checks = doc["rc"], doc["checks"]
         rows = [(c["agent"], c["check"], c["status"], int(c["findings"])) for c in checks]
         age = (now - ran).total_seconds() / 86400.0
