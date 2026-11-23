@@ -365,6 +365,47 @@ def codex_block_lines(policy):
     return out
 
 
+def stray_tail(inner, where):
+    """Lines inside the block after the closing quotes of auto_review.policy that
+    environment_render did not render: what an older `rules_block.py codex-defaults` put
+    there (its `# session-notes defaults` comment and top-level `key = value` lines). Returns
+    them with blank edges trimmed, to be kept after the END marker; [] when there are none.
+    Refuses (EnvError) on anything but comments, blanks and one-line top-level keys, rather
+    than delete it."""
+    body = "\n".join(inner)
+    k = body.find('auto_review.policy = """')
+    if k < 0:
+        return []
+    try:
+        _, end = toml_ml_decode(body, k + len("auto_review.policy = "))
+    except ValueError:
+        return []
+    tail = body[end:].split("\n")[1:]          # the rest of the closing-quotes line is dropped
+    tail = [ln for ln in tail]
+    while tail and not tail[0].strip():
+        tail.pop(0)
+    while tail and not tail[-1].strip():
+        tail.pop()
+    if not tail:
+        return []
+    headers, clean = scan_toml(tail, where + " (inside the session-notes block)")
+    bad = None
+    for no, ln in enumerate(tail):
+        t = ln.strip()
+        if not t or t.startswith("#"):
+            continue
+        path = _line_key(ln)
+        if no in headers or not clean[no] or not path or path[0] in (
+                set(k2 for k2, _ in CODEX_SETTINGS) | {"auto_review"}):
+            bad = ln
+            break
+    if bad is not None:
+        raise EnvError("%s: the session-notes block holds %r after the policy, which is not "
+                       "something this tool can move out of the block safely; move or remove "
+                       "that line by hand and apply again" % (where, bad.strip()))
+    return tail
+
+
 def place_codex_block(text, policy, where):
     """config.toml text with the block set to `policy`. Refuses on a conflicting setting."""
     lines = text.split("\n")
@@ -391,7 +432,12 @@ def place_codex_block(text, policy, where):
                                "by hand (remove it, or move it out of the way) and apply again"
                                % (where, orig_no(k), ln.strip()))
     new = codex_block_lines(policy)
+    moved = stray_tail(inner, where) if inner is not None else []
+    if moved:
+        new = new + [""] + moved       # kept, top-level, right after the END marker
     if inner is not None and h >= len(before):
+        if moved and after and after[0].strip():
+            after = [""] + after
         res = before + new + after                      # replace in place
     else:
         rest = before + after
@@ -483,10 +529,17 @@ def atomic_write(path, data, backup=True):
         if backup:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             bak = path + BAK + stamp
-            n = 0
-            while os.path.exists(bak):
-                n += 1
-                bak = "%s%s%s-%d" % (path, BAK, stamp, n)
+            # On a same-second clash: the number after every existing one (never a pruned
+            # lower name), so ranking backups by name stays correct.
+            d0, name0 = os.path.split(bak)
+            top = -1
+            for other in os.listdir(d0 or "."):
+                if other == name0:
+                    top = max(top, 0)
+                elif other.startswith(name0 + "-") and other[len(name0) + 1:].isdigit():
+                    top = max(top, int(other[len(name0) + 1:]))
+            if top >= 0:
+                bak = "%s-%d" % (bak, top + 1)
             shutil.copyfile(real, bak)     # not copy2: prune orders by when the copy was made
             shutil.copymode(real, bak)
     if bak:
@@ -559,6 +612,11 @@ def codex_diff(ctx, entries):
     elif blk[3]:
         out.append("codex: the session-notes block in %s is inside table %s; Codex does not "
                    "read it as top-level (run apply to move it)" % (ctx.config_toml, blk[3]))
+    moved = stray_tail(blk[2], ctx.config_toml) if blk else []
+    if moved:
+        out.append("codex: %d line(s) inside the block are not ours (an older codex-defaults put "
+                   "them there); apply moves them, unchanged, to just after the END marker:\n%s"
+                   % (len(moved), "\n".join("  " + ln for ln in moved)))
     if have_cfg != want_cfg:
         out.append(udiff(have_cfg, want_cfg, "installed " + ctx.config_toml,
                          "rendered " + ctx.config_toml))
@@ -1147,8 +1205,13 @@ def selftest():
         check("diff: a foreign line inside the block shows as a removal",
               rc == 1 and "-model = 'foreign'" in out)
         rc, out = run(cmd_apply, ctx, "codex", True)
-        check("apply shows it and removes it", "-model = 'foreign'" in out
-              and "model = 'foreign'" not in open(ctx.config_toml).read())
+        moved_cfg = open(ctx.config_toml).read()
+        check("apply shows the move and keeps the foreign key, now after the END marker",
+              "-model = 'foreign'" in out and "moves them" in out
+              and moved_cfg.count("model = 'foreign'") == 1
+              and moved_cfg.index("model = 'foreign'") > moved_cfg.index(CODEX_END)
+              and moved_cfg.index("model = 'foreign'") < moved_cfg.index("[sandbox_workspace_write]")
+              and run(cmd_diff, ctx, "codex") == (0, ""))
 
         # nightly check + upstream, injected
         with open(srcf, "w") as fh:
