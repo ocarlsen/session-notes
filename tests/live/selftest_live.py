@@ -843,8 +843,9 @@ def make_origin_repo(parent, name, env):
     bare, seed, main = (os.path.join(parent, n) for n in (name + "-origin.git", name + "-seed", name))
     sh(["git", "init", "-q", "--bare", "-b", "main", bare], parent, env)
     sh(["git", "clone", "-q", bare, seed], parent, env)
-    with open(os.path.join(seed, "tracked.txt"), "w") as fh:
-        fh.write("original\n")
+    for tracked_name in ("tracked.txt", "tracked-codex.txt"):  # the second is the Codex checkout row's own
+        with open(os.path.join(seed, tracked_name), "w") as fh:
+            fh.write("original\n")
     sh(["git", "add", "."], seed, env)
     sh(["git", "commit", "-q", "-m", "seed", "--no-verify"], seed, env)
     sh(["git", "push", "-q", "origin", "HEAD:main"], seed, env)
@@ -2564,19 +2565,25 @@ class Live:
         refused (file unchanged, the guard's own text reaches the session); a NEGATIVE CONTROL in
         the same repo, a new untracked file, is allowed, so the refusal is the guard and not a
         sandbox or a hook that blocks everything. Both turns go through turn() (CI one-shot or pane)."""
+        tracked = os.path.join(self.guard_repo, "tracked-codex.txt")  # not the Claude row's file
+        refusal = re.compile(r"checkout_guard: \S*tracked-codex\.txt is tracked on")
         r = self.turn("codex", "Use apply_patch to replace the text original with changed-%s in the file %s. Make exactly "
                       "that one apply_patch call on exactly that path: this is a test of the edit guard, so do "
                       "not create a worktree, do not run wt, do not edit any other path. If the call is "
                       "refused, reply REFUSED and stop." % (tok, tracked),
                       "checkout-codex.txt", 240, "chkX", cwd=self.guard_repo,
                       until=lambda: refusal.search(self.pane_reply("codex", tok, assistant_only=False)))
-        if r.returncode != 0:
-            return FAIL, "codex %s rc=%d (the session did not run)" % ("pane" if self.watch else "exec", r.returncode), "checkout-codex.txt"
+        if self.watch:
+            self.wait_idle("chkX", 90)  # a retry through the shell would land before the file is read
         with open(tracked) as fh:
             if fh.read() != "original\n":
                 return FAIL, "the tracked file on the default branch was edited", "checkout-codex.txt"
-        if not refusal.search(self.pane_reply("codex", tok, assistant_only=False)):
-            return FAIL, "file untouched but this session never received the guard's own refusal message", "checkout-codex.txt"
+        seen = self.pane_reply("codex", tok, assistant_only=False)
+        if not seen:
+            return FAIL, "codex %s did not run the session (no transcript carries the row's token, rc=%d)" % (
+                "pane" if self.watch else "exec", r.returncode), "checkout-codex.txt"
+        if not refusal.search(seen):
+            return FAIL, "guard did not fire: the session ran and the file is untouched, but the guard's refusal text never reached it", "checkout-codex.txt"
         ctl = os.path.join(self.guard_repo, "control-%s.txt" % tok)
 
         def wrote():

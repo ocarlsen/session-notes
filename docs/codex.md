@@ -132,6 +132,19 @@ runs against them. It is a new hook, so trust it once after installing (`/hooks`
 nothing it should not, exempt repos in the config's `[checkout_guard]` section; see
 `docs/tools.md`.
 
+**Known limits of the guard under Codex** (read from the Codex 0.171 source, not observed live):
+- `write_stdin` sends no PreToolUse hook: text typed into a shell that is already running was
+  judged when that shell started, so a `gh pr merge` or `git reset --hard` typed into it later is
+  never shown to the guard.
+- Only exit code 2 with text on stderr blocks a call. Any other failure of the hook is a failed
+  hook and the call proceeds. In particular a launcher file that is gone makes the shell exit 127
+  (the "guard hooks fail closed" rule covers a missing script or checkout behind a working
+  launcher, not a missing launcher), and the hook's 10 second timeout is longer than one 8 second
+  git call inside the guard, so a very slow `git status` on a large dirty tree can end as a timed-out
+  hook and let the call through.
+- The guard reads `apply_patch` text and shell commands. Shell writes other than `apply_patch`
+  (`sed -i`, redirects) are not covered, as under Claude Code.
+
 ## Sessions and the bus
 
 With the hooks trusted and Codex started as `codex --no-daemon` (or with the shared daemon

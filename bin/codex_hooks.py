@@ -526,6 +526,26 @@ def selftest():
         check("rerun: reports unchanged", not changed)
         check("rerun: byte-identical", open(path, "rb").read() == before)
 
+        # upgrade: an existing file whose PreToolUse holds ONLY the user's own groups (no entry of
+        # ours yet, the state of every install before this hook was registered)
+        up = os.path.join(tmp, "upgrade", "hooks.json")
+        os.makedirs(os.path.dirname(up))
+        priv = [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 /opt/p1.py"}]},
+                {"hooks": [{"type": "command", "command": "python3 /opt/p2.py"}]}]
+        with open(up, "w") as fh:
+            fh.write(render({"hooks": {"PreToolUse": priv, "Stop": [{"hooks": [
+                {"type": "command", "command": "python3 /opt/s.py"}]}]}, "model": "keep-me"}))
+        refresh(up, launcher)
+        with open(up) as fh:
+            u = json.load(fh)
+        check("upgrade: the user's PreToolUse groups survive, first and unchanged, with one checkout guard beside them",
+              u["hooks"]["PreToolUse"][:2] == priv and len(u["hooks"]["PreToolUse"]) == 3
+              and sum(c.endswith(" checkout_guard") for c in cmds(u, "PreToolUse")) == 1
+              and cmds(u, "Stop")[0] == "python3 /opt/s.py" and u["model"] == "keep-me")
+        before = open(up, "rb").read()
+        check("upgrade: a second refresh is a no-op", refresh(up, launcher)[0] is False
+              and open(up, "rb").read() == before)
+
         # foreign entries preserved, ours refreshed in place
         foreign = {"type": "command", "command": "python3 /opt/other/private_hook.py"}
         d = load()
