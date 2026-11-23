@@ -50,4 +50,4 @@ the one that merges. A build the user ordered merges on that APPROVE. If the def
 and a rebase is needed after the verdict, the head sha changes and the change needs a fresh
 verdict from the reviewer. The session posts only the verdict the reviewer returned, never one
 of its own. Anything whose acceptance needs a live run the user types (for example a Codex
-change checked in both the CLI and the desktop app) waits for that run.
+change checked in the Codex CLI) waits for that run.

@@ -10,7 +10,9 @@ here, never restated.
         write a reviewer prompt plus meta.json under the state dir
         (<state_dir>/review/<owner>-<repo>-<PR>/). Prints the prompt path, the head sha and the
         review round. Says so, and still exits 0, when this is the last review the contract's
-        fix-round limit allows or the limit is already passed.
+        fix-round limit allows or the limit is already passed. From round 2 on it also runs the
+        test-edit check on the range since the last reviewed head (the sha in the newest own
+        verdict comment at another sha; no own verdict, no section) and names that comment.
     review.py post <PR> APPROVE|CHANGES --body-file FILE [--dry-run]
         Post the reviewer's reply as the verdict comment: first line
         `Review verdict: <V> <head sha>`, then the body. Refuses when the PR head moved since
@@ -26,8 +28,8 @@ The comment is posted with the token from `[wt].token_command` (the account whos
 
 Exit codes: 0 ok; 1 fatal, no subcommand, or a refusal (no prepare, empty body, a body that does
 not end in its own VERDICT line, verdict mismatch, PR not open); 2 a usage error (argparse: bad
-verdict word, unknown flag) or a --selftest failure; 3 token command failed; 4 the PR head moved
-since prepare.
+verdict word, unknown flag); 3 token command failed; 4 the PR head moved since prepare. A failing
+--selftest exits 1.
 """
 import argparse
 import json
@@ -61,7 +63,7 @@ input, state or sequence that makes it wrong.
 - For EVERY finding quote the file, the line number and the lines themselves. A finding with no
   quote is not a finding.
 - For each finding say what breaks, how to trigger it, and whether it blocks the merge.
-- Verify the change against the spec above, including what it should refuse or leave alone.
+- Verify the change against the spec below, including what it should refuse or leave alone.
 - Do not post anything and do not change any file; report to the session that spawned you.
 
 END your reply with a final line that is exactly one of these, and nothing after it:
@@ -120,6 +122,71 @@ def count_rounds(comments, login):
 
 
 # ------------------------------------------------------------------ prepare
+def _git(repo, *args):
+    """(rc, stdout) of a git command in `repo`; rc is None when git could not run."""
+    try:
+        r = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return r.returncode, r.stdout.decode("utf-8", errors="replace")
+
+
+def last_review_point(comments, login, head):
+    """(sha, verdict comment url) of the last reviewed head, or (None, None).
+
+    Only a posted verdict says a head was reviewed: it is the newest verdict comment by `login`
+    whose sha differs from `head`. No own verdict, or none at another sha, means no base.
+    """
+    found = (None, None)
+    for c in comments:
+        if ((c.get("user") or {}).get("login") or "").lower() != login.lower():
+            continue
+        v = wt.parse_verdict(c.get("body"))
+        if v and wt._SHA.match(v[1]) and v[1] != head:
+            found = (v[1], c.get("html_url"))
+    return found
+
+
+def since_last_review(repo, num, prev, head, url, globs):
+    """Markdown sub-section: the test-edit check on `git diff prev..head`, or why it is absent.
+
+    Never raises: any git trouble prints a warning and is said in the section itself.
+    """
+    title = "### Since the last reviewed head %s\n\n" % prev[:10]
+    tail = ("\nThe prior verdict comment is %s . Check whether this fix introduced defects.\n"
+            % url) if url else ""
+
+    def unavailable(why):
+        print("warning: no since-last-review check: %s" % why, file=sys.stderr)
+        return title + ("The check on the range since that head could not be run: %s. Read the "
+                        "range yourself with `git -C %s diff %s..%s`.\n%s"
+                        % (why, repo, prev[:10], head[:10], tail))
+
+    def have(sha):
+        rc, _ = _git(repo, "cat-file", "-e", sha + "^{commit}")
+        return rc == 0
+
+    if not (have(prev) and have(head)):
+        _git(repo, "fetch", "-q", "origin", "pull/%s/head" % num)
+    if not have(prev) or not have(head):
+        return unavailable("git does not have both commits locally")
+    rc, _ = _git(repo, "merge-base", "--is-ancestor", prev, head)
+    if rc == 1:
+        return unavailable("the last reviewed head is not an ancestor of this head (history was "
+                           "rewritten)")
+    if rc != 0:
+        return unavailable("git merge-base failed")
+    rc, diff = _git(repo, "diff", "--no-ext-diff", "--no-color", "--no-textconv",
+                    "%s..%s" % (prev, head))
+    if rc != 0:
+        return unavailable("git diff failed")
+    hits, counts = test_edit_check._scan_blocks(diff, extra_globs=globs)
+    out = (test_edit_check.format_output(hits, counts) if hits else
+           "The test-edit check found no edited tests, fixtures or guards and no removed "
+           "assertions in the changes since that head. It is a heuristic, not proof.")
+    return title + out + "\n" + tail
+
+
 def build_prompt(check_output, contract, title, body, repo_path, sha, diff, diff_path):
     parts = ["# Review request\n"]
     parts.append("## Edits to tests, fixtures and guards (look at these first)\n\n%s\n" % check_output)
@@ -153,6 +220,9 @@ def cmd_prepare(args, cfg):
         login = gh.run(["api", "user", "--jq", ".login"], main).strip()
         comments = gh.json(["api", "--paginate",
                             "repos/%s/issues/%s/comments" % (orp, num)], main)
+    except UnicodeDecodeError:
+        raise wt.Die(1, "PR #%s: the diff is not UTF-8 (gh output could not be decoded), so "
+                        "prepare cannot build a prompt from it" % num)
     except wt.GhError as exc:
         raise wt.Die(1, "gh failed: %s" % exc)
     if not login:
@@ -173,6 +243,9 @@ def cmd_prepare(args, cfg):
         raise wt.Die(1, "cannot read the review contract %s: %s" % (CONTRACT, exc))
 
     d = _review_dir(owner, repo, num, cfg)
+    prev, prior_url = last_review_point(comments, login, sha)
+    if prev:
+        check_output += "\n\n" + since_last_review(main, num, prev, sha, prior_url, globs)
     os.makedirs(d, exist_ok=True)
     diff_path = None
     if len(diff.encode("utf-8")) > DIFF_INLINE_CAP:
@@ -269,6 +342,17 @@ def cmd_post(args, cfg):
         print("dry run, would post to %s#%s:" % (orp, num))
         print(comment, end="")
         return 0
+    changes_after = None  # own CHANGES verdicts including this one, counted BEFORE posting
+    if args.verdict == wt.CHANGES:
+        try:
+            login = gh.run(["api", "user", "--jq", ".login"], main).strip()
+            comments = gh.json(["api", "--paginate",
+                                "repos/%s/issues/%s/comments" % (orp, num)], main)
+            _, prior = count_rounds(comments if isinstance(comments, list) else [], login)
+            changes_after = prior + 1
+        except wt.GhError as exc:
+            print("warning: could not count CHANGES verdicts for the fix-round limit: %s" % exc,
+                  file=sys.stderr)
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix="comment-", suffix=".md", dir=d)
     try:
@@ -285,18 +369,8 @@ def cmd_post(args, cfg):
     url = (out or "").strip().splitlines()[-1] if (out or "").strip() else None
     print("posted %s verdict at %s%s" % (args.verdict, prepared, (" " + url) if url else ""))
     on_verdict_posted(orp, num, args.verdict, prepared, url)
-    if args.verdict == wt.CHANGES:
-        try:
-            login = gh.run(["api", "user", "--jq", ".login"], main).strip()
-            comments = gh.json(["api", "--paginate",
-                                "repos/%s/issues/%s/comments" % (orp, num)], main)
-            _, changes = count_rounds(comments if isinstance(comments, list) else [], login)
-            notice = round_notice(changes)
-            if notice and changes > FIX_ROUND_LIMIT:
-                print(notice)
-        except wt.GhError as exc:
-            print("warning: could not count CHANGES verdicts for the fix-round limit: %s" % exc,
-                  file=sys.stderr)
+    if changes_after is not None and changes_after > FIX_ROUND_LIMIT:
+        print(round_notice(changes_after))
     return 0
 
 
@@ -343,7 +417,7 @@ with open(os.path.join(d, "gh.log"), "a") as fh:
 def canned(n):
     p = os.path.join(d, n)
     if os.path.exists(p):
-        sys.stdout.write(open(p).read()); return 0
+        sys.stdout.flush(); sys.stdout.buffer.write(open(p, "rb").read()); return 0
     sys.stderr.write("stub: no canned file %s\n" % n); return 1
 if a[:2] == ["pr", "view"]:
     sys.exit(canned("pr_view.json"))
@@ -511,10 +585,210 @@ def selftest():
               < pt.find("## The spec it implements") < pt.find("## The diff"))
         # a non-numeric PR argument: every later call uses the number gh reported
         put("comments.json", [])
-        run("prepare", "feature-branch")
+        os.remove(os.path.join(stub, "gh.log"))
+        shutil.rmtree(sdir)
+        rc, out, err = run("prepare", "feature-branch")
+        bf = os.path.join(T, "fb-body.md")
+        with open(bf, "w") as fh:
+            fh.write("Finding.\nVERDICT: CHANGES\n")
+        rc2, out2, err2 = run("post", "feature-branch", wt.CHANGES, "--body-file", bf)
+        if os.path.exists(os.path.join(stub, "posted.md")):
+            os.remove(os.path.join(stub, "posted.md"))
+        calls = gh_calls()
+        after = []
+        for c in calls:
+            if c[:2] == ["pr", "view"]:
+                after = []   # only what follows each pr view is checked
+            else:
+                after.append(c)
         check("calls after pr view use view[number], not the raw argument",
-              any(c[-1] == "repos/example/proj/issues/7/comments" for c in gh_calls())
-              and os.path.exists(os.path.join(sdir, "meta.json")))
+              rc == 0 and rc2 == 0 and len(after) >= 3
+              and not any("feature-branch" in a for c in calls if c[:2] != ["pr", "view"] for a in c)
+              and os.path.exists(os.path.join(sdir, "meta.json")), (rc, err, rc2, err2, calls))
+        os.remove(os.path.join(stub, "gh.log"))
+
+        # ---- since the last reviewed head (fix rounds): real commits in the temp repo
+        def git(*a):
+            subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com"]
+                           + list(a), check=True, capture_output=True)
+
+        def head_sha():
+            return subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        os.makedirs(os.path.join(repo, "tests"), exist_ok=True)
+        with open(os.path.join(repo, "tests", "test_y.py"), "w") as fh:
+            fh.write("def t():\n    assert out == [1, 2]\n")
+        os.makedirs(os.path.join(repo, "data"), exist_ok=True)
+        with open(os.path.join(repo, "data", "x.json"), "w") as fh:
+            fh.write("1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "c1")
+        c1 = head_sha()
+        with open(os.path.join(repo, "tests", "test_y.py"), "w") as fh:
+            fh.write("def t():\n    assert out\n")
+        git("commit", "-q", "-a", "-m", "c2")
+        c2 = head_sha()
+        put("diff.patch", diff_small)
+        prior_url = "https://github.com/example/proj/pull/7#issuecomment-99"
+        view(c2)
+
+        def prompt_text():
+            return open(os.path.join(sdir, "prompt.md")).read()
+
+        # no prior meta, a prior own verdict at c1: sha and url come from the comment
+        shutil.rmtree(sdir, ignore_errors=True)
+        cm1 = verdict_comment("reviewer-bot", wt.CHANGES, c1, 1)
+        cm1["html_url"] = prior_url
+        put("comments.json", [cm1])
+        rc, out, err = run("prepare", "7")
+        pt = prompt_text()
+        i_sub = pt.find("### Since the last reviewed head %s" % c1[:10])
+        check("fix round, no prior meta: since-check from the verdict comment's sha",
+              rc == 0 and 0 <= i_sub < pt.find("## The review contract")
+              and "tests/test_y.py:2 [assertion]" in pt[i_sub:pt.find("## The review contract")]
+              and prior_url in pt[i_sub:pt.find("## The review contract")], (rc, err, pt[:600]))
+        # meta.json is never the base: a newer prepared head is not a reviewed head
+        shutil.rmtree(sdir)
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "meta.json"), "w") as fh:
+            json.dump({"head_sha": c1}, fh)
+        put("comments.json", [])
+        rc, out, err = run("prepare", "7")
+        check("a stale or newer meta head with no own verdict: no since-last-review section",
+              "### Since the last reviewed head" not in prompt_text(), prompt_text()[:400])
+        shutil.rmtree(sdir)
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "meta.json"), "w") as fh:
+            json.dump({"head_sha": c1}, fh)
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, "d" * 40, 1)])
+        rc, out, err = run("prepare", "7")
+        check("the previous meta head does NOT win over the verdict comment's sha",
+              "### Since the last reviewed head %s" % ("d" * 10) in prompt_text()
+              and "### Since the last reviewed head %s" % c1[:10] not in prompt_text())
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, c2, 1)])
+        rc, out, err = run("prepare", "7")  # the only own verdict is at the head: no base
+        check("the only own verdict is at the head: no since-last-review section",
+              "### Since the last reviewed head" not in prompt_text())
+        shutil.rmtree(sdir)
+
+        # A, B, C: CHANGES at A (c1); B (c2) loosens an assert the PR added; C (c4) is an
+        # unrelated push (plus a data/ change for the extra-glob check); prepare at B then at C
+        with open(os.path.join(repo, "bin_u.py"), "w") as fh:
+            fh.write("u = 1\n")
+        os.makedirs(os.path.join(repo, "data"), exist_ok=True)
+        with open(os.path.join(repo, "data", "x.json"), "w") as fh:
+            fh.write("2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "c4")
+        c4 = head_sha()
+        git("reset", "-q", "--hard", c2)
+        cmA = verdict_comment("reviewer-bot", wt.CHANGES, c1, 1)
+        cmA["html_url"] = prior_url
+        put("comments.json", [cmA])
+        view(c2)
+        run("prepare", "7")
+        check("A,B,C: prepare at B shows the loosened assert",
+              "tests/test_y.py:2 [assertion]" in prompt_text())
+        view(c4)
+        rc, out, err = run("prepare", "7")
+        pt = prompt_text()
+        sec = pt[pt.find("### Since the last reviewed head"):pt.find("## The review contract")]
+        check("A,B,C: prepare at C still shows B's loosened assert, based at A",
+              "### Since the last reviewed head %s" % c1[:10] in sec
+              and "tests/test_y.py:2 [assertion]" in sec and prior_url in sec, (rc, err, sec))
+        check("[review].test_globs reach the since-range scan", "data/x.json" in sec, sec)
+        # round 1: prepares at two different heads, no verdict ever: no section
+        put("comments.json", [])
+        shutil.rmtree(sdir)
+        view(c2)
+        run("prepare", "7")
+        a1 = "### Since the last reviewed head" not in prompt_text()
+        view(c4)
+        run("prepare", "7")
+        check("round 1, prepares at two heads: no since-last-review section",
+              a1 and "### Since the last reviewed head" not in prompt_text())
+        # another login's verdict never sets the base or the url; the newest own one wins
+        cmS = verdict_comment("stranger", wt.CHANGES, c2, 3)
+        cmS["html_url"] = "https://example.com/stranger"
+        put("comments.json", [cmS])
+        run("prepare", "7")
+        check("only another login's verdict: no since-last-review section",
+              "### Since the last reviewed head" not in prompt_text())
+        cmO = verdict_comment("reviewer-bot", wt.CHANGES, c2, 2)
+        cmO["html_url"] = "https://example.com/newer-own"
+        put("comments.json", [cmA, cmO, cmS])
+        run("prepare", "7")
+        pt = prompt_text()
+        check("the newest own verdict wins over an older one, a stranger's is ignored",
+              "### Since the last reviewed head %s" % c2[:10] in pt
+              and "https://example.com/newer-own" in pt and prior_url not in pt
+              and "example.com/stranger" not in pt, pt[:500])
+        # the missing-commit fetch asks for this PR's head ref by number
+        real_git = globals()["_git"]
+        seen = []
+
+        def spy(repo_, *a):
+            seen.append(a)
+            return real_git(repo_, *a)
+
+        globals()["_git"] = spy
+        try:
+            put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, "d" * 40, 1)])
+            run("prepare", "feature-branch")
+        finally:
+            globals()["_git"] = real_git
+        check("the fetch uses the PR number", ("fetch", "-q", "origin", "pull/7/head") in seen, seen)
+        # the user's git config (color, external diff) must not hide a hit
+        git("config", "--local", "color.ui", "always")
+        git("config", "--local", "diff.external", "/usr/bin/false")
+        put("comments.json", [cmA])
+        run("prepare", "7")
+        git("config", "--local", "--unset", "color.ui")
+        git("config", "--local", "--unset", "diff.external")
+        check("color.ui=always and diff.external do not hide the since-range hit",
+              "tests/test_y.py:2 [assertion]" in prompt_text())
+        shutil.rmtree(sdir, ignore_errors=True)
+        git("reset", "-q", "--hard", c2)
+        view(c2)
+        put("comments.json", [])
+        # git cannot produce the range: a verdict at a sha this repo does not have
+        shutil.rmtree(sdir, ignore_errors=True)
+        cm2 = verdict_comment("reviewer-bot", wt.CHANGES, "d" * 40, 1)
+        cm2["html_url"] = prior_url
+        put("comments.json", [cm2])
+        rc, out, err = run("prepare", "7")
+        pt = prompt_text()
+        check("git cannot produce the range: warns, says so in the sub-heading, still exits 0",
+              rc == 0 and "warning: no since-last-review check" in err
+              and "### Since the last reviewed head %s" % ("d" * 10) in pt
+              and "could not be run" in pt and prior_url in pt, (rc, err, pt[:600]))
+        # the last reviewed head is not an ancestor (history rewritten)
+        git("checkout", "-q", "-b", "other", c1)
+        with open(os.path.join(repo, "tests", "z.py"), "w") as fh:
+            fh.write("x = 1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "c3")
+        c3 = head_sha()
+        git("checkout", "-q", "-")
+        shutil.rmtree(sdir)
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, c3, 1)])
+        rc, out, err = run("prepare", "7")
+        check("a non-ancestor last head is said so, never a bogus range",
+              rc == 0 and "not an ancestor" in prompt_text(), err)
+        shutil.rmtree(sdir)
+        put("comments.json", [])
+        view(sha1)
+
+        # a diff that is not UTF-8 dies with a clear message, not a traceback
+        with open(os.path.join(stub, "diff.patch"), "wb") as fh:
+            fh.write(b"diff --git a/x b/x\n+caf\xe9\n")
+        rc, out, err = run("prepare", "7")
+        check("a non-UTF-8 diff: clear Die naming the PR, exit 1",
+              rc == 1 and "PR #7" in err and "diff is not UTF-8" in err and "Traceback" not in err,
+              (rc, err))
+        put("diff.patch", diff_small)
+        run("prepare", "7")
 
         # strip_body_verdict: the reviewer's own last line must be exact
         for bad in ("**VERDICT: CHANGES**", "`VERDICT: CHANGES`", "VERDICT: CHANGES.",
@@ -607,20 +881,31 @@ def selftest():
         run("prepare", "7")
         BINDIR = lay
         write_body("Finding.\nVERDICT: CHANGES\n")
-        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1)])
+        put("comments.json", [])
         rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
         check("post exits 0 and warns when live.py fails",
               rc == 0 and "warning: live-context note failed" in err and "boom" in err, (rc, err))
-        check("one CHANGES after the post: no stop line", "LIMIT REACHED" not in out, out)
-        # post CHANGES that brings the count to 3 prints the stop line; fewer does not
+        check("first CHANGES: no stop line", "LIMIT" not in out and "LAST REVIEW" not in out, out)
+        # the count is taken BEFORE the post (prior own CHANGES + 1) and never re-read after it
         BINDIR = os.path.join(T, "emptybin")
-        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, i) for i in (1, 2, 3)])
-        rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
-        check("post CHANGES reaching 3 prints the stop-and-report line",
-              rc == 0 and "LIMIT REACHED" in out, out)
         put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, i) for i in (1, 2)])
+        os.remove(os.path.join(stub, "gh.log"))
         rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
-        check("post CHANGES reaching 2 prints no stop line", rc == 0 and "LIMIT" not in out, out)
+        calls = gh_calls()
+        check("post CHANGES making the third prints the stop-and-report line",
+              rc == 0 and "LIMIT REACHED: 3 CHANGES" in out, out)
+        check("the count is read before the post, not after it",
+              [c[0] for c in calls].count("api") == 2
+              and calls[-1][:2] == ["pr", "comment"], calls)
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1)])
+        rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
+        check("post CHANGES making the second prints no stop line, and not the last-review text",
+              rc == 0 and "LIMIT" not in out and "LAST REVIEW" not in out, out)
+        put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, 1)]
+            + [verdict_comment("stranger", wt.CHANGES, sha1, i) for i in (2, 3, 4)])
+        rc, out, err = run("post", "7", wt.CHANGES, "--body-file", body)
+        check("other logins' CHANGES verdicts are not counted by post",
+              rc == 0 and "LIMIT" not in out and "LAST REVIEW" not in out, out)
         write_body("Fine.\nVERDICT: APPROVE\n")
         put("comments.json", [verdict_comment("reviewer-bot", wt.CHANGES, sha1, i) for i in (1, 2, 3)])
         rc, out, err = run("post", "7", wt.APPROVE, "--body-file", body)
