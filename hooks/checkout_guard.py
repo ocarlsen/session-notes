@@ -53,6 +53,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import unicodedata
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BIN = os.path.join(ROOT, "bin")
@@ -119,20 +120,39 @@ _FACT_CACHE = {}
 
 
 def repo_info(path):
-    """(toplevel, common git dir), both real paths, for the repo holding `path`; None if none."""
-    d = _nearest_dir(path)
-    if d in _INFO_CACHE:
-        return _INFO_CACHE[d]
-    r = _git(d, "rev-parse", "--show-toplevel", "--git-common-dir")
-    info = None
-    lines = r.stdout.splitlines() if r.returncode == 0 else []
-    if len(lines) >= 2:
-        common = lines[1]
-        if not os.path.isabs(common):
-            common = os.path.join(d, common)
-        info = (os.path.realpath(lines[0]), os.path.realpath(common))
-    _INFO_CACHE[d] = info
+    """(toplevel, common git dir), both real paths, for the repo holding `path`; None if none.
+    A directory with no `.git` entry of its own inherits its parent's answer, so any number of
+    sibling directories cost one `git rev-parse`, not one each."""
+    cur = _nearest_dir(path)
+    chain = []
+    while True:
+        if cur in _INFO_CACHE:
+            info = _INFO_CACHE[cur]
+            break
+        if os.path.lexists(os.path.join(cur, ".git")):
+            info = _rev_parse(cur)
+            _INFO_CACHE[cur] = info
+            break
+        chain.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            info = None
+            break
+        cur = parent
+    for c in chain:
+        _INFO_CACHE[c] = info
     return info
+
+
+def _rev_parse(d):
+    r = _git(d, "rev-parse", "--show-toplevel", "--git-common-dir")
+    lines = r.stdout.splitlines() if r.returncode == 0 else []
+    if len(lines) < 2:
+        return None
+    common = lines[1]
+    if not os.path.isabs(common):
+        common = os.path.join(d, common)
+    return os.path.realpath(lines[0]), os.path.realpath(common)
 
 
 def guarded_branch(top, common):
@@ -180,19 +200,46 @@ def is_tracked(top, real):
 _PATHSPEC_MAX = 50  # above this many candidates one whole-repo listing beats a long pathspec
 
 
+def _name_folding(top):
+    """The function that makes an on-disk name comparable with an index name: lower-cased when
+    core.ignorecase, NFC when core.precomposeunicode (or on macOS, where git stores names
+    precomposed whatever spelling the file system returns), else None. Memoized per repo."""
+    key = ("fold", top)
+    if key not in _FACT_CACHE:
+        r = _git(top, "config", "--get-regexp", r"^core\.(ignorecase|precomposeunicode)$")
+        conf = {}
+        for ln in r.stdout.splitlines():
+            k, _, v = ln.partition(" ")
+            conf[k.lower()] = v.strip().lower()
+        ic = conf.get("core.ignorecase") == "true"
+        uni = conf.get("core.precomposeunicode") == "true" or (
+            sys.platform == "darwin" and conf.get("core.precomposeunicode") != "false")
+        if ic or uni:
+            def fold(x, ic=ic, uni=uni):
+                if uni:
+                    x = unicodedata.normalize("NFC", x)
+                return x.lower() if ic else x
+            _FACT_CACHE[key] = fold
+        else:
+            _FACT_CACHE[key] = None
+    return _FACT_CACHE[key]
+
+
 def tracked_paths(top, reals):
     """The subset of `reals` (real paths under `top`) that is tracked: a tracked file, or a
     directory holding one. ONE `git ls-files` call for all of them (a pathspec list for a few,
-    the whole listing for many); a git error falls back to one call per path."""
+    the whole listing for many, and always the whole listing when names must be case- or
+    Unicode-folded, since a literal pathspec would not match them); a git error falls back to
+    one call per path. Both sides are folded the same way before they are compared."""
     rels = {r: os.path.relpath(r, top) for r in reals}
+    fold = _name_folding(top)
     args = ["--literal-pathspecs", "ls-files", "-z"]
-    if len(rels) <= _PATHSPEC_MAX:
+    if len(rels) <= _PATHSPEC_MAX and fold is None:
         args += ["--"] + list(dict.fromkeys(rels.values()))
     r = _git(top, *args)
     if r.returncode != 0:
         return {x for x in reals if is_tracked(top, x)}
-    fold = _git(top, "config", "--get", "core.ignorecase").stdout.strip() == "true"
-    norm = (lambda x: x.lower()) if fold else (lambda x: x)
+    norm = fold or (lambda x: x)
     files = {norm(f) for f in r.stdout.split("\0") if f}
     dirs = set()
     for f in files:
@@ -201,7 +248,8 @@ def tracked_paths(top, reals):
             if f in dirs:
                 break
             dirs.add(f)
-    return {x for x, rel in rels.items() if norm(rel) in files or norm(rel) in dirs}
+    return {x for x, rel in rels.items()
+            if norm(rel) in files or norm(rel) in dirs or (rel == "." and files)}
 
 
 def tree_dirty(tree, untracked):
@@ -261,11 +309,12 @@ def patch_paths(text):
     return _PATCH_RE.findall(text or "")
 
 
-def check_edit_at(paths, cwd, cfg):
+def check_edit_at(paths, cwd, cfg, root_ok=None):
     """(refusal, index of the refused path in `paths`) or (None, None). Repo facts are memoized
     and tracked-ness is decided with one `git ls-files` per repo. A path that IS a checkout's
-    top-level directory (`rm -rf <clone>`, `mv <clone> <clone>2`) passes: the files inside are
-    still judged when named or globbed."""
+    top-level directory passes only where `root_ok[i]` (an `rm` operand, an `mv` source):
+    `rm -rf <clone>`, `mv <clone> <clone>2`. As any other write target it is judged as before,
+    and the files inside are always judged when named or globbed."""
     groups = {}
     for i, p in enumerate(paths):
         ap = p if os.path.isabs(p) else os.path.join(cwd, p)
@@ -276,7 +325,9 @@ def check_edit_at(paths, cwd, cfg):
         top, common = info
         if repo_exempt(cfg, top) or path_exempt(cfg, real):
             continue
-        if real == top or guarded_branch(top, common) is None:
+        if guarded_branch(top, common) is None:
+            continue
+        if real == top and root_ok and root_ok[i]:
             continue
         groups.setdefault((top, common), []).append((i, real))
     best = None
@@ -656,7 +707,7 @@ def _inplace_files(name, a):
             skip = False
         elif t in ("-e", "-f", "--expression", "--file") or re.fullmatch(r"-[A-Za-z0-9]*[ef]", t):
             have_script, skip = True, True
-        elif not t.startswith(("-M", "-m")) and (
+        elif not t.startswith(("-M", "-m", "-I")) and (
                 t.startswith("-e") or re.fullmatch(r"-[A-Za-z0-9]*e.+", t)):
             have_script = True  # the script is attached (`-es/a/b/`, `-pes/a/b/`): next is a file
         elif t.startswith(("--expression=", "--file=")):
@@ -674,38 +725,40 @@ def _write_targets(argv, writes, cwd):
     destination means <dir>/<each source's name>), mv (sources and destination), rm/truncate/
     unlink, dd of=. One list for the config protection and for Arm A, so the two cannot drift.
     A program that writes on its own (a script) is not seen."""
-    cands = [(w, False) for w in writes]
+    cands = [(w, False, False) for w in writes]
     if argv:
         name, a = os.path.basename(argv[0]), argv[1:]
         ops = [t for t in a if not t.startswith("-")]
         if name == "tee":
-            cands += [(t, True) for t in ops]
+            cands += [(t, True, False) for t in ops]
         elif name in ("sed", "perl"):
-            cands += [(t, True) for t in _inplace_files(name, a) if t]
+            cands += [(t, True, False) for t in _inplace_files(name, a) if t]
         elif name in ("cp", "install", "ln", "mv") and ops:
             srcs, dest = ops[:-1], ops[-1]
             if name == "mv":
-                cands += [(t, True) for t in srcs]
+                cands += [(t, True, True) for t in srcs]  # moving a root is allowed
             d = os.path.expanduser(dest)
             if d.endswith("/") or os.path.basename(d) in (".", "..") or \
                     os.path.isdir(d if os.path.isabs(d) else os.path.join(cwd, d)):
-                # expand a glob source first, then join each real name with the destination
+                # expand a glob source and a glob destination directory, then join the names
+                dests = _expand(d, cwd, True) if _GLOB_CHARS.search(d) else [d]
                 for t in srcs:
                     for x in _expand(t, cwd, True):
-                        if os.path.basename(x.rstrip("/")):
-                            cands.append((os.path.join(d, os.path.basename(x.rstrip("/"))), False))
+                        base = os.path.basename(x.rstrip("/"))
+                        if base:
+                            cands += [(os.path.join(dd, base), False, False) for dd in dests]
             else:
-                cands.append((dest, True))
+                cands.append((dest, True, False))
         elif name in ("rm", "truncate", "unlink"):
-            cands += [(t, True) for t in ops]
+            cands += [(t, True, name == "rm") for t in ops]
         elif name == "dd":
-            cands += [(t[3:], False) for t in a if t.startswith("of=")]
+            cands += [(t[3:], False, False) for t in a if t.startswith("of=")]
     return cands
 
 
 def _config_write(argv, writes, cwd, protected):
     """The refusal when this segment writes to the config file."""
-    for c, _ in _write_targets(argv, writes, cwd):
+    for c, _, _ in _write_targets(argv, writes, cwd):
         if is_protected(c, cwd, protected):
             return _config_msg(os.path.realpath(os.path.expanduser(c)))
     return None
@@ -741,13 +794,14 @@ def _shell_write(argv, writes, dirs, cfg, fallback=None):
     if cfg is None:
         return None
     for d in dirs:
-        cands, rel = [], []
-        for c, g in _write_targets(argv, writes, d):
+        cands, rel, rootok = [], [], []
+        for c, g, ro in _write_targets(argv, writes, d):
             if c and not c.startswith("-"):
                 for x in _expand(c, d, g):
                     cands.append(x)
                     rel.append(not os.path.isabs(os.path.expanduser(c)))
-        r, i = check_edit_at(cands, d, cfg) if cands else (None, None)
+                    rootok.append(ro)
+        r, i = check_edit_at(cands, d, cfg, rootok) if cands else (None, None)
         if r:
             if fallback is not None and d == fallback and rel[i]:
                 r += (" That relative path was judged from %s, where the tool call started, "
@@ -1735,7 +1789,7 @@ def selftest():
         t0 = time.time()
         r = bash("rm -f logs/*.log", perf)
         dt = time.time() - t0
-        check("P refuse: rm -f logs/*.log (300 tracked) refuses in under 2 s",
+        check("P refuse: rm -f logs/*.log (300 tracked) refuses, names the first match, quickly",
               refused(r) and "logs/f000.log" in r.stderr and dt < 2, "%.2fs %s" % (dt, r.stderr))
         for cmd in ("perl -i -pe's/a/b/' README.md", "perl -pi -es/a/b/ README.md",
                     "sed -i '' -es/a/b/ README.md", "sed -i -e's/a/b/' README.md",
@@ -1769,6 +1823,62 @@ def selftest():
             check("D refuse: a source basename collides with a tracked file: " + cmd,
                   refused(bash(cmd, sw2)) and "a.png" in bash(cmd, sw2).stderr, cmd)
         check("D allow: glob that matches nothing", passed(bash("cp %s/*.gif docs/media/" % shots, sw2)))
+
+        # Fix round 1: directory matches, root scope, NFD names, destination globs, -I, folding
+        perfd = mkrepo("perfd", ["README.md", "sub/f.txt"])
+        pd_wt = os.path.join(tmp, "perfd_wt")
+        sh(perfd, "git", "worktree", "add", "-q", "-b", "pdfeat", pd_wt)
+        loose = os.path.join(tmp, "loosedir")
+        for base in (perfd, pd_wt, loose):
+            for i in range(1500):
+                dd = os.path.join(base, "node_modules", "pkg%04d" % i)
+                os.makedirs(dd)
+                with open(os.path.join(dd, "index.js"), "w") as fh:
+                    fh.write("x\n")
+        for label, where, ok in (("main checkout", perfd, True), ("linked worktree", pd_wt, True),
+                                 ("no repo", loose, True)):
+            t0 = time.time()
+            r = bash("rm -rf node_modules/*", where)
+            dt = time.time() - t0
+            check("P2 allow (%s): rm -rf node_modules/* (1500 directories) under 2 s" % label,
+                  passed(r) and dt < 2, "%.2fs %s" % (dt, r.stderr))
+            t0 = time.time()
+            r = bash("rm -rf README.md node_modules/*", where)
+            dt = time.time() - t0
+            want = label != "no repo" and label != "linked worktree"
+            check("P2 (%s): rm -rf README.md node_modules/* verdict, under 2 s" % label,
+                  (refused(r) if want else passed(r)) and dt < 2, "%.2fs %s" % (dt, r.stderr))
+        for cmd in ("cp -R %s/. ." % sw2, "cp -R %s/. %s" % (sw2, sw2), "cp -a %s/. %s/" % (sw2, sw2),
+                    "cd sub && cp -R %s/. .." % sw2, "echo x > .", "tee .", "mv %s/. ." % sw2):
+            check("R refuse (a root as a write target, not rm/mv source): " + cmd,
+                  refused(bash(cmd, sw2)), cmd)
+        os.makedirs(os.path.join(sw2, "docs", "media"), exist_ok=True)
+        touch(shots, "a.png", "p\n")
+        for cmd in ("cp %s/a.png docs/med*/" % shots, "cp %s/a.png docs/m?dia/" % shots):
+            check("D refuse: glob in the destination directory over a tracked file: " + cmd,
+                  refused(bash(cmd, sw2)) and "a.png" in bash(cmd, sw2).stderr, cmd)
+        check("D allow: glob destination directory, no collision",
+              passed(bash("cp %s/zz.png docs/med*/" % shots, sw2)))
+        check("I allow: perl -I<dir> is not an attached script",
+              passed(bash("perl -Ivendor/perl5 -i rules.sed /tmp/zz-out", sw2)))
+        # core.ignorecase: the verdict does not depend on the operand count
+        icr = mkrepo("icrepo", ("README.md", "keep/f.txt"))
+        sh(icr, "git", "config", "core.ignorecase", "true")
+        for cmd in ("rm readme.md", "rm -rf Keep"):
+            check("C refuse (core.ignorecase, one operand): " + cmd, refused(bash(cmd, icr)), cmd)
+        # a tracked file whose name is decomposed (NFD) on disk
+        nfd = "cafe\u0301.txt"
+        nfr = mkrepo("nfdrepo", ("README.md",))
+        touch(nfr, nfd, "n\n")
+        sh(nfr, "git", "add", "-A")
+        sh(nfr, "git", "commit", "-q", "-m", "nfd")
+        if nfd in os.listdir(nfr):
+            for cmd in ("rm caf*", "rm -f *.txt", "rm " + nfd, "echo x >> " + nfd,
+                        "sed -i '' -e s/a/b/ " + nfd, "rm caf\u00e9.txt"):
+                check("N refuse (NFD name on disk): " + cmd, refused(bash(cmd, nfr)), cmd)
+            check("N refuse: Edit tool with the NFD path", refused(edit("Edit", os.path.join(nfr, nfd))))
+        else:
+            print("skip N: this file system does not keep a decomposed name")
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
