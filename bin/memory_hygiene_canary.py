@@ -824,7 +824,9 @@ def _toml_value(raw):
         return int(raw.replace("_", ""))
     if raw in ("true", "false"):
         return raw == "true"
-    if raw[:1] in "\"'":
+    if not raw:
+        raise ValueError("empty value")
+    if raw.startswith(('"', "'")):
         if _skip_string(raw, 0) != len(raw):
             raise ValueError("trailing text")
         return _toml_string(raw)
@@ -1848,6 +1850,28 @@ def selftest():
                 got = ["RAISED %r" % exc]
             check(any("CODEX CONFIG" in f and key in f and shown.lower() in f.lower() for f in got),
                   "codex config: invalid %s is one finding naming key and value" % text.strip())
+        # An empty value (also `key = # comment`) is invalid TOML: one finding, never an exception,
+        # on the tomllib path AND on the scanner-only path (tomllib forced off).
+        global _tomllib
+        saved_tomllib = _tomllib
+        try:
+            for force_scanner in (False, True):
+                _tomllib = None if force_scanner else saved_tomllib
+                for text, key in (("project_doc_max_bytes =\n", "project_doc_max_bytes"),
+                                  ("project_doc_max_bytes = # todo\n", "project_doc_max_bytes"),
+                                  ("project_doc_fallback_filenames = # todo\n", "project_doc_fallback_filenames"),
+                                  ("project_doc_fallback_filenames =   \n", "project_doc_fallback_filenames")):
+                    _write(os.path.join(ch, "config.toml"), text)
+                    try:
+                        got = codex_project_doc_findings(cfg)
+                    except Exception as exc:
+                        got = ["RAISED %r" % exc]
+                    cfg_f = [f for f in got if f.startswith("CODEX CONFIG")]
+                    check(len(cfg_f) == 1 and (key in cfg_f[0] or saved_tomllib is not None and not force_scanner) and not any("RAISED" in f for f in got),
+                          "codex config: empty value %r is one finding, no exception (%s)"
+                          % (text.strip(), "scanner" if force_scanner else "default parser"))
+        finally:
+            _tomllib = saved_tomllib
         _write(os.path.join(ch, "config.toml"), 'project_doc_max_bytes = "big"\n')
         cap_r = _Capture()
         rc = report_mode(cfg, cap_r)
