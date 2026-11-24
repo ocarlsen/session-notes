@@ -562,10 +562,11 @@ def _config_write(argv, writes, cwd, protected):
     return None
 
 
-def check_command(cmd, cwd, cfg, protected, depth=0):
+def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
     """Refusal text for a shell command, or None. cfg None (config failed to parse) leaves only
     the config-file protection active."""
     wt = wt_command()
+    base_cwd = base_cwd or cwd  # the directory the tool call started in (the payload cwd)
     for seg, writes in split_segments(strip_heredocs(cmd)):
         msg = _config_write([], writes, cwd, protected)
         if msg:
@@ -591,19 +592,23 @@ def check_command(cmd, cwd, cfg, protected, depth=0):
         if name in SHELLS and depth < 3:
             script = _script_of(argv)
             if script:
-                r = check_command(script, cwd, cfg, protected, depth + 1)
+                r = check_command(script, cwd, cfg, protected, depth + 1, base_cwd)
                 if r:
                     return r
             continue
         if name in APPLY_PATCH_NAMES:
-            # an apply_patch run through the shell is an edit too (judged from the cd-adjusted cwd)
+            # An apply_patch run through the shell is an edit too. It is judged from BOTH the
+            # directory the call started in and the guard's own cd-tracked directory, and refused
+            # if either refuses: the guard cannot resolve every cd (`cd "$PWD"`, a subshell, a
+            # failed cd, popd), and the shell does not always keep the one it can.
             pp = patch_paths(cmd)
-            for p in pp:
-                if is_protected(p, cwd, protected):
-                    return _config_msg(os.path.realpath(os.path.join(cwd, os.path.expanduser(p))))
-            r = check_edit(pp, cwd, cfg) if cfg is not None else None
-            if r:
-                return r
+            for d in ([cwd] if base_cwd == cwd else [cwd, base_cwd]):
+                for p in pp:
+                    if is_protected(p, d, protected):
+                        return _config_msg(os.path.realpath(os.path.join(d, os.path.expanduser(p))))
+                r = check_edit(pp, d, cfg) if cfg is not None else None
+                if r:
+                    return r
             continue
         if cfg is None:
             continue
@@ -1275,7 +1280,8 @@ def selftest():
         r = patched("brand-new-%s.txt" % "x", "   ")
         check("codex recorded B1: an indented header on a new file still passes", passed(r), r.stderr)
 
-        # N2: apply_patch through the shell in every spelling Codex intercepts
+        # N2: apply_patch through the shell: the direct name, the `applypatch` alias, literal
+        # `cd <dir> &&` chains and `bash -c` with the body inline (nothing else is covered)
         body = "<<'EOF'\n" + patch + "EOF"
         for label, cmd, where in (
                 ("applypatch alias", "applypatch " + body, main_repo),
@@ -1287,6 +1293,24 @@ def selftest():
         r = run({"tool_name": "Bash", "cwd": os.path.dirname(wt1),
                  "tool_input": {"command": "cd %s && apply_patch %s" % (os.path.basename(wt1), body)}})
         check("codex recorded N2: cd into a linked worktree then apply_patch passes", passed(r), r.stderr)
+
+        # B2: judged from the payload cwd AND the guard's cd-tracked directory; refuse if either does
+        other = os.path.join(tmp, "b2other", "deep")
+        os.makedirs(other)
+        cfgpatch = ("<<'EOF'\n*** Begin Patch\n*** Update File: ../config.toml\n@@\n-a\n+b\n*** End Patch\nEOF")
+        for label, pre in (
+                ('cd "$(git rev-parse --show-toplevel)" &&', 'cd "$(git rev-parse --show-toplevel)" && '),
+                ('cd "$PWD" &&', 'cd "$PWD" && '),
+                ("(cd other); ", "(cd %s); " % other),
+                ("failed cd nowhere &&", "cd /nonexistent-b2 && "),
+                ("failed cd nowhere ;", "cd /nonexistent-b2 2>/dev/null; "),
+                ("pushd x; popd;", "pushd %s; popd; " % other)):
+            r = run({"tool_name": "Bash", "cwd": main_repo, "tool_input": {"command": pre + "apply_patch " + body}})
+            check("codex recorded B2: %s apply_patch refused" % label, refused(r) and "a.txt" in r.stderr, r.stderr)
+        for label, pre in (("(cd other/deep); ", "(cd %s); " % other), ('cd "$PWD" && ', 'cd "$PWD" && ')):
+            r = run({"tool_name": "Bash", "cwd": main_repo, "tool_input": {"command": pre + "apply_patch " + cfgpatch}})
+            check("codex recorded B2: relative ../config.toml after %s refused" % label.strip(),
+                  refused(r) and "user" in r.stderr, r.stderr)
         r = run(recorded("codex_pretooluse_shell.json", nongit, command="gh pr merge 1 --squash"))
         check("codex recorded: Bash `gh pr merge` refused", refused(r), r.stderr)
         r = run(recorded("codex_pretooluse_shell.json", dirty_repo, command="git reset --hard"))

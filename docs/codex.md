@@ -142,8 +142,16 @@ nothing it should not, exempt repos in the config's `[checkout_guard]` section; 
   launcher, not a missing launcher), and the hook's 10 second timeout is longer than one 8 second
   git call inside the guard, so a very slow `git status` on a large dirty tree can end as a timed-out
   hook and let the call through.
-- The guard reads `apply_patch` text and shell commands. Shell writes other than `apply_patch`
-  (`sed -i`, redirects) are not covered, as under Claude Code.
+- Shell coverage of `apply_patch` is exactly: the direct `apply_patch` tool, the `applypatch`
+  alias, literal `cd <dir> &&` (or `;`) chains in front of it, and `bash -c "..."` with the body
+  inline. The patch is judged from BOTH the directory the tool call started in and the directory
+  the guard tracks through `cd`, and refused if either refuses (the guard cannot resolve every
+  `cd`: `cd "$PWD"`, a subshell, a failed `cd`, `popd`). The cost: `cd <linked worktree> &&
+  apply_patch` from a session whose directory is the main checkout is refused, as it was before
+  this change. Everything else through the shell is NOT covered, and was not before: `eval`,
+  variables, `$'...'`, `printf` or a redirect into `apply_patch`, `xargs`, `cd --` or `cd -P`,
+  `builtin cd`, and a heredoc body inside `bash -c "...\nEOF\n"`. Other shell writes
+  (`sed -i`, redirects) are not covered either, as under Claude Code.
 
 ## Sessions and the bus
 
