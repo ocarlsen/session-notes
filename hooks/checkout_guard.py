@@ -6,11 +6,14 @@ Reads one hook payload (JSON: tool_name, tool_input, cwd) on stdin. To refuse it
 paragraph to stderr and exits 2 (the PreToolUse blocking convention), nothing on stdout. To
 allow it exits 0 silently.
 
-ARM A, edits. Edit, Write, MultiEdit, NotebookEdit and Codex apply_patch are refused when the
-target is a TRACKED file of a repo whose MAIN checkout is on the default branch. The fix is
+ARM A, edits. Edit, Write, MultiEdit, NotebookEdit and Codex apply_patch, and shell writes
+(Bash and the Codex shell tools: a redirect `>`/`>>`, tee, sed/perl -i, cp/install/ln
+destination, mv, rm, truncate, unlink, dd of=, also inside `bash -c` and after `cd`), are
+refused when the target is a TRACKED file of a repo whose MAIN checkout is on the default branch. The fix is
 to work in a worktree (`wt new <name>`). Never refused: a new untracked file, a file in a
 linked worktree (whatever its branch), a main checkout on a non-default branch or a detached
-HEAD, anything outside a git repo.
+HEAD, anything outside a git repo. Known limit: a program that writes on its own (a script such
+as `python3 bin/tool.py`) is not seen, only the shell's own writes are.
 
 ARM B, shell commands (Bash, and the Codex shell tools). Refused:
   * any raw `gh pr merge` invocation (not `--help`); `wt merge` is the gated way. Only an
@@ -537,9 +540,11 @@ def is_protected(path, cwd, protected):
     return os.path.realpath(p) in protected
 
 
-def _config_write(argv, writes, cwd, protected):
-    """The refusal when this segment writes to the config: a redirect target, tee, sed/perl -i,
-    cp/install/ln (destination), mv (either end), rm/truncate/unlink, dd of=."""
+def _write_targets(argv, writes):
+    """Every path this segment writes to: its redirect targets (`writes`), tee, sed/perl -i,
+    cp/install/ln (destination), mv (either end), rm/truncate/unlink, dd of=. One list for the
+    config protection and for Arm A, so the two cannot drift. A program that writes on its own
+    (a script) is not seen."""
     cands = list(writes)
     if argv:
         name, a = os.path.basename(argv[0]), argv[1:]
@@ -556,9 +561,32 @@ def _config_write(argv, writes, cwd, protected):
             cands += ops
         elif name == "dd":
             cands += [t[3:] for t in a if t.startswith("of=")]
-    for c in cands:
+    return cands
+
+
+def _config_write(argv, writes, cwd, protected):
+    """The refusal when this segment writes to the config file."""
+    for c in _write_targets(argv, writes):
         if is_protected(c, cwd, protected):
             return _config_msg(os.path.realpath(os.path.expanduser(c)))
+    return None
+
+
+def _shell_write(argv, writes, cwd, base_cwd, cfg):
+    """Arm A for a shell write: the refusal when a write target is a tracked file of a main
+    checkout on its default branch. Judged from BOTH the payload cwd and the cd-tracked cwd and
+    refused if either refuses: the guard cannot resolve every cd (`cd "$PWD"`, a subshell, a
+    failed cd, popd)."""
+    if cfg is None:
+        return None
+    cands = [os.path.expanduser(c) for c in _write_targets(argv, writes)
+             if c and not c.startswith("-")]
+    if not cands:
+        return None
+    for d in ([cwd] if base_cwd == cwd else [cwd, base_cwd]):
+        r = check_edit(cands, d, cfg)
+        if r:
+            return r
     return None
 
 
@@ -568,7 +596,8 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
     wt = wt_command()
     base_cwd = base_cwd or cwd  # the directory the tool call started in (the payload cwd)
     for seg, writes in split_segments(strip_heredocs(cmd)):
-        msg = _config_write([], writes, cwd, protected)
+        msg = _config_write([], writes, cwd, protected) \
+            or _shell_write([], writes, cwd, base_cwd, cfg)
         if msg:
             return msg
         try:
@@ -578,7 +607,8 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
                 return _merge_msg(wt)
             continue
         argv = strip_prefix(argv)
-        msg = _config_write(argv, [], cwd, protected)
+        msg = _config_write(argv, [], cwd, protected) \
+            or _shell_write(argv, [], cwd, base_cwd, cfg)
         if msg:
             return msg
         if not argv:
@@ -1319,6 +1349,74 @@ def selftest():
         check("codex recorded: Bash `git reset --hard` on a clean tree passes", passed(r), r.stderr)
         r = run(recorded("codex_pretooluse_shell.json", main_repo))
         check("codex recorded: the fixture's own `git status --short` passes", passed(r), r.stderr)
+
+        # Arm A, shell writes
+        sw = mkrepo("sw", ("README.md", "sub/f.txt", ".gitignore"))
+        with open(os.path.join(sw, ".gitignore"), "w") as fh:
+            fh.write("ign.txt\n")
+        sh(sw, "git", "add", "-A")
+        sh(sw, "git", "commit", "-q", "-m", "ign")
+        touch(sw, "ign.txt", "i\n")
+        sw_wt = os.path.join(tmp, "sw_wt")
+        sh(sw, "git", "worktree", "add", "-q", "-b", "swfeat", sw_wt)
+        sw_dev = mkrepo("sw_dev", ("README.md",))
+        sh(sw_dev, "git", "checkout", "-q", "-b", "dev")
+        sw_abs = os.path.join(sw, "README.md")
+        for cmd in ("printf '\\n' >> README.md", "echo x > README.md", "cat a > README.md",
+                    ": > README.md", "tee README.md", "echo x | tee -a README.md",
+                    "sed -i '' 's/a/b/' README.md", "sed -i.bak 's/a/b/' README.md",
+                    "perl -pi -e 's/a/b/' README.md", "cp /tmp/x README.md",
+                    "mv /tmp/x README.md", "mv README.md /tmp/x", "rm README.md",
+                    "truncate -s0 README.md", "dd of=README.md",
+                    "echo x >| README.md", "echo x &> README.md", "echo x 2> README.md",
+                    "cd sub && echo x > ../README.md", "cd sub && rm ../README.md",
+                    "bash -c 'echo x >> README.md'", "sh -c \"rm README.md\"",
+                    "echo x >> " + sw_abs, "rm " + sw_abs,
+                    "echo hi; echo x >> README.md", "FOO=1 tee README.md",
+                    "cat <<EOF\nbody\nEOF\nprintf x >> README.md"):
+            r = bash(cmd, sw)
+            check("A shell refuse: " + cmd.replace("\n", "\\n"),
+                  refused(r) and "README.md" in r.stderr and "worktree" in r.stderr, r.stderr)
+        for cmd in ("echo x >> " + sw_abs, "rm " + sw_abs, "sed -i '' s/a/b/ " + sw_abs,
+                    "bash -c 'echo x > %s'" % sw_abs, "cd %s && echo x > README.md" % sw):
+            check("A shell refuse (cwd outside the repo): " + cmd,
+                  refused(bash(cmd, nongit)))
+        # HOME is tmp/home in the hook's env, so ~/../sw is the repo.
+        check("A shell refuse: ~-path target",
+              refused(bash("echo x > ~/../sw/README.md", nongit)))
+        check("A shell refuse: ~-path via tee in bash -c",
+              refused(bash("bash -c 'tee -a ~/../sw/README.md'", nongit)))
+        # the same via the recorded Codex payload shape
+        for cmd in ("printf '\\n' >> README.md", "rm README.md", "cd sub && sed -i '' s/a/b/ ../README.md"):
+            r = run(recorded("codex_pretooluse_shell.json", sw, command=cmd))
+            check("A shell refuse (codex Bash): " + cmd, refused(r) and "README.md" in r.stderr, r.stderr)
+        for cmd in ("echo hi > /dev/null", "ls 2>&1", "ls &>/dev/null", "echo hi >&2",
+                    "echo x > /tmp/swout.txt", "echo x > %s/swout.txt" % nongit,
+                    "echo x > new.txt", "echo x >> ign.txt", "echo x > sub/newfile.txt",
+                    "cat README.md", "grep a README.md", "sed -n 1,5p README.md",
+                    "cp README.md /tmp/swcopy", "cp README.md new2.txt", "tee /tmp/swlog",
+                    "git commit -m x", "git add README.md", "git status 2>&1 | cat",
+                    "python3 bin/pdr.py add README.md",
+                    "cat <<'EOF'\nprintf x >> README.md\nEOF",
+                    "echo \"printf x >> README.md\"", "echo 'rm README.md'",
+                    "git log # echo x > README.md"):
+            r = bash(cmd, sw)
+            check("A shell pass: " + cmd.replace("\n", "\\n"), passed(r), r.stderr)
+        for cmd in ("echo x >> README.md", "rm README.md", "sed -i '' s/a/b/ sub/f.txt",
+                    "mv README.md README.old"):
+            check("A shell pass (linked worktree): " + cmd, passed(bash(cmd, sw_wt)))
+            check("A shell pass (main checkout on dev): " + cmd, passed(bash(cmd, sw_dev)))
+        check("A shell pass (worktree file by absolute path from the main checkout)",
+              passed(bash("echo x >> %s" % os.path.join(sw_wt, "README.md"), sw)))
+        check("A shell pass: exempt_repos repo", passed(bash("echo x >> b.txt", exrepo)))
+        check("A shell pass: exempt_paths glob",
+              passed(bash("echo x >> docs/g.txt", main_repo)))
+        check("A shell pass: scope memory store",
+              passed(bash("echo x >> mem/note.md", memrepo)))
+        check("A shell pass: non-git dir", passed(bash("echo x >> f.txt", nongit)))
+        check("A shell pass: repo with no origin", passed(bash("echo x >> a.txt", noorigin)))
+        check("A shell pass: config=None path unaffected (unparseable segment fails open)",
+              passed(bash("echo 'unterminated >> README.md", nongit)))
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0

@@ -207,7 +207,12 @@ refused when the target is a tracked file and its repo's MAIN checkout is on the
 (`origin/HEAD`'s branch if set, else `main`, or `master` when that is what is checked out). The
 message says to run `wt new <name>` and edit there. Allowed: a new untracked file, anything in a
 linked worktree (whatever its branch), a main checkout on another branch or a detached HEAD, and
-paths outside a git repo. An `apply_patch` is refused if any file it touches qualifies.
+paths outside a git repo. An `apply_patch` is refused if any file it touches qualifies. Shell
+writes are judged the same way: a redirect (`>`, `>>`, `>|`, `&>`), `tee`, `sed -i` / `perl -i`,
+the destination of `cp` / `install` / `ln`, either end of `mv`, `rm`, `truncate`, `unlink` and
+`dd of=`, also inside `bash -c` and after a `cd`, from the payload directory and the tracked
+directory alike. `> /dev/null`, `2>&1`, writes outside a repo, to untracked files, in linked
+worktrees and to exempt paths pass.
 
 **Arm B, shell.** Refused: any raw `gh pr merge` invocation except `--help` (use `wt merge`, which
 checks the review verdict); and, only when it would destroy uncommitted work, `git checkout -f`,
@@ -255,8 +260,8 @@ comment that turns the guard off.
 line names the file and says the guard is off for that call), except that the file itself stays
 protected.
 
-**Known limits.** Arm A does not see general shell writes to tracked files (`sed -i` on a source
-file, redirects, `python -c`); only writes to the config file are covered. Shell variables are
+**Known limits.** Arm A sees only the shell's own writes (the list above), not a program that
+writes on its own (`python3 script.py`, `python -c`, `make`). Shell variables are
 not expanded: a `-C "$VAR"` or `cd "$VAR"` that cannot be resolved is judged against the nearest
 existing parent directory, and `> "$CFG"` is not recognised as a config write. The `gh pr merge`
 exemption is keyed on the current directory's repo. `gh api` merges are not covered.
