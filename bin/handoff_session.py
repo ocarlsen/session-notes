@@ -51,6 +51,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import shlex
 import sys
 import time
 
@@ -162,6 +163,11 @@ def build_park_cmd(name, spec):
     return [sys.executable, BUS, "send", "--staged", "--to", name, spec]
 
 
+def park_cmd_text(name, spec):
+    """The park command as one printable line (dry-run and the retry hint use this)."""
+    return " ".join(shlex.quote(x) for x in build_park_cmd(name, spec))
+
+
 def build_label_cmd(name, display):
     """The `tmux set-option` argv that stores a display-only label on the session, or
     None. The messaging name stays --name (what `claude -n`, SendMessage and the bus
@@ -233,20 +239,6 @@ def selftest():
           c3 == ["tmux", "new-session", "-d", "-s", "gamma", "-c", "/tmp", "--", "c", "-n", "gamma"],
           " ".join("%r" % x for x in c3))
 
-    # 4b. The STAGED park carries --staged (bus_nudge keeps the pane idle); the dry-run says so.
-    pc = build_park_cmd("gamma", "the spec")
-    check("staged park argv includes --staged before --to",
-          pc[2:] == ["send", "--staged", "--to", "gamma", "the spec"] or
-          pc[-5:] == ["send", "--staged", "--to", "gamma", "the spec"], " ".join(pc))
-    import contextlib as _cl, io as _io
-    for flag, val, want in (("--spec", "do it", True), ("--prompt", "go.", False)):
-        buf = _io.StringIO()
-        with _cl.redirect_stdout(buf):
-            rc = main(["--name", "t", flag, val, "--cwd", "/tmp", "--dry-run",
-                       "--claude-bin", sys.executable])
-        check("dry-run %s: %s mentions send --staged" % (flag, "staged" if want else "auto-start"),
-              rc == 0 and ("send --staged" in buf.getvalue()) == want, buf.getvalue()[-300:])
-
     # 4a. Lineage: parent_args (session_lineage.spawn_env_args() output) land right after
     #     `new-session -d` and before `-s <name>`: tmux's own option position for `-e`,
     #     distinct from the inner claude argv after `--`.
@@ -283,6 +275,26 @@ def selftest():
         check("dry run passes spawn_env_args() through to tmux",
               rc == 0 and "'SESSION_NOTES_PARENT_SESSION=work'" in buf.getvalue(),
               "rc=%r out=%r" % (rc, buf.getvalue()[:300]))
+        # The STAGED park carries --staged (bus_nudge keeps the pane idle). Stubs above.
+        pc = build_park_cmd("gamma", "the spec")
+        check("staged park argv includes --staged before --to",
+              pc[-5:] == ["send", "--staged", "--to", "gamma", "the spec"], " ".join(pc))
+        for flag, val, want in (("--spec", "do it", True), ("--prompt", "go.", False)):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["--name", "t", flag, val, "--cwd", "/tmp", "--dry-run",
+                           "--claude-bin", "c"])
+            out = buf.getvalue()
+            check("dry-run %s: park line from build_park_cmd %s"
+                  % (flag, "printed" if want else "absent"),
+                  rc == 0 and (park_cmd_text("t", "<spec>") in out) == want, out[-300:])
+        import inspect
+        check("the real park call site runs build_park_cmd",
+              "_run(build_park_cmd(" in inspect.getsource(main))
+        check("the failed-send retry hint says --staged and is built from build_park_cmd",
+              "--staged" in park_cmd_text("w", "<spec>")
+              and "park_cmd_text(name" in inspect.getsource(main)
+              and 'send --to %s' not in inspect.getsource(main))
     finally:
         (session_lineage.spawn_env_args, g["live_sessions"], g["tmux_has_session"],
          shutil.which) = saved
@@ -541,8 +553,9 @@ def main(argv=None):
             print("[dry-run] AUTO-START: prompt is argv (%d chars); bus park SKIPPED" % len(prompt))
             print("[dry-run] " + spawn_note(a.no_build))
         if spec:
-            print("[dry-run] would park spec (%d chars) on the bus for %r (send --staged: "
-                  "bus_nudge leaves the pane idle until you type)" % (len(spec), name))
+            print("[dry-run] would park spec (%d chars) on the bus for %r (bus_nudge leaves "
+                  "the pane idle until you type): %s"
+                  % (len(spec), name, park_cmd_text(name, "<spec>")))
         print("[dry-run] attach: tmux attach -t %s" % name)
         return 0
 
@@ -600,13 +613,18 @@ def main(argv=None):
             print("parked spec on the bus for %r%s" % (name, note))
         else:
             print("handoff_session: spec send FAILED: %s" % (s.stderr or s.stdout).strip(), file=sys.stderr)
-            print("  -> the session is up; retry: python3 %s send --to %s \"<spec>\"" % (BUS, name), file=sys.stderr)
+            print("  -> the session is up; retry (keep --staged, or the spec runs unprompted): %s"
+                  % park_cmd_text(name, "<spec>"), file=sys.stderr)
             return 7
     elif not registered:
         print("note: session not yet visible on the bus after %.0fs (it should appear shortly)" % a.timeout)
 
     print("attach: tmux attach -t %s   (from inside tmux: tmux switch-client -t %s)" % (name, name))
     print("NOTE: this only STAGED the session + spec; nothing has run. Your prompt in that pane authorizes.")
+    if spec:
+        print("NOTE: the spec is delivered by the bus hook on that first prompt, and expires "
+              "after 24h if it is not. A Codex pane: trust the hooks in /hooks before typing, "
+              "or the spec does not arrive.")
     return 0
 
 

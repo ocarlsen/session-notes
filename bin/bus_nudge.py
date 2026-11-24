@@ -135,6 +135,18 @@ def is_hooked_agent(p):
     return _harness(p) is not None and not is_hookless(p)
 
 
+def hold_text(name, hook_dead):
+    """The once-only HOLDING line for a pane with a parked staged spec."""
+    base = ("a staged spec is parked for it; not nudging until a human types in that "
+            "pane. The typed prompt delivers it only if the bus hook runs in that pane "
+            "(Codex: --no-daemon and hooks trusted in /hooks); otherwise the spec and "
+            "later mail to that session wait until they expire (24h)")
+    if hook_dead:
+        base = ("this pane's hook is not delivering: the spec will not arrive, and later "
+                "mail to that session waits behind it until it expires (24h). " + base)
+    return "HOLDING %s: %s" % (name, base)
+
+
 def is_ready(p):
     """Safe to type into + Enter now. Claude: not working and bcast's empty ❯ box.
     Any other harness (Codex): its own idle + empty-box tests on the raw -e screen."""
@@ -212,8 +224,10 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
             pk = "parked:%s:%s" % (name, created)
             if pk not in capped:
                 capped.add(pk)
-                print("%s  HOLDING %s: a staged spec is parked for it; not nudging until "
-                      "a human types in that pane" % (time.strftime("%H:%M"), name),
+                hook_dead = any(is_hookless(p) or history.get(
+                    "pull:%s:%s:%s" % (p["pane_id"], p.get("pane_pid"), created), False)
+                    for p in by_session.get(name, []))
+                print("%s  %s" % (time.strftime("%H:%M"), hold_text(name, hook_dead)),
                       flush=True)
             continue
         if session_bus.delivery_errors(name):
@@ -417,6 +431,33 @@ def selftest():
               not hist.get("alpha") and not any(k.startswith(("pull:", "hooked:")) for k in hist))
         check("the parked hold is announced exactly once",
               out.count("HOLDING alpha") == 1)
+        check("hooked HOLDING text names the release condition and the 24h expiry",
+              "bus hook runs in that pane" in out and "/hooks" in out and "24h" in out
+              and "will not arrive" not in out)
+        cx = {"is_claude": False, "is_agent": True, "harness": "codex", "is_self": False,
+              "tmux_session": "alpha", "state": "idle", "name": "alpha:0", "pane_id": "%1",
+              "pane_pid": 7}
+        saved_h = getattr(session_peers, "HARNESSES", None)
+        session_peers.HARNESSES = {"codex": {"hook_in_pane": lambda p: False}}
+        try:
+            session_peers.list_peers = lambda: [dict(cx)]
+            _, _, out = run_ticks([{"id": "s", "staged": True, "_offers": 0}])
+            check("hookless pane: HOLDING says the hook is not delivering",
+                  "hook is not delivering: the spec will not arrive" in out
+                  and out.count("HOLDING alpha") == 1)
+            session_peers.HARNESSES = {"codex": {"hook_in_pane": lambda p: True}}
+            del sent[:]
+            session_bus.undelivered = lambda nm, created=None: [
+                {"id": "s", "staged": True, "_offers": 0}]
+            h2 = {"pull:%1:7:1": True}
+            o2 = io.StringIO()
+            with contextlib.redirect_stdout(o2):
+                tick(h2, set())
+            check("escalated pane (sticky pull state): HOLDING says the hook is not delivering",
+                  "will not arrive" in o2.getvalue() and sent == [])
+        finally:
+            session_peers.HARNESSES = saved_h
+            session_peers.list_peers = lambda: [dict(pane)]
         run_ticks([{"id": "p", "_offers": 0}], n=1)
         check("positive control: a plain zero-offer message IS nudged", sent == ["%1"])
         run_ticks([{"id": "s", "staged": True, "_offers": 1}, {"id": "p", "_offers": 0}], n=1)
