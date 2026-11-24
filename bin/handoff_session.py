@@ -157,6 +157,11 @@ def label_spec(spec):
             "authorizes; nothing here has run): " + spec)
 
 
+def build_park_cmd(name, spec):
+    """argv that parks a STAGED spec. `--staged` tells bus_nudge to leave the pane idle."""
+    return [sys.executable, BUS, "send", "--staged", "--to", name, spec]
+
+
 def build_label_cmd(name, display):
     """The `tmux set-option` argv that stores a display-only label on the session, or
     None. The messaging name stays --name (what `claude -n`, SendMessage and the bus
@@ -227,6 +232,20 @@ def selftest():
     check("staged spawn is exactly a bare claude",
           c3 == ["tmux", "new-session", "-d", "-s", "gamma", "-c", "/tmp", "--", "c", "-n", "gamma"],
           " ".join("%r" % x for x in c3))
+
+    # 4b. The STAGED park carries --staged (bus_nudge keeps the pane idle); the dry-run says so.
+    pc = build_park_cmd("gamma", "the spec")
+    check("staged park argv includes --staged before --to",
+          pc[2:] == ["send", "--staged", "--to", "gamma", "the spec"] or
+          pc[-5:] == ["send", "--staged", "--to", "gamma", "the spec"], " ".join(pc))
+    import contextlib as _cl, io as _io
+    for flag, val, want in (("--spec", "do it", True), ("--prompt", "go.", False)):
+        buf = _io.StringIO()
+        with _cl.redirect_stdout(buf):
+            rc = main(["--name", "t", flag, val, "--cwd", "/tmp", "--dry-run",
+                       "--claude-bin", sys.executable])
+        check("dry-run %s: %s mentions send --staged" % (flag, "staged" if want else "auto-start"),
+              rc == 0 and ("send --staged" in buf.getvalue()) == want, buf.getvalue()[-300:])
 
     # 4a. Lineage: parent_args (session_lineage.spawn_env_args() output) land right after
     #     `new-session -d` and before `-s <name>`: tmux's own option position for `-e`,
@@ -522,7 +541,8 @@ def main(argv=None):
             print("[dry-run] AUTO-START: prompt is argv (%d chars); bus park SKIPPED" % len(prompt))
             print("[dry-run] " + spawn_note(a.no_build))
         if spec:
-            print("[dry-run] would park spec (%d chars) on the bus for %r" % (len(spec), name))
+            print("[dry-run] would park spec (%d chars) on the bus for %r (send --staged: "
+                  "bus_nudge leaves the pane idle until you type)" % (len(spec), name))
         print("[dry-run] attach: tmux attach -t %s" % name)
         return 0
 
@@ -573,7 +593,7 @@ def main(argv=None):
         time.sleep(0.5)
 
     if spec:
-        s = _run([sys.executable, BUS, "send", "--to", name, spec])
+        s = _run(build_park_cmd(name, spec))
         if s.returncode == 0:
             note = "" if registered else " (session not yet visible on the bus; spec is queued, " \
                                          "it delivers on the pane's next prompt)"

@@ -58,6 +58,10 @@ GUARDS
     acknowledgments cannot run all night. Hitting the cap is announced once.
   * A session with a RECORDED DELIVERY FAILURE is skipped (announced once): its hook
     is broken, so a nudge would burn a billed turn and still deliver nothing.
+  * A pane holding a parked staged spec (send --staged) with zero offers is NOT nudged
+    (announced once): the staged handoff waits for the human's own typed prompt, which
+    runs the hook and records the offer. Other mail to that pane waits with it. A spec
+    parked by a plain `send` is not protected.
   * NUDGE asks for no thank-you or ack replies, which stops most ping-pong
     before the cap is needed.
 """
@@ -200,6 +204,17 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
             capped.discard(name)
             capped.discard("skip:" + name)
             errored.discard(name)
+            capped.discard("parked:%s:%s" % (name, created))
+            continue
+        if session_bus.parked(mail):
+            # Before cap accounting, escalation and the pull branch: a skip costs nothing
+            # and cannot leave sticky state. Announced once per (session, created).
+            pk = "parked:%s:%s" % (name, created)
+            if pk not in capped:
+                capped.add(pk)
+                print("%s  HOLDING %s: a staged spec is parked for it; not nudging until "
+                      "a human types in that pane" % (time.strftime("%H:%M"), name),
+                      flush=True)
             continue
         if session_bus.delivery_errors(name):
             if name not in errored:
@@ -367,6 +382,47 @@ def selftest():
         with contextlib.redirect_stdout(io.StringIO()):
             tick(hist, cap_set, errored=err_set)
         check("a healthy session is nudged again", sent == ["%1"])
+    finally:
+        (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+         session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
+         session_peers.peek) = saved
+
+    # --- a parked staged spec (send --staged, zero offers) keeps its pane idle ---
+    sent = []
+    saved = (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+             session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
+             session_peers.peek)
+    session_peers.list_peers = lambda: [dict(pane)]
+    session_bus.live_sessions = lambda: {"alpha": 1}
+    session_bus.delivery_errors = lambda n, panes=None: []
+    bcast.send = lambda pid, text: sent.append(pid)
+    bcast.log = lambda *a, **k: None
+    bcast.input_box_empty = lambda lines: True
+    session_peers.peek = lambda p: []
+
+    def run_ticks(mail, n=3):
+        del sent[:]
+        session_bus.undelivered = lambda nm, created=None: [dict(m) for m in mail]
+        hist, cap_set, err_set = {}, set(), set()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for _ in range(n):
+                tick(hist, cap_set, errored=err_set)
+        return hist, cap_set, out.getvalue()
+
+    try:
+        hist, cap_set, out = run_ticks([{"id": "s", "staged": True, "_offers": 0}])
+        check("parked staged spec with zero offers: no nudge sent", sent == [])
+        check("parked skip costs no cap stamp and leaves no escalation state",
+              not hist.get("alpha") and not any(k.startswith(("pull:", "hooked:")) for k in hist))
+        check("the parked hold is announced exactly once",
+              out.count("HOLDING alpha") == 1)
+        run_ticks([{"id": "p", "_offers": 0}], n=1)
+        check("positive control: a plain zero-offer message IS nudged", sent == ["%1"])
+        run_ticks([{"id": "s", "staged": True, "_offers": 1}, {"id": "p", "_offers": 0}], n=1)
+        check("an offered staged spec plus fresh plain mail is nudged", sent == ["%1"])
+        run_ticks([{"id": "s", "staged": True, "_offers": 0}, {"id": "p", "_offers": 0}])
+        check("staged and plain both zero offers: not nudged", sent == [])
     finally:
         (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
          session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,

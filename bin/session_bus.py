@@ -569,7 +569,22 @@ def no_address_note(env=None):
             "unset), so this session has no address; cannot send.")
 
 
+def parked(msgs):
+    """True when a STAGED message (send --staged) in `msgs` has never been offered.
+
+    A parked spec waits for the human's first typed prompt, which runs the hook, delivers
+    it and records the offer. `msgs` is `undelivered()` output (carries `_offers`).
+    Messages without the field (older ones, plain sends) are never staged.
+    """
+    return any(m.get("staged") is True and m.get("_offers", 0) == 0 for m in msgs)
+
+
 def cmd_send(args):
+    if getattr(args, "staged", False) and (args.all or str(args.to) == BROADCAST):
+        print("session_bus: --staged parks a spec for ONE named session; it cannot be "
+              "combined with a broadcast (--all or --to '*'). Use --to <name>.",
+              file=sys.stderr)
+        return 2
     if args.all and not args.broadcast_confirm:
         print("session_bus: --all reaches EVERY live session in EVERY project on "
               "this machine, with no per-recipient verification -- that is strictly "
@@ -625,7 +640,7 @@ def cmd_send(args):
                   f"FAILURE ({err}). It may not receive this. Read that file "
                   "before assuming the message landed.", file=sys.stderr)
 
-    msg = append({
+    entry = {
         "id": uuid.uuid4().hex[:12],
         "ts": time.time(),
         "from": me,
@@ -633,7 +648,10 @@ def cmd_send(args):
         "to": to,
         "to_created": to_created,
         "body": body,
-    })
+    }
+    if getattr(args, "staged", False):
+        entry["staged"] = True
+    msg = append(entry)
     prune_state(alive)
     dest = "all sessions" if to == BROADCAST else f"session {to}"
     print(f"sent {msg['id']} from {me} to {dest} "
@@ -1093,6 +1111,53 @@ def selftest():
         check("send --to '*' is refused (rc 2) and points at --broadcast-confirm",
               rc == 2 and "--broadcast-confirm" in err.getvalue())
 
+        ns = argparse.Namespace(all=True, to=None, broadcast_confirm=True, staged=True,
+                                text=["hi"])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cmd_send(ns)
+        check("send --staged with --all is refused (rc 2)",
+              rc == 2 and "--staged" in err.getvalue())
+        ns = argparse.Namespace(all=False, to=BROADCAST, broadcast_confirm=False, staged=True,
+                                text=["hi"])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cmd_send(ns)
+        check("send --staged with --to '*' is refused (rc 2)",
+              rc == 2 and "--staged" in err.getvalue())
+        g = globals()
+        saved_fns = {k: g[k] for k in ("session_info", "live_sessions", "delivery_errors")}
+        saved_st = g["_STATE"]
+        g["session_info"] = lambda env=None: ("sender", 1)
+        g["live_sessions"] = lambda: {"target": 5}
+        g["delivery_errors"] = lambda n, panes=None: []
+        g["_STATE"] = os.path.join(tmp, "send-state")
+        try:
+            for staged in (True, False):
+                ns = argparse.Namespace(all=False, to="target", broadcast_confirm=False,
+                                        staged=staged, text=["spec" + str(staged)])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = cmd_send(ns)
+                got = [m for m in _read(bus) if m.get("body") == "spec" + str(staged)]
+                check("send staged=%s succeeds and writes one line" % staged,
+                      rc == 0 and len(got) == 1)
+                check("send staged=%s: field %s" % (staged, "written" if staged else "absent"),
+                      bool(got) and (got[0].get("staged") is True if staged
+                                     else "staged" not in got[0]))
+        finally:
+            g.update(saved_fns)
+            g["_STATE"] = saved_st
+        check("parked: staged + zero offers", parked([{"staged": True, "_offers": 0}]))
+        check("parked: staged with an offer is released",
+              not parked([{"staged": True, "_offers": 1}]))
+        check("parked: plain zero-offer message is not parked",
+              not parked([{"_offers": 0}]))
+        check("parked: staged false/absent field is not parked",
+              not parked([{"staged": False, "_offers": 0}, {"_offers": 0}]))
+        check("parked: empty", not parked([]))
+        check("parked: any staged zero-offer among others",
+              parked([{"_offers": 1}, {"staged": True, "_offers": 0}, {"_offers": 0}]))
+
         orig_state = _STATE
         sd = os.path.join(tmp, "prune-state")
         _STATE = sd
@@ -1244,6 +1309,9 @@ def main():
     s.add_argument("--broadcast-confirm", action="store_true",
                     help="required alongside --all; explicit confirmation that you mean every "
                          "live session, not just the one you're thinking of")
+    s.add_argument("--staged", action="store_true",
+                   help="park a staged-handoff spec: bus_nudge will not wake the pane until "
+                        "the human types (one named session only, never a broadcast)")
     s.add_argument("text", nargs="+")
     s.set_defaults(fn=cmd_send)
 

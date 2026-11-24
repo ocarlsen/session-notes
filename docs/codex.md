@@ -165,6 +165,11 @@ hook wrote from inside the pane). If a pane was nudged and still shows the mail 
 a later tick, its hook did not run (usually an untrusted hook), and the next nudge is the
 pull line below.
 
+A staged handoff spec (`handoff_session.py` parks it with `send --staged`) is the exception:
+`bus_nudge.py` types nothing into that pane, Codex or Claude, until the human's own typed
+prompt delivers the spec. The pane stays idle. Other mail to the pane waits for that
+keystroke too, and a spec parked by a plain `send` is not protected.
+
 Without it (default daemon mode, where hooks run in the shared background process with no
 `TMUX_PANE`), the fallback is the pull: `bus_nudge.py` types a different fixed line asking
 the pane to run `session_bus.py inbox --nudged --as <session>:<created>`, and the mail
