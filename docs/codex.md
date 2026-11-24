@@ -79,7 +79,7 @@ desktop app's PATH lacks `~/.local/bin`):
 | SessionStart | `codex_session_start` (boot load), `session_pane_registry` |
 | UserPromptSubmit | `time_sense`, `session_bus_hook` |
 | Stop | `session_bus_hook` |
-| PreToolUse (`Bash`, `apply_patch`) | `checkout_guard`: refuses an edit of a tracked file on the default branch of a main checkout (the patch text is read for its target paths), a raw `gh pr merge`, and destructive git on a dirty tree. A refusal blocks the tool call and the model is shown the reason |
+| PreToolUse (`Bash`, `apply_patch`) | `checkout_guard`: refuses an edit of a tracked file on the default branch of a main checkout (the patch text is read for its target paths, and a shell write such as a redirect, `tee`, `sed -i`, `cp`/`mv`/`rm` is judged the same way), a raw `gh pr merge`, and destructive git on a dirty tree. A refusal blocks the tool call and the model is shown the reason |
 | PostToolUse (`apply_patch`) | `em_dash_guard`, which checks only the lines a patch adds |
 
 **The launcher.** `python3 bin/codex_hooks.py launcher --repo <checkout>` writes the script
