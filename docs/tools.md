@@ -208,11 +208,17 @@ refused when the target is a tracked file and its repo's MAIN checkout is on the
 message says to run `wt new <name>` and edit there. Allowed: a new untracked file, anything in a
 linked worktree (whatever its branch), a main checkout on another branch or a detached HEAD, and
 paths outside a git repo. An `apply_patch` is refused if any file it touches qualifies. Shell
-writes are judged the same way: a redirect (`>`, `>>`, `>|`, `&>`), `tee`, `sed -i` / `perl -i`,
-the destination of `cp` / `install` / `ln`, either end of `mv`, `rm`, `truncate`, `unlink` and
-`dd of=`, also inside `bash -c` and after a `cd`, from the payload directory and the tracked
-directory alike. `> /dev/null`, `2>&1`, writes outside a repo, to untracked files, in linked
-worktrees and to exempt paths pass.
+writes are judged the same way: a redirect (`>`, `>>`, `>|`, `>!`, `&>`), `tee`, `sed -i` / `perl -i`
+(their file operands, not the script), the destination of `cp` / `install` / `ln` (a directory
+destination means `<dir>/<each source name>`), `mv`, `rm`, `truncate`, `unlink` and `dd of=`,
+also inside `bash -c`, `eval` and the wrappers `env` (`-C` too), `timeout`, `nice`, `nohup`,
+`time`, `command`, `builtin`, `noglob`, `exec`, `sudo`. Glob operands are expanded the way the
+shell does. After a `cd` to a literal, existing directory (also `pushd`, `cd -` and a `cd` in a
+subshell, which ends with the subshell) relative paths are judged from there only, so `cd
+<worktree> && edit` works; when the guard cannot follow a `cd` (variables, command
+substitution, a missing directory, `popd`) it judges from the payload directory too and refuses
+if either refuses. Writes outside a repo, to untracked files, in linked worktrees and to exempt
+paths pass.
 
 **Arm B, shell.** Refused: any raw `gh pr merge` invocation except `--help` (use `wt merge`, which
 checks the review verdict); and, only when it would destroy uncommitted work, `git checkout -f`,
@@ -260,11 +266,10 @@ comment that turns the guard off.
 line names the file and says the guard is off for that call), except that the file itself stays
 protected.
 
-**Known limits.** Arm A sees only the shell's own writes (the list above), not a program that
-writes on its own (`python3 script.py`, `python -c`, `make`). Shell variables are
-not expanded: a `-C "$VAR"` or `cd "$VAR"` that cannot be resolved is judged against the nearest
-existing parent directory, and `> "$CFG"` is not recognised as a config write. The `gh pr merge`
-exemption is keyed on the current directory's repo. `gh api` merges are not covered.
+**Known limits.** Arm A judges only the listed commands, invoked directly or through
+`bash -c`, `eval` or the listed wrappers. It does not see a program that writes on its own
+(`python3 script.py`, `python -c`, `make`), nor `xargs`, a heredoc fed to a shell, `$'...'`
+quoting, `gsed`, `ruby -i`, `curl -o`, `rsync`, `patch` or `git apply`.
 
 **Codex.** `install.sh --codex` registers the hook on PreToolUse for the tool names `Bash` and
 `apply_patch`, the names and payload shapes recorded from Codex 0.171

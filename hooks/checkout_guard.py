@@ -13,7 +13,8 @@ refused when the target is a TRACKED file of a repo whose MAIN checkout is on th
 to work in a worktree (`wt new <name>`). Never refused: a new untracked file, a file in a
 linked worktree (whatever its branch), a main checkout on a non-default branch or a detached
 HEAD, anything outside a git repo. Known limit: a program that writes on its own (a script such
-as `python3 bin/tool.py`) is not seen, only the shell's own writes are.
+as `python3 bin/tool.py`) is not seen: only the listed commands, invoked directly or through
+bash -c/eval/the listed wrappers, are judged (not xargs, gsed, ruby -i, curl, rsync, patch).
 
 ARM B, shell commands (Bash, and the Codex shell tools). Refused:
   * any raw `gh pr merge` invocation (not `--help`); `wt merge` is the gated way. Only an
@@ -41,6 +42,7 @@ line `checkout_guard: <error>`. A config that fails to parse says so by file nam
     python3 checkout_guard.py --selftest
 """
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -68,7 +70,11 @@ SHELL_TOOLS = ("shell", "exec_command", "local_shell", "container.exec", "Bash")
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
 # wrapper -> the flags that take a separate value
 WRAPPERS = {"command": (), "env": ("-u", "-C", "-S"), "time": (), "nohup": (), "exec": ("-a",),
-            "sudo": ("-u", "-g", "-h", "-p", "-U", "-C", "-D", "-R", "-T")}
+            "sudo": ("-u", "-g", "-h", "-p", "-U", "-C", "-D", "-R", "-T"),
+            "builtin": (), "noglob": (), "nice": ("-n",),
+            "timeout": ("-s", "-k", "--signal", "--kill-after")}
+# wrappers that take this many positional operands before the command (`timeout 5 cmd`)
+WRAPPER_POSITIONAL = {"timeout": 1}
 # shell keywords that can sit in front of a command
 KEYWORDS = ("if", "then", "else", "elif", "do", "while", "until", "!", "{", "(")
 # Codex trims every line of a patch before reading it (`line.trim()` in its parser), so a marker
@@ -76,7 +82,7 @@ KEYWORDS = ("if", "then", "else", "elif", "do", "while", "until", "!", "{", "(")
 _PATCH_RE = re.compile(r"^[^\S\n]*\*\*\* (?:Update File|Add File|Delete File|Move to): (.+?)\s*$", re.M)
 APPLY_PATCH_NAMES = ("apply_patch", "applypatch")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_HEREDOC_RE = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+_HEREDOC_RE = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_.][A-Za-z0-9_.-]*))")
 _MERGE_FALLBACK_RE = re.compile(
     r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:(?:command|env|sudo|time|nohup|exec)\s+)*"
     r"(?:\S*/)?gh\s+(?:(?:-R|--repo)\s+\S+\s+)*pr\s+merge\b")
@@ -142,7 +148,8 @@ def has_origin(top):
 
 
 def is_tracked(top, real):
-    return _git(top, "ls-files", "--error-unmatch", "--", real).returncode == 0
+    return _git(top, "--literal-pathspecs", "ls-files", "--error-unmatch", "--",
+                real).returncode == 0
 
 
 def tree_dirty(tree, untracked):
@@ -206,7 +213,7 @@ def check_edit(paths, cwd, cfg):
     for p in paths:
         ap = p if os.path.isabs(p) else os.path.join(cwd, p)
         real = os.path.realpath(ap)
-        info = repo_info(os.path.dirname(real))
+        info = repo_info(real if os.path.isdir(real) else os.path.dirname(real))
         if not info:
             continue
         top, common = info
@@ -255,6 +262,8 @@ def _redirect(cmd, i):
     n = len(cmd)
     op = next(o for o in _REDIR_OPS if cmd.startswith(o, i))
     j = i + len(op)
+    if op in (">", ">>") and j < n and cmd[j] == "!":  # zsh force-clobber `>!` / `>>!`
+        j += 1
     while j < n and cmd[j] in " \t":
         j += 1
     k, q = j, None
@@ -296,16 +305,21 @@ def _is_write_redirect(op, word, amp):
 def split_segments(cmd):
     """Split on unquoted ; & | newline ( ) and backtick; drop unquoted comments. Redirections
     (`>`, `>>`, `<`, `<<<`, `&>`, `N>`, `2>&1`, `>|`, attached or detached) are removed from the
-    text and their write targets returned: a list of (text, write targets) per segment."""
+    text and their write targets returned: a list of (text, write targets, sub) per segment.
+    `sub` is True when the segment may run in a subshell, so a `cd` in it need not move the shell:
+    inside ( ) or backticks, or on either side of a single `|`, or before a single `&`."""
     segs, buf, writes, q, i, n = [], [], [], None, 0, len(cmd)
+    st = {"depth": 0, "bt": False, "prev": ""}
 
-    def flush():
+    def flush(sep=""):
         s = "".join(buf).strip()
         w = list(writes)
         del buf[:]
         del writes[:]
+        sub = st["depth"] > 0 or st["bt"] or sep in ("|", "&") or st["prev"] == "|"
         if s or w:
-            segs.append((s, w))
+            segs.append((s, w, sub))
+        st["prev"] = sep if (s or w or sep) else st["prev"]
     while i < n:
         c = cmd[i]
         if q:
@@ -343,7 +357,17 @@ def split_segments(cmd):
                 writes.append(word)
             continue
         elif c in ";&|\n()`":
-            flush()
+            sep = c
+            if c in "&|" and i + 1 < n and cmd[i + 1] == c:  # `&&` / `||`: plain sequencing
+                sep = ""
+                i += 1
+            flush(sep)
+            if c == "(":
+                st["depth"] += 1
+            elif c == ")":
+                st["depth"] = max(0, st["depth"] - 1)
+            elif c == "`":
+                st["bt"] = not st["bt"]
         else:
             buf.append(c)
         i += 1
@@ -351,8 +375,9 @@ def split_segments(cmd):
     return segs
 
 
-def strip_prefix(argv):
-    """Drop env assignments and wrapper commands in front of the real command."""
+def strip_prefix(argv, chdir=None):
+    """Drop env assignments and wrapper commands in front of the real command. When `chdir` (a
+    list) is given, an `env -C DIR` / `env --chdir=DIR` appends DIR to it."""
     while argv:
         tok = argv[0]
         if _ASSIGN_RE.match(tok) or tok in KEYWORDS:
@@ -361,8 +386,14 @@ def strip_prefix(argv):
             valued = WRAPPERS[tok]
             argv = argv[1:]
             while argv and (argv[0].startswith("-") or _ASSIGN_RE.match(argv[0])):
+                if tok == "env" and chdir is not None:
+                    if argv[0] == "-C" and len(argv) > 1:
+                        chdir.append(argv[1])
+                    elif argv[0].startswith("--chdir="):
+                        chdir.append(argv[0][len("--chdir="):])
                 skip = 2 if argv[0] in valued else 1
                 argv = argv[skip:]
+            argv = argv[WRAPPER_POSITIONAL.get(tok, 0):]
         else:
             break
     return argv
@@ -540,64 +571,137 @@ def is_protected(path, cwd, protected):
     return os.path.realpath(p) in protected
 
 
-def _write_targets(argv, writes):
-    """Every path this segment writes to: its redirect targets (`writes`), tee, sed/perl -i,
-    cp/install/ln (destination), mv (either end), rm/truncate/unlink, dd of=. One list for the
-    config protection and for Arm A, so the two cannot drift. A program that writes on its own
-    (a script) is not seen."""
-    cands = list(writes)
+_GLOB_CHARS = re.compile(r"[*?\[]")
+_SED_INPLACE = re.compile(r"-[nEersuz]*i")
+_PERL_INPLACE = re.compile(r"-[plnaswcTtWXuUS0-9]*i")
+
+
+def _inplace_files(name, a):
+    """File operands of an in-place sed/perl (`-i`, `-i.bak`, `-pi`, `--in-place`), else []. The
+    script (`-e X`, `-f X`, or the first operand when there is no -e/-f) is not a target."""
+    pat = _SED_INPLACE if name == "sed" else _PERL_INPLACE
+    inplace = any(t.startswith("--in-place") or (
+        t.startswith("-") and not t.startswith("--") and not t.startswith(("-M", "-m", "-I"))
+        and pat.match(t)) for t in a)
+    if not inplace:
+        return []
+    ops, have_script, skip = [], False, False
+    for t in a:
+        if skip:
+            skip = False
+        elif t in ("-e", "-f", "--expression", "--file") or re.fullmatch(r"-[A-Za-z0-9]*[ef]", t):
+            have_script, skip = True, True
+        elif t.startswith(("--expression=", "--file=")):
+            have_script = True
+        elif t.startswith("-") and t != "-":
+            pass
+        elif t:
+            ops.append(t)
+    return ops if have_script else ops[1:]
+
+
+def _write_targets(argv, writes, cwd):
+    """Every path this segment writes to, as (path, globbable): its redirect targets (`writes`,
+    never glob-expanded), tee, sed/perl -i (files only), cp/install/ln (destination; a directory
+    destination means <dir>/<each source's name>), mv (sources and destination), rm/truncate/
+    unlink, dd of=. One list for the config protection and for Arm A, so the two cannot drift.
+    A program that writes on its own (a script) is not seen."""
+    cands = [(w, False) for w in writes]
     if argv:
         name, a = os.path.basename(argv[0]), argv[1:]
         ops = [t for t in a if not t.startswith("-")]
         if name == "tee":
-            cands += ops
+            cands += [(t, True) for t in ops]
         elif name in ("sed", "perl"):
-            if any((t.startswith("-") and not t.startswith("--") and "i" in t[1:])
-                   or t.startswith("--in-place") for t in a):
-                cands += a
-        elif name in ("cp", "install", "ln"):
-            cands += ops[-1:]
-        elif name == "mv" or name in ("rm", "truncate", "unlink"):
-            cands += ops
+            cands += [(t, True) for t in _inplace_files(name, a) if t]
+        elif name in ("cp", "install", "ln", "mv") and ops:
+            srcs, dest = ops[:-1], ops[-1]
+            if name == "mv":
+                cands += [(t, True) for t in srcs]
+            d = os.path.expanduser(dest)
+            if d.endswith("/") or os.path.basename(d) in (".", "..") or \
+                    os.path.isdir(d if os.path.isabs(d) else os.path.join(cwd, d)):
+                cands += [(os.path.join(d, os.path.basename(t.rstrip("/"))), True)
+                          for t in srcs if os.path.basename(t.rstrip("/"))]
+            else:
+                cands.append((dest, True))
+        elif name in ("rm", "truncate", "unlink"):
+            cands += [(t, True) for t in ops]
         elif name == "dd":
-            cands += [t[3:] for t in a if t.startswith("of=")]
+            cands += [(t[3:], False) for t in a if t.startswith("of=")]
     return cands
 
 
 def _config_write(argv, writes, cwd, protected):
     """The refusal when this segment writes to the config file."""
-    for c in _write_targets(argv, writes):
+    for c, _ in _write_targets(argv, writes, cwd):
         if is_protected(c, cwd, protected):
             return _config_msg(os.path.realpath(os.path.expanduser(c)))
     return None
 
 
-def _shell_write(argv, writes, cwd, base_cwd, cfg):
+def _expand(path, d, globbable):
+    """The paths a write target means from directory d. A glob operand is expanded like the
+    shell does (no dotfiles for `*`; no match means nothing to judge); a path that exists
+    literally is judged literally as well."""
+    p = os.path.expanduser(path)
+    p = p if os.path.isabs(p) else os.path.join(d, p)
+    if not (globbable and _GLOB_CHARS.search(p)):
+        return [p]
+    out = glob.glob(p)
+    return ([p] if os.path.lexists(p) else []) + out
+
+
+def _dirs(cwd, base_cwd, reliable, chdir=None):
+    """The directories a segment's relative paths are judged from. Just the cd-tracked one while
+    every cd so far was literal, to an existing directory, outside a subshell; otherwise that one
+    AND the payload cwd (refused if either refuses), since the guard cannot resolve every cd."""
+    out = [cwd] if reliable else [cwd, base_cwd]
+    for c in chdir or ():
+        c = os.path.expanduser(c)
+        out = [c if os.path.isabs(c) else os.path.join(d, c) for d in out]
+    return list(dict.fromkeys(out))
+
+
+def _shell_write(argv, writes, dirs, cfg):
     """Arm A for a shell write: the refusal when a write target is a tracked file of a main
-    checkout on its default branch. Judged from BOTH the payload cwd and the cd-tracked cwd and
-    refused if either refuses: the guard cannot resolve every cd (`cd "$PWD"`, a subshell, a
-    failed cd, popd)."""
+    checkout on its default branch, judged from each directory in `dirs`."""
     if cfg is None:
         return None
-    cands = [os.path.expanduser(c) for c in _write_targets(argv, writes)
-             if c and not c.startswith("-")]
-    if not cands:
-        return None
-    for d in ([cwd] if base_cwd == cwd else [cwd, base_cwd]):
-        r = check_edit(cands, d, cfg)
+    for d in dirs:
+        cands = []
+        for c, g in _write_targets(argv, writes, d):
+            if c and not c.startswith("-"):
+                cands += _expand(c, d, g)
+        r = check_edit(cands, d, cfg) if cands else None
         if r:
             return r
     return None
 
 
-def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
+def _literal_dir(arg, cwd):
+    """The directory a `cd ARG` reliably lands in, or None when the guard cannot be sure."""
+    if not arg or arg.startswith("-") or re.search(r"[$`*?\[]", arg):
+        return None
+    d = os.path.expanduser(arg)
+    d = os.path.normpath(d if os.path.isabs(d) else os.path.join(cwd, d))
+    return d if os.path.isdir(d) else None
+
+
+def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=True):
     """Refusal text for a shell command, or None. cfg None (config failed to parse) leaves only
-    the config-file protection active."""
+    the config-file protection active. `reliable` is False once the cd-tracked directory may not
+    be where the shell really is."""
     wt = wt_command()
     base_cwd = base_cwd or cwd  # the directory the tool call started in (the payload cwd)
-    for seg, writes in split_segments(strip_heredocs(cmd)):
+    oldpwd, saved = None, None  # the previous directory (for `cd -`); state outside a subshell
+    for seg, writes, sub in split_segments(strip_heredocs(cmd)):
+        if saved and not sub:  # a subshell's cd does not outlive the subshell
+            cwd, reliable, oldpwd = saved
+            saved = None
+        dirs = _dirs(cwd, base_cwd, reliable)
         msg = _config_write([], writes, cwd, protected) \
-            or _shell_write([], writes, cwd, base_cwd, cfg)
+            or _shell_write([], writes, dirs, cfg)
         if msg:
             return msg
         try:
@@ -606,33 +710,46 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
             if cfg is not None and _MERGE_FALLBACK_RE.match(seg) and not _exempt_cwd(cfg, cwd):
                 return _merge_msg(wt)
             continue
-        argv = strip_prefix(argv)
+        chdir = []
+        argv = strip_prefix(argv, chdir)
         msg = _config_write(argv, [], cwd, protected) \
-            or _shell_write(argv, [], cwd, base_cwd, cfg)
+            or _shell_write(argv, [], _dirs(cwd, base_cwd, reliable, chdir), cfg)
         if msg:
             return msg
         if not argv:
             continue
         name = os.path.basename(argv[0])
         if name in ("cd", "pushd"):
-            if len(argv) > 1 and not argv[1].startswith("-"):
-                d = os.path.expanduser(argv[1])
-                cwd = os.path.normpath(d if os.path.isabs(d) else os.path.join(cwd, d))
+            args = [t for t in argv[1:] if t not in ("-P", "-L", "-e", "-@", "--")]
+            d = oldpwd if args == ["-"] and oldpwd else (
+                _literal_dir(args[0], cwd) if len(args) == 1 else None)
+            if d is None:
+                reliable = False
+            else:
+                if sub and saved is None:
+                    saved = (cwd, reliable, oldpwd)
+                oldpwd, cwd = cwd, d
+            continue
+        if name == "popd":
+            reliable = False
             continue
         if name in SHELLS and depth < 3:
             script = _script_of(argv)
             if script:
-                r = check_command(script, cwd, cfg, protected, depth + 1, base_cwd)
+                r = check_command(script, cwd, cfg, protected, depth + 1, base_cwd, reliable)
                 if r:
                     return r
             continue
+        if name == "eval" and depth < 3 and len(argv) > 1:
+            r = check_command(" ".join(argv[1:]), cwd, cfg, protected, depth + 1, base_cwd,
+                              reliable)
+            if r:
+                return r
+            continue
         if name in APPLY_PATCH_NAMES:
-            # An apply_patch run through the shell is an edit too. It is judged from BOTH the
-            # directory the call started in and the guard's own cd-tracked directory, and refused
-            # if either refuses: the guard cannot resolve every cd (`cd "$PWD"`, a subshell, a
-            # failed cd, popd), and the shell does not always keep the one it can.
+            # An apply_patch run through the shell is an edit too, judged like a shell write.
             pp = patch_paths(cmd)
-            for d in ([cwd] if base_cwd == cwd else [cwd, base_cwd]):
+            for d in _dirs(cwd, base_cwd, reliable, chdir):
                 for p in pp:
                     if is_protected(p, d, protected):
                         return _config_msg(os.path.realpath(os.path.join(d, os.path.expanduser(p))))
@@ -646,8 +763,8 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
             if is_gh_pr_merge(argv[1:]) and not _exempt_cwd(cfg, cwd):
                 return _merge_msg(wt)
         elif name == "git":
-            sub, args, tree = _git_target(argv, cwd)
-            verb = git_verdict(sub, args, tree) if sub else None
+            sub_cmd, args, tree = _git_target(argv, cwd)
+            verb = git_verdict(sub_cmd, args, tree) if sub_cmd else None
             if not verb or _exempt_cwd(cfg, tree):
                 continue
             return ("checkout_guard: `%s` would destroy uncommitted changes: the tree at %s has "
@@ -1415,8 +1532,108 @@ def selftest():
               passed(bash("echo x >> mem/note.md", memrepo)))
         check("A shell pass: non-git dir", passed(bash("echo x >> f.txt", nongit)))
         check("A shell pass: repo with no origin", passed(bash("echo x >> a.txt", noorigin)))
-        check("A shell pass: config=None path unaffected (unparseable segment fails open)",
-              passed(bash("echo 'unterminated >> README.md", nongit)))
+
+        # Arm A shell writes, round 1 fixes
+        fresh = os.path.join(tmp, "fresh")
+        os.makedirs(fresh)
+        sh(fresh, "git", "init", "-q", "-b", "main")
+        touch(fresh, "README.md", "x\n")
+        sh(fresh, "git", "add", "-A")
+        sh(fresh, "git", "commit", "-q", "-m", "i")
+        plain = os.path.join(tmp, "plaindir")
+        os.makedirs(plain)
+        wt_probe = os.path.realpath(r2.stdout.strip())
+        wtq = "%s" % sw_wt
+        # F1: cd into a place that is not the main checkout, then a relative write
+        for cmd in ("cd %s && echo x >> README.md" % wtq, "cd %s && sed -i '' s/a/b/ sub/f.txt" % wtq,
+                    "cd %s && rm sub/f.txt" % wtq, "cd %s; echo x >> README.md" % wtq,
+                    "pushd %s && echo x >> README.md" % wtq,
+                    "bash -lc 'cd %s && echo x >> README.md'" % wtq,
+                    "cd %s && cat > README.md <<'EOF'\nx\nEOF" % wtq,
+                    "cd %s && git mv README.md R.md && mv Makefile GNUmakefile" % wtq,
+                    "cd %s && echo x > README.md" % plain, "cd %s && echo x > README.md" % fresh,
+                    "cd %s && echo x >> README.md" % sw_dev,
+                    "(cd %s && echo x >> README.md)" % wtq,
+                    "cd ../sw_wt && echo x >> README.md"):
+            check("F1 allow (from main checkout): " + cmd.replace("\n", "\\n"), passed(bash(cmd, sw)))
+        check("F1 allow: `wt new` worktree, then cd and write (the guard's own advice)",
+              passed(bash("cd %s && printf x >> a.txt" % wt_probe, wtrepo)))
+        for cmd in ("(cd %s && git fetch -q) ; echo x >> README.md" % sw,
+                    "cd %s && git pull --ff-only && cd - && echo x >> README.md" % sw,
+                    "(cd %s; true) && echo x >> README.md" % sw):
+            check("F1 allow (from a worktree): " + cmd, passed(bash(cmd, sw_wt)))
+        for cmd in ('cd "$X" && rm README.md', "cd /nonexistent; rm README.md",
+                    "(cd sub && true); rm README.md", "cd sub && echo x >> ../README.md",
+                    "cd $(echo sub) && rm README.md", "cd - && rm README.md",
+                    "pushd sub; popd; rm README.md", "cd sub | cat; rm README.md",
+                    "cd sub & rm README.md"):
+            check("F1 refuse (tracking unreliable or a real hit): " + cmd, refused(bash(cmd, sw)), cmd)
+        check("F1 refuse: cd into a main checkout subdir from elsewhere",
+              refused(bash("cd %s/sub && echo x >> f.txt" % sw, nongit)))
+        check("F1 refuse: cd into main checkout from a worktree, write there",
+              refused(bash("cd %s && echo x >> README.md" % sw, sw_wt)))
+        # F2: directory destinations and directory sources
+        sw2 = mkrepo("sw2", ("README.md", "sub/f.txt", "docs/media/a.png", "logs/.gitkeep",
+                             "out/.gitkeep", "docs/samples/x.tmp", "app/i/new.tsx", "rules.sed"))
+        touch(sw2, "new.txt", "n\n")
+        touch(sw2, "scratch/u.txt", "u\n")
+        for cmd in ("cp /tmp/README.md .", "cp /tmp/README.md %s/" % sw2, "cd sub && cp /tmp/README.md ..",
+                    "rm -rf %s" % sw2, "mv %s %s.bak" % (sw2, sw2), "rm -r docs/media",
+                    "install /tmp/f.txt sub", "ln -sf /tmp/README.md .", "mv /tmp/README.md ."):
+            check("F2 refuse: " + cmd, refused(bash(cmd, sw2)), cmd)
+        for cmd in ("cp /tmp/shot.png docs/media/", "mv new.txt sub/", "cd sub && cp /tmp/new.txt .",
+                    "rm -rf scratch", "rm -rf %s" % sw_wt, "cp /tmp/shot.png docs/media",
+                    "cp README.md out/"):
+            check("F2 allow: " + cmd, passed(bash(cmd, sw2)), cmd)
+        # F3: globs are shell globs, paths are literal for git
+        for cmd in ("rm -rf logs/*", "mv out/* /tmp/", "rm -f *.tmp", "echo x > 'app/[id]/new.tsx'",
+                    "rm -f nomatch*"):
+            check("F3 allow: " + cmd, passed(bash(cmd, sw2)), cmd)
+        for cmd in ("rm sub/*", "rm -f docs/samples/*.tmp", "rm -f docs/*/x.tmp", "rm -f R?ADME.md"):
+            check("F3 refuse: " + cmd, refused(bash(cmd, sw2)), cmd)
+        # F4: sed/perl in-place only, files only
+        for cmd in ("perl -Mstrict -ne 'print if /x/' README.md",
+                    "perl -MList::Util=sum -lane 'print' sub/f.txt",
+                    "sed -i '' -f rules.sed /tmp/out.txt", "sed -n 1,5p README.md",
+                    "sed -i.bak -e s/a/b/ /tmp/out.txt", "perl -pi -e s/a/b/ /tmp/out.txt"):
+            check("F4 allow: " + cmd, passed(bash(cmd, sw2)), cmd)
+        for cmd in ("sed -i '' s/a/b/ README.md", "sed -i.bak s/a/b/ README.md",
+                    "perl -pi -e s/a/b/ README.md", "sed -i -e s/a/b/ README.md",
+                    "sed --in-place s/a/b/ README.md", "sed -ni s/a/b/p README.md"):
+            check("F4 refuse: " + cmd, refused(bash(cmd, sw2)), cmd)
+        # F5: cheap bypasses
+        for cmd in ("echo x >! README.md", "echo x >>! README.md", "timeout 5 rm README.md",
+                    "timeout -s KILL 5 rm README.md", "nice rm README.md", "nice -n 5 rm README.md",
+                    "noglob rm README.md", "nohup rm README.md", "command rm README.md",
+                    "time rm README.md", "exec rm README.md", "builtin rm README.md",
+                    "eval 'echo x > README.md'", "eval echo x '>' README.md",
+                    "env -C %s rm README.md" % sw2, "env FOO=1 -C %s tee README.md" % sw2):
+            check("F5 refuse: " + cmd, refused(bash(cmd, sw2) if "env -C" not in cmd and
+                                                "FOO=1 -C" not in cmd else bash(cmd, nongit)), cmd)
+        for cmd in ("timeout 5 rm /tmp/zz", "eval 'echo hi'", "nice -n 5 echo x > /tmp/zz",
+                    "echo x >! /tmp/zz", "env -C %s rm README.md" % sw_wt, "eval 'echo x > /tmp/zz'"):
+            check("F5 allow: " + cmd, passed(bash(cmd, sw2)), cmd)
+        # F6: heredoc delimiter with a hyphen; a broken config keeps only the config protection
+        check("F6 allow: heredoc with a hyphenated unquoted delimiter",
+              passed(bash("cat <<E-O-F > /tmp/note.txt\nrm README.md\nE-O-F", sw2)))
+        check("F6 allow: unparseable segment is not judged as a write",
+              passed(bash("echo 'unterminated >> README.md", sw2)))
+        badcfg = os.path.join(tmp, "bad.toml")
+        with open(badcfg, "w") as fh:
+            fh.write("[checkout_guard\nexempt_repos = \n")
+        benv = dict(env, SESSION_NOTES_CONFIG=badcfg)
+
+        def brun(cmd, cwd):
+            return subprocess.run([sys.executable, os.path.realpath(__file__)], env=benv,
+                                  input=json.dumps({"tool_name": "Bash", "cwd": cwd,
+                                                    "tool_input": {"command": cmd}}),
+                                  capture_output=True, text=True, timeout=30)
+        r = brun("echo x >> README.md", sw2)
+        check("F6 broken config: shell write to a tracked file is NOT judged (loud, rc 0)",
+              r.returncode == 0 and "LOUD" in r.stderr, r.stderr)
+        r = brun("echo x >> %s" % badcfg, sw2)
+        check("F6 broken config: the config file itself is still protected", r.returncode == 2
+              and "config" in r.stderr, r.stderr)
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
