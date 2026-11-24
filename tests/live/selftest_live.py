@@ -2424,7 +2424,7 @@ class Live:
 
     def row_handoff(self, cli):
         if cli == "codex":
-            return SKIP, "handoff_session launches Claude only", None
+            return self.row_handoff_codex()
         tok = "CHILD%s" % self.tok
         self.assert_sandbox_tmux()
         line = "Reply with only the word %s" % tok
@@ -2439,6 +2439,45 @@ class Live:
         if not self.wait_for(lambda: seen(tok, self.ctext("claude")), 120) or "child" not in self.tmux("ls").stdout:
             return FAIL, "child session never answered %s (or its pane is gone)" % tok, "handoff.txt"
         return PASS, "child pane launched in the sandbox server and ran its prompt", None
+
+    def row_handoff_codex(self):
+        """handoff_session --cli codex: an auto-start child answers its (dash-leading) prompt, and a
+        staged child gets its parked spec from the prompt hook on the first typed line."""
+        self.assert_sandbox_tmux()
+        script = os.path.join(self.repo, "bin", "handoff_session.py")
+        common = ["--cli", "codex", "--cwd", self.work, "--codex-bin", self.codex_bin, "--model", self.codex_model,
+                  "--codex-arg=--dangerously-bypass-hook-trust", "--codex-arg=-c",
+                  "--codex-arg=model_reasoning_effort=low", "--codex-arg=-a", "--codex-arg=never"]
+        tok = "XCHILD%s" % self.tok
+        r = self.run([sys.executable, script, "--name", "xchild", "--prompt", "- Reply with only the word %s" % tok]
+                     + common, "handoff-codex.txt", timeout=60)
+        if r.returncode != 0:
+            return FAIL, "handoff_session --cli codex rc=%d: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-200:]), "handoff-codex.txt"
+        if self.watch:
+            self.ephemeral.append("xchild")
+            self.focus("codex", "xchild")
+        if not self.wait_for(lambda: seen(tok, self.ctext("codex")), 150) or "xchild" not in self.tmux("ls").stdout:
+            return FAIL, "codex child never answered %s (or its pane is gone)" % tok, "handoff-codex.txt"
+        # negative control: the same check on a token no child was given must come back empty
+        if seen("NEVER" + tok, self.ctext("codex")):
+            return FAIL, "negative control: an unsent token was reported as seen", "handoff-codex.txt"
+        stok = "XSTAGED%s" % self.tok
+        # the park needs a sender address ($TMUX_PANE), so the launcher runs from its own sandbox pane
+        out = self.pane_run("xlauncher", [sys.executable, script, "--name", "xstaged", "--spec",
+                            "SPEC: the word is %s." % stok] + common, "handoff-codex-staged.txt", timeout=60)
+        if out is None or "parked spec on the bus" not in out:
+            return FAIL, "staged handoff --cli codex did not park: %s" % (out or "timeout").strip()[-200:], "handoff-codex-staged.txt"
+        self.panes.add("xstaged")
+        if self.watch:
+            self.ephemeral.append("xstaged")
+            self.focus("codex", "xstaged")
+        self.wait_idle("xstaged", 90)
+        if self.hook_injected("codex", stok):
+            return FAIL, "negative control: the parked spec reached the staged pane before anyone typed", "handoff-codex-staged.txt"
+        self.send("xstaged", "What is 2+2? Answer in one short line.")
+        if not self.wait_for(lambda: self.hook_injected("codex", stok), 120):
+            return FAIL, "the prompt hook never delivered the parked spec on the first typed prompt", "handoff-codex-staged.txt"
+        return PASS, "auto-start child answered; staged child idle until typed, then the hook delivered the spec", None
 
     def row_refresh(self, cli):
         a, _ = self.pane_pair(cli)

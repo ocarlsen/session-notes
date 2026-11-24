@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""handoff_session -- hand work off to a new, named Claude Code session in tmux.
+"""handoff_session -- hand work off to a new, named Claude Code or Codex session in tmux.
 
 The new session records which session launched it (see session_lineage.py). Usually it starts
 on its task at once (--prompt); in staged mode (--spec) the task waits on the bus until a human
@@ -8,6 +8,22 @@ types in the new pane.
     handoff_session.py --name task-b --prompt-file /tmp/p.md
     handoff_session.py --name images --spec "generate today's images ..."
     handoff_session.py --name task-a --spec-file /tmp/spec.md --cwd /path/to/project
+    handoff_session.py --cli codex --name task-c --prompt-file /tmp/p.md
+
+WHICH CLI. --cli claude|codex picks the agent in the new pane. Without it: codex when
+SESSION_NOTES_AGENT=codex (set by `install.sh --codex` for Codex's shell, so a Codex session
+hands off to Codex), otherwise claude. The Claude path is unchanged. Codex launches as
+`codex --no-daemon` (hooks run in the pane only without the daemon) with the prompt as its
+positional argument. Flag mapping for codex:
+
+    --model M      -> -m M
+    --bypass       -> --dangerously-bypass-approvals-and-sandbox  (the twin of Claude's
+                      --dangerously-skip-permissions: no approval prompts AND no sandbox)
+    --codex-arg A  -> A verbatim (repeatable; a Codex-only flag with no twin here, e.g.
+                      --codex-arg=-a --codex-arg=never)
+    --claude-bin   -> refused with --cli codex (use --codex-bin); --codex-bin and --codex-arg
+                      are refused with --cli claude
+    claude `-n`    -> no twin: the tmux session name IS the address (bus, peers, lineage)
 
 TWO MODES (pick one; they are mutually exclusive by design):
 
@@ -21,7 +37,7 @@ TWO MODES (pick one; they are mutually exclusive by design):
 
 What it does, in order:
   1. refuse if a live tmux session already owns that name
-  2. resolve the `claude` binary
+  2. resolve the `claude` (or `codex`) binary
   3. `tmux new-session -d [-e parent vars] -s <name> -c <cwd> -- <claude> -n <name> ...`
      (the -e vars name THIS session as the new one's parent; see session_lineage.py)
      (permission mode is whatever your Claude Code settings default to; NO
@@ -91,6 +107,26 @@ def resolve_claude(override=None):
     return fallback if os.path.exists(fallback) else None
 
 
+def resolve_codex(override=None):
+    if override:
+        return override
+    found = shutil.which("codex")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/codex")
+    return fallback if os.path.exists(fallback) else None
+
+
+def choose_cli(cli=None, env=None):
+    """The agent for the new pane: an explicit --cli wins; else codex when this shell is a
+    Codex session (SESSION_NOTES_AGENT=codex, the same switch every other tool reads);
+    else claude."""
+    if cli:
+        return cli
+    env = os.environ if env is None else env
+    return "codex" if (env.get("SESSION_NOTES_AGENT") or "").strip().lower() == "codex" else "claude"
+
+
 def tmux_has_session(name):
     """True if tmux itself knows this session (independent of bus registration)."""
     if shutil.which("tmux") is None:
@@ -141,6 +177,28 @@ def build_spawn_cmd(name, cwd, claude, bypass=False, prompt=None,
         inner += ["--model", model]
     if bypass:
         inner.append("--dangerously-skip-permissions")
+    if prompt:
+        inner += ["--", prompt]
+    return (["tmux", "new-session", "-d"] + list(parent_args or [])
+            + ["-s", name, "-c", cwd, "--"] + inner)
+
+
+def build_codex_cmd(name, cwd, codex, bypass=False, prompt=None,
+                    model=DEFAULT_HANDOFF_MODEL, parent_args=None, extra_args=None):
+    """The full `tmux new-session` argv for a Codex pane (LIST form, like build_spawn_cmd).
+
+    `codex --no-daemon`: without it Codex runs commands (and hooks) in a shared background
+    process that has no TMUX_PANE, so the bus hook and the pane registry cannot see the pane.
+    Codex has no `-n`: the tmux session name is the address. Options ride BEFORE the `--`
+    that makes the prompt a positional (a prompt starting with "-" would otherwise parse as a
+    flag). `extra_args` (--codex-arg) goes in verbatim, after the mapped flags.
+    """
+    inner = [codex, "--no-daemon"]
+    if model is not None:
+        inner += ["-m", model]
+    if bypass:
+        inner.append("--dangerously-bypass-approvals-and-sandbox")
+    inner += list(extra_args or [])
     if prompt:
         inner += ["--", prompt]
     return (["tmux", "new-session", "-d"] + list(parent_args or [])
@@ -392,6 +450,95 @@ def selftest():
     finally:
         shutil.which = saved_which
 
+    # 6. --cli codex: argv, selection, flag mapping and refusals.
+    cx = build_codex_cmd("cx", "/tmp", "/usr/bin/codex", prompt="go.")
+    check("codex AUTO-START argv is exactly `codex --no-daemon -- <prompt>`",
+          cx == ["tmux", "new-session", "-d", "-s", "cx", "-c", "/tmp", "--", "/usr/bin/codex",
+                 "--no-daemon", "--", "go."], " ".join("%r" % x for x in cx))
+    cx_s = build_codex_cmd("cx", "/tmp", "c")
+    check("codex STAGED argv is a bare `codex --no-daemon`",
+          cx_s == ["tmux", "new-session", "-d", "-s", "cx", "-c", "/tmp", "--", "c", "--no-daemon"],
+          " ".join("%r" % x for x in cx_s))
+    cx_d = build_codex_cmd("cx", "/tmp", "c", prompt=dashed)
+    check("codex leading-dash prompt follows an end-of-options --, verbatim and last",
+          cx_d[-2] == "--" and cx_d[-1] == dashed)
+    cx_m = build_codex_cmd("cx", "/tmp", "c", bypass=True, prompt="go.", model="m1",
+                           parent_args=pargs, extra_args=["-a", "never"])
+    check("codex --model maps to -m and --bypass to the bypass flag, before the --",
+          "-m" in cx_m and cx_m[cx_m.index("-m") + 1] == "m1"
+          and "--dangerously-bypass-approvals-and-sandbox" in cx_m
+          and cx_m.index("-m") < len(cx_m) - 2
+          and cx_m.index("--dangerously-bypass-approvals-and-sandbox") < len(cx_m) - 2,
+          " ".join(cx_m))
+    check("codex --codex-arg lands verbatim before the prompt separator",
+          cx_m[-4:] == ["-a", "never", "--", "go."], " ".join(cx_m))
+    check("codex parent_args ride right after `new-session -d`",
+          cx_m[:3 + len(pargs)] == ["tmux", "new-session", "-d"] + pargs)
+    check("codex argv never carries claude-only flags",
+          not any(x in cx_m for x in ("-n", "--model", "--dangerously-skip-permissions")))
+    check("choose_cli: explicit wins over the environment",
+          choose_cli("claude", {"SESSION_NOTES_AGENT": "codex"}) == "claude"
+          and choose_cli("codex", {}) == "codex")
+    check("choose_cli: SESSION_NOTES_AGENT=codex selects codex, else claude",
+          choose_cli(None, {"SESSION_NOTES_AGENT": "codex"}) == "codex"
+          and choose_cli(None, {"SESSION_NOTES_AGENT": " Codex "}) == "codex"
+          and choose_cli(None, {}) == "claude"
+          and choose_cli(None, {"SESSION_NOTES_AGENT": "claude"}) == "claude")
+    saved_which = shutil.which
+    saved_probes = (g["live_sessions"], g["tmux_has_session"], session_lineage.spawn_env_args)
+    try:
+        shutil.which = lambda n: "/usr/bin/" + n
+        g["live_sessions"] = lambda: set()
+        g["tmux_has_session"] = lambda name: False
+        session_lineage.spawn_env_args = lambda *a, **k: []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--cli", "codex", "--name", "x", "--prompt", "go.", "--dry-run", "--cwd", "/tmp",
+                       "--codex-bin", "cbin", "--model", "m1", "--bypass", "--codex-arg=-a",
+                       "--codex-arg=never"])
+        out = buf.getvalue()
+        check("codex --dry-run prints the exact argv with the mapped flags",
+              rc == 0 and "'cbin' '--no-daemon' '-m' 'm1' '--dangerously-bypass-approvals-and-sandbox' "
+              "'-a' 'never' '--' 'go.'" in out, "rc=%r out=%r" % (rc, out[:400]))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--cli", "codex", "--name", "x", "--spec", "s", "--dry-run", "--cwd", "/tmp",
+                       "--codex-bin", "cbin"])
+        line = [l for l in buf.getvalue().splitlines() if "would spawn:" in l]
+        check("codex staged --dry-run: bare codex argv and the bus park announced",
+              rc == 0 and line and line[0].endswith("'cbin' '--no-daemon'")
+              and "would park spec" in buf.getvalue(), buf.getvalue()[:400])
+        saved_env = os.environ.get("SESSION_NOTES_AGENT")
+        os.environ["SESSION_NOTES_AGENT"] = "codex"
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["--name", "x", "--prompt", "go.", "--dry-run", "--cwd", "/tmp",
+                           "--codex-bin", "cbin"])
+            check("SESSION_NOTES_AGENT=codex with no --cli launches codex",
+                  rc == 0 and "'cbin' '--no-daemon'" in buf.getvalue(), buf.getvalue()[:300])
+        finally:
+            if saved_env is None:
+                os.environ.pop("SESSION_NOTES_AGENT", None)
+            else:
+                os.environ["SESSION_NOTES_AGENT"] = saved_env
+        errbuf = io.StringIO()
+        with contextlib.redirect_stderr(errbuf):
+            rc1 = main(["--cli", "codex", "--name", "x", "--prompt", "go.", "--claude-bin", "c",
+                        "--dry-run"])
+            e1 = errbuf.getvalue()
+            rc2 = main(["--cli", "claude", "--name", "x", "--prompt", "go.", "--codex-bin", "c",
+                        "--dry-run"])
+            rc3 = main(["--cli", "claude", "--name", "x", "--prompt", "go.", "--codex-arg=-a",
+                        "--dry-run"])
+        check("--claude-bin with --cli codex is refused (rc 2), naming --codex-bin",
+              rc1 == 2 and "--codex-bin" in e1, "rc=%r err=%r" % (rc1, e1))
+        check("--codex-bin / --codex-arg with --cli claude are refused (rc 2)", rc2 == 2 and rc3 == 2,
+              "rc=%r,%r" % (rc2, rc3))
+    finally:
+        shutil.which = saved_which
+        (g["live_sessions"], g["tmux_has_session"], session_lineage.spawn_env_args) = saved_probes
+
     print("handoff_session selftest: %d checks, %d failed" % (ran[0], len(fails)))
     for f in fails:
         print("  FAIL %s" % f)
@@ -402,6 +549,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Hand work off to a new, named Claude Code session in tmux, "
                                 "recording its parent. --prompt starts it working; --spec parks the "
                                 "task until you type in the new pane.")
+    p.add_argument("--cli", choices=("claude", "codex"),
+                   help="agent to launch in the new pane. Default: codex when "
+                        "SESSION_NOTES_AGENT=codex, else claude")
     p.add_argument("--name", help="tmux session name for the new worker (required unless --selftest)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--spec", help="STAGED mode: spec text to park on the bus for the new session")
@@ -417,13 +567,18 @@ def main(argv=None):
                         "[handoff] build_note out of the spawn note")
     p.add_argument("--cwd", default=os.getcwd(), help="working dir for the new session (default: cwd)")
     p.add_argument("--bypass", action="store_true",
-                   help="add --dangerously-skip-permissions (default OFF)")
+                   help="add --dangerously-skip-permissions (default OFF); with --cli codex, "
+                        "--dangerously-bypass-approvals-and-sandbox")
     p.add_argument("--model", default=DEFAULT_HANDOFF_MODEL,
                    help="model for the spawned ORCHESTRATOR session. Default: inherit the "
                         "interactive default (the session orchestrates and may delegate the "
                         "build to a cheaper sub-agent). Pass an id only for a deliberate "
                         "exception.")
-    p.add_argument("--claude-bin", help="override the claude binary path")
+    p.add_argument("--claude-bin", help="override the claude binary path (--cli claude only)")
+    p.add_argument("--codex-bin", help="override the codex binary path (--cli codex only)")
+    p.add_argument("--codex-arg", action="append", default=[], metavar="ARG",
+                   help="extra argv for codex, verbatim, before the prompt (repeatable; write "
+                        "--codex-arg=-a --codex-arg=never so argparse keeps the dash). --cli codex only")
     p.add_argument("--timeout", type=float, default=12.0, help="seconds to wait for bus registration (default 12)")
     p.add_argument("--raw", action="store_true", help="park the spec verbatim, no informational prefix")
     p.add_argument("--dry-run", action="store_true", help="print what would happen; do not spawn or send")
@@ -436,6 +591,16 @@ def main(argv=None):
     name = (a.name or "").strip()
     if not name:
         print("handoff_session: --name is required", file=sys.stderr)
+        return 2
+
+    cli = choose_cli(a.cli)
+    if cli == "codex" and a.claude_bin:
+        print("handoff_session: --claude-bin has no effect on a codex pane; use --codex-bin.",
+              file=sys.stderr)
+        return 2
+    if cli == "claude" and (a.codex_bin or a.codex_arg):
+        print("handoff_session: --codex-bin/--codex-arg only apply with --cli codex "
+              "(this launch is claude).", file=sys.stderr)
         return 2
 
     spec = a.spec
@@ -524,10 +689,16 @@ def main(argv=None):
         print("handoff_session: note: tmux not found on PATH; a real launch would fail (rc 5)",
               file=sys.stderr)
 
-    claude = resolve_claude(a.claude_bin)
-    if not claude:
-        print("handoff_session: could not resolve the `claude` binary (pass --claude-bin)", file=sys.stderr)
-        return 4
+    if cli == "codex":
+        claude = resolve_codex(a.codex_bin)
+        if not claude:
+            print("handoff_session: could not resolve the `codex` binary (pass --codex-bin)", file=sys.stderr)
+            return 4
+    else:
+        claude = resolve_claude(a.claude_bin)
+        if not claude:
+            print("handoff_session: could not resolve the `claude` binary (pass --claude-bin)", file=sys.stderr)
+            return 4
 
     # A live session already owns this name -> refuse (never clobber / re-address).
     # Checked against BOTH the bus and tmux itself: a session that has not registered on the
@@ -541,8 +712,12 @@ def main(argv=None):
     # Lineage: tell the child who launched it. spawn_env_args() never raises and is []
     # outside tmux, so a launch never fails over the record of its own parentage.
     parent_args = session_lineage.spawn_env_args()
-    tmux_cmd = build_spawn_cmd(name, cwd, claude, bypass=a.bypass,
-                               prompt=prompt, model=model, parent_args=parent_args)
+    if cli == "codex":
+        tmux_cmd = build_codex_cmd(name, cwd, claude, bypass=a.bypass, prompt=prompt, model=model,
+                                   parent_args=parent_args, extra_args=a.codex_arg)
+    else:
+        tmux_cmd = build_spawn_cmd(name, cwd, claude, bypass=a.bypass,
+                                   prompt=prompt, model=model, parent_args=parent_args)
     label_cmd = build_label_cmd(name, a.display)
 
     if a.dry_run:
@@ -572,8 +747,8 @@ def main(argv=None):
                   % (lr.stderr or lr.stdout).strip(), file=sys.stderr)
     # NAME THE MODEL in the confirmation. The failure this flag fixes was invisible spend:
     # large-model handoffs nobody noticed until the usage numbers moved.
-    print("spawned session %r (claude, model: %s%s) in %s"
-          % (name,
+    print("spawned session %r (%s, model: %s%s) in %s"
+          % (name, cli,
              "inherited (session default)" if model is None else model,
              " --bypass" if a.bypass else "", cwd))
 
@@ -584,10 +759,10 @@ def main(argv=None):
         # that died on startup would otherwise be reported as "working now".
         time.sleep(1.0)
         if not tmux_has_session(name):
-            print("handoff_session: the pane died immediately after spawn: the claude process "
+            print("handoff_session: the pane died immediately after spawn: the %s process "
                   "did not survive startup. Check the binary (%s) and the prompt's first line "
-                  "(a leading '-' is handled, but an unreadable --cwd or a bad --claude-bin is "
-                  "not)." % claude, file=sys.stderr)
+                  "(a leading '-' is handled, but an unreadable --cwd or a bad --%s-bin is "
+                  "not)." % (cli, claude, cli), file=sys.stderr)
             return 8
         print("AUTO-START: the session launched with its prompt (%d chars) and is working now."
               % len(prompt))
