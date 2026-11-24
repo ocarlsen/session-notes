@@ -79,6 +79,7 @@ desktop app's PATH lacks `~/.local/bin`):
 | SessionStart | `codex_session_start` (boot load), `session_pane_registry` |
 | UserPromptSubmit | `time_sense`, `session_bus_hook` |
 | Stop | `session_bus_hook` |
+| PreToolUse (`Bash`, `apply_patch`) | `checkout_guard`: refuses an edit of a tracked file on the default branch of a main checkout (the patch text is read for its target paths), a raw `gh pr merge`, and destructive git on a dirty tree. A refusal blocks the tool call and the model is shown the reason |
 | PostToolUse (`apply_patch`) | `em_dash_guard`, which checks only the lines a patch adds |
 
 **The launcher.** `python3 bin/codex_hooks.py launcher --repo <checkout>` writes the script
@@ -94,7 +95,7 @@ idle-prompt hook; `time_sense.py` tells Codex to run `$refresh` where it tells C
 
 **Refresh.** Rerunning the install updates the file in place through `bin/codex_hooks.py`.
 It replaces only this repo's entries: a command with the `SESSION_NOTES_AGENT=codex` prefix
-that runs `<launcher> hook <name>` for one of the five hooks above (the launcher may be at any
+that runs `<launcher> hook <name>` for one of the hooks above (the launcher may be at any
 path), or the older form that ran `python3 <checkout>/hooks/<script>.py` (so entries from a
 moved or removed checkout are migrated, not duplicated). Everything else, including your
 private hooks, is kept, and nothing is written when nothing changed, so a second run is a
@@ -116,10 +117,41 @@ skill links, the `SESSION_NOTES` value in config.toml and the lines in `rules/de
 A later change moves them to the launcher; until then, fix them by hand when you move a
 checkout. Until you reinstall, a missing checkout is survivable: an informational hook prints
 one warning line and passes, so prompts keep working. A guard hook fails closed with exit 2.
-For a PreToolUse guard (`checkout_guard`, once registered) that blocks the tool call. For
+For a PreToolUse guard (`checkout_guard`) that blocks the tool call. For
 `em_dash_guard`, which is PostToolUse, the edit has already happened, and the model is told
 the check did not run. `codex_hooks.py merge` warns about any entry, ours or not, whose script
 or launcher is missing, or whose launcher's checkout lacks the script.
+
+**The checkout guard.** Codex 0.171 sends `checkout_guard` a PreToolUse payload with
+`tool_name` `Bash` and `tool_input.command` (a string) for a shell command, and `tool_name`
+`apply_patch` with the whole patch text in `tool_input.command`; both carry `cwd`. The guard
+exits 2 with one paragraph on stderr, and Codex then refuses the tool call and shows the model
+that text ("Command blocked by PreToolUse hook: checkout_guard: ..."). The recorded payloads
+(identifiers scrubbed) are `tests/fixtures/codex_pretooluse_*.json`, and the guard's selftest
+runs against them. It is a new hook, so trust it once after installing (`/hooks`). To refuse
+nothing it should not, exempt repos in the config's `[checkout_guard]` section; see
+`docs/tools.md`.
+
+**Known limits of the guard under Codex** (read from the Codex 0.171 source, not observed live):
+- `write_stdin` sends no PreToolUse hook: text typed into a shell that is already running was
+  judged when that shell started, so a `gh pr merge` or `git reset --hard` typed into it later is
+  never shown to the guard.
+- Only exit code 2 with text on stderr blocks a call. Any other failure of the hook is a failed
+  hook and the call proceeds. In particular a launcher file that is gone makes the shell exit 127
+  (the "guard hooks fail closed" rule covers a missing script or checkout behind a working
+  launcher, not a missing launcher), and the hook's 10 second timeout is longer than one 8 second
+  git call inside the guard, so a very slow `git status` on a large dirty tree can end as a timed-out
+  hook and let the call through.
+- Shell coverage of `apply_patch` is exactly: the direct `apply_patch` tool, the `applypatch`
+  alias, literal `cd <dir> &&` (or `;`) chains in front of it, and `bash -c "..."` with the body
+  inline. The patch is judged from BOTH the directory the tool call started in and the directory
+  the guard tracks through `cd`, and refused if either refuses (the guard cannot resolve every
+  `cd`: `cd "$PWD"`, a subshell, a failed `cd`, `popd`). The cost: `cd <linked worktree> &&
+  apply_patch` from a session whose directory is the main checkout is refused, as it was before
+  this change. Everything else through the shell is NOT covered, and was not before: `eval`,
+  variables, `$'...'`, `printf` or a redirect into `apply_patch`, `xargs`, `cd --` or `cd -P`,
+  `builtin cd`, and a heredoc body inside `bash -c "...\nEOF\n"`. Other shell writes
+  (`sed -i`, redirects) are not covered either, as under Claude Code.
 
 ## Sessions and the bus
 

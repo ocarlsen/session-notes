@@ -57,7 +57,9 @@ except Exception as _exc:  # fail open, reported by main()
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 PATCH_TOOLS = ("apply_patch",)
-# UNVERIFIED until a live Codex run: the names Codex gives its shell tool. Claude's is "Bash".
+# Recorded from Codex 0.171 (tests/fixtures/codex_pretooluse_*.json): its shell tool is named
+# "Bash" with tool_input {"command": "<string>"}, and apply_patch carries the whole patch text in
+# tool_input {"command": "*** Begin Patch\n..."}. The other names are older/other Codex builds.
 SHELL_TOOLS = ("shell", "exec_command", "local_shell", "container.exec", "Bash")
 
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
@@ -66,7 +68,10 @@ WRAPPERS = {"command": (), "env": ("-u", "-C", "-S"), "time": (), "nohup": (), "
             "sudo": ("-u", "-g", "-h", "-p", "-U", "-C", "-D", "-R", "-T")}
 # shell keywords that can sit in front of a command
 KEYWORDS = ("if", "then", "else", "elif", "do", "while", "until", "!", "{", "(")
-_PATCH_RE = re.compile(r"^\*\*\* (?:Update File|Add File|Delete File|Move to): (.+?)\s*$", re.M)
+# Codex trims every line of a patch before reading it (`line.trim()` in its parser), so a marker
+# may be indented: `[^\S\n]*` is whitespace that is not a newline.
+_PATCH_RE = re.compile(r"^[^\S\n]*\*\*\* (?:Update File|Add File|Delete File|Move to): (.+?)\s*$", re.M)
+APPLY_PATCH_NAMES = ("apply_patch", "applypatch")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _HEREDOC_RE = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
 _MERGE_FALLBACK_RE = re.compile(
@@ -557,10 +562,11 @@ def _config_write(argv, writes, cwd, protected):
     return None
 
 
-def check_command(cmd, cwd, cfg, protected, depth=0):
+def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None):
     """Refusal text for a shell command, or None. cfg None (config failed to parse) leaves only
     the config-file protection active."""
     wt = wt_command()
+    base_cwd = base_cwd or cwd  # the directory the tool call started in (the payload cwd)
     for seg, writes in split_segments(strip_heredocs(cmd)):
         msg = _config_write([], writes, cwd, protected)
         if msg:
@@ -586,7 +592,21 @@ def check_command(cmd, cwd, cfg, protected, depth=0):
         if name in SHELLS and depth < 3:
             script = _script_of(argv)
             if script:
-                r = check_command(script, cwd, cfg, protected, depth + 1)
+                r = check_command(script, cwd, cfg, protected, depth + 1, base_cwd)
+                if r:
+                    return r
+            continue
+        if name in APPLY_PATCH_NAMES:
+            # An apply_patch run through the shell is an edit too. It is judged from BOTH the
+            # directory the call started in and the guard's own cd-tracked directory, and refused
+            # if either refuses: the guard cannot resolve every cd (`cd "$PWD"`, a subshell, a
+            # failed cd, popd), and the shell does not always keep the one it can.
+            pp = patch_paths(cmd)
+            for d in ([cwd] if base_cwd == cwd else [cwd, base_cwd]):
+                for p in pp:
+                    if is_protected(p, d, protected):
+                        return _config_msg(os.path.realpath(os.path.join(d, os.path.expanduser(p))))
+                r = check_edit(pp, d, cfg) if cfg is not None else None
                 if r:
                     return r
             continue
@@ -673,28 +693,8 @@ def decide(payload):
                          "OFF for this call except for protecting that file, fix it\n"
                          % (notes_config.config_path(), exc))
     if tool in SHELL_TOOLS:
-        # An apply_patch run through the shell is an edit too.
-        if _runs_apply_patch(cmd):
-            pp = patch_paths(cmd)
-            for p in pp:
-                if is_protected(p, cwd, protected):
-                    return _config_msg(os.path.realpath(os.path.join(cwd, os.path.expanduser(p))))
-            r = check_edit(pp, cwd, cfg) if cfg is not None else None
-            if r:
-                return r
         return check_command(cmd, cwd, cfg, protected)
     return check_edit(paths, cwd, cfg) if cfg is not None else None
-
-
-def _runs_apply_patch(cmd):
-    for seg, _writes in split_segments(strip_heredocs(cmd)):
-        try:
-            argv = strip_prefix(shlex.split(seg))
-        except ValueError:
-            continue
-        if argv and os.path.basename(argv[0]) == "apply_patch":
-            return True
-    return False
 
 
 def main():
@@ -1232,6 +1232,93 @@ def selftest():
         r = run({"tool_name": "shell", "cwd": main_repo,
                  "tool_input": {"command": ["bash", "-lc", "apply_patch <<'EOF'\n" + patch + "EOF"]}})
         check("codex: apply_patch run through the shell is an edit", refused(r), r.stderr)
+
+        # The payloads Codex 0.171 really sends (recorded, scrubbed fixtures).
+        fx = os.path.join(ROOT, "tests", "fixtures")
+
+        def recorded(name, cwd, **tool_input):
+            with open(os.path.join(fx, name)) as fh:
+                pl = json.load(fh)
+            pl["cwd"] = cwd
+            pl["tool_input"].update(tool_input)
+            return pl
+
+        r = run(recorded("codex_pretooluse_apply_patch.json", main_repo,
+                         command=patch))
+        check("codex recorded: apply_patch on a tracked file of main refused", refused(r), r.stderr)
+        pl = recorded("codex_pretooluse_apply_patch.json", main_repo)
+        pl["tool_input"]["command"] = pl["tool_input"]["command"].replace("tracked.txt", "a.txt")
+        r = run(pl)
+        check("codex recorded: the fixture's own patch (path swapped) refused, names the file",
+              refused(r) and "a.txt" in r.stderr, r.stderr)
+        pl = recorded("codex_pretooluse_apply_patch.json", wt_on_main)
+        pl["tool_input"]["command"] = pl["tool_input"]["command"].replace("tracked.txt", "a.txt")
+        r = run(pl)
+        check("codex recorded: apply_patch on a tracked file in a linked worktree that is on the default "
+              "branch passes (so is_main_checkout is what lets it)", passed(r), r.stderr)
+        r = run(recorded("codex_pretooluse_apply_patch.json", nongit))
+        check("codex recorded: apply_patch outside a repo passes", passed(r), r.stderr)
+
+        # B1: Codex trims each patch line, so a marker may be indented
+        def patched(header_path, body_indent="", cwd=None, second=None):
+            pl = recorded("codex_pretooluse_apply_patch.json", cwd or main_repo)
+            text = "*** Begin Patch\n"
+            if second:
+                text += "*** Add File: fresh.txt\n+n\n"
+            text += "%s*** Update File: %s\n@@\n-x\n+y\n*** End Patch\n" % (body_indent, header_path)
+            pl["tool_input"]["command"] = text
+            return run(pl)
+        for label, ind in (("space", "   "), ("tab", "\t"), ("mixed", " \t ")):
+            r = patched("a.txt", ind)
+            check("codex recorded B1: %s-indented Update header on a tracked file refused" % label,
+                  refused(r) and "a.txt" in r.stderr, r.stderr)
+        r = patched("a.txt", "  ", second=True)
+        check("codex recorded B1: an indented header after an earlier hunk refused", refused(r), r.stderr)
+        r = patched(cfgp, "   ", cwd=tmp)
+        check("codex recorded B1: an indented header naming the guard's own config file refused",
+              refused(r) and "user" in r.stderr, r.stderr)
+        r = patched("brand-new-%s.txt" % "x", "   ")
+        check("codex recorded B1: an indented header on a new file still passes", passed(r), r.stderr)
+
+        # N2: apply_patch through the shell: the direct name, the `applypatch` alias, literal
+        # `cd <dir> &&` chains and `bash -c` with the body inline (nothing else is covered)
+        body = "<<'EOF'\n" + patch + "EOF"
+        for label, cmd, where in (
+                ("applypatch alias", "applypatch " + body, main_repo),
+                ("cd <dir> && apply_patch", "cd %s && apply_patch %s" % (os.path.basename(main_repo), body),
+                 os.path.dirname(main_repo)),
+                ("bash -lc as one string", "bash -lc \"apply_patch %s\"" % body.replace('"', '\\"'), main_repo)):
+            r = run({"tool_name": "Bash", "cwd": where, "tool_input": {"command": cmd}})
+            check("codex recorded N2: %s refused" % label, refused(r) and "a.txt" in r.stderr, r.stderr)
+        r = run({"tool_name": "Bash", "cwd": os.path.dirname(wt1),
+                 "tool_input": {"command": "cd %s && apply_patch %s" % (os.path.basename(wt1), body)}})
+        check("codex recorded N2: cd into a linked worktree then apply_patch passes", passed(r), r.stderr)
+
+        # B2: judged from the payload cwd AND the guard's cd-tracked directory; refuse if either does
+        other = os.path.join(tmp, "b2other", "deep")
+        os.makedirs(other)
+        cfgpatch = ("<<'EOF'\n*** Begin Patch\n*** Update File: ../config.toml\n@@\n-a\n+b\n*** End Patch\nEOF")
+        for label, pre in (
+                ('cd "$(git rev-parse --show-toplevel)" &&', 'cd "$(git rev-parse --show-toplevel)" && '),
+                ('cd "$PWD" &&', 'cd "$PWD" && '),
+                ("(cd other); ", "(cd %s); " % other),
+                ("failed cd nowhere &&", "cd /nonexistent-b2 && "),
+                ("failed cd nowhere ;", "cd /nonexistent-b2 2>/dev/null; "),
+                ("pushd x; popd;", "pushd %s; popd; " % other)):
+            r = run({"tool_name": "Bash", "cwd": main_repo, "tool_input": {"command": pre + "apply_patch " + body}})
+            check("codex recorded B2: %s apply_patch refused" % label, refused(r) and "a.txt" in r.stderr, r.stderr)
+        for label, pre in (("(cd other/deep); ", "(cd %s); " % other), ('cd "$PWD" && ', 'cd "$PWD" && ')):
+            r = run({"tool_name": "Bash", "cwd": main_repo, "tool_input": {"command": pre + "apply_patch " + cfgpatch}})
+            check("codex recorded B2: relative ../config.toml after %s refused" % label.strip(),
+                  refused(r) and "user" in r.stderr, r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", nongit, command="gh pr merge 1 --squash"))
+        check("codex recorded: Bash `gh pr merge` refused", refused(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", dirty_repo, command="git reset --hard"))
+        check("codex recorded: Bash `git reset --hard` on a dirty tree refused", refused(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", mkrepo("cx_clean"), command="git reset --hard"))
+        check("codex recorded: Bash `git reset --hard` on a clean tree passes", passed(r), r.stderr)
+        r = run(recorded("codex_pretooluse_shell.json", main_repo))
+        check("codex recorded: the fixture's own `git status --short` passes", passed(r), r.stderr)
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
