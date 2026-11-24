@@ -58,6 +58,10 @@ GUARDS
     acknowledgments cannot run all night. Hitting the cap is announced once.
   * A session with a RECORDED DELIVERY FAILURE is skipped (announced once): its hook
     is broken, so a nudge would burn a billed turn and still deliver nothing.
+  * A pane holding a parked staged spec (send --staged) with zero offers is NOT nudged
+    (announced once): the staged handoff waits for the human's own typed prompt, which
+    runs the hook and records the offer. Other mail to that pane waits with it. A spec
+    parked by a plain `send` is not protected.
   * NUDGE asks for no thank-you or ack replies, which stops most ping-pong
     before the cap is needed.
 """
@@ -131,6 +135,18 @@ def is_hooked_agent(p):
     return _harness(p) is not None and not is_hookless(p)
 
 
+def hold_text(name, hook_dead):
+    """The once-only HOLDING line for a pane with a parked staged spec."""
+    base = ("a staged spec is parked for it; not nudging until a human types in that "
+            "pane. The typed prompt delivers it only if the bus hook runs in that pane "
+            "(Codex: --no-daemon and hooks trusted in /hooks); otherwise the spec and "
+            "later mail to that session wait until they expire (24h)")
+    if hook_dead:
+        base = ("this pane's hook is not delivering: the spec will not arrive, and later "
+                "mail to that session waits behind it until it expires (24h). " + base)
+    return "HOLDING %s: %s" % (name, base)
+
+
 def is_ready(p):
     """Safe to type into + Enter now. Claude: not working and bcast's empty ❯ box.
     Any other harness (Codex): its own idle + empty-box tests on the raw -e screen."""
@@ -200,6 +216,19 @@ def tick(history, capped, dry_run=False, now=None, cap=CAP, errored=None, only=N
             capped.discard(name)
             capped.discard("skip:" + name)
             errored.discard(name)
+            capped.discard("parked:%s:%s" % (name, created))
+            continue
+        if session_bus.parked(mail):
+            # Before cap accounting, escalation and the pull branch: a skip costs nothing
+            # and cannot leave sticky state. Announced once per (session, created).
+            pk = "parked:%s:%s" % (name, created)
+            if pk not in capped:
+                capped.add(pk)
+                hook_dead = any(is_hookless(p) or history.get(
+                    "pull:%s:%s:%s" % (p["pane_id"], p.get("pane_pid"), created), False)
+                    for p in by_session.get(name, []))
+                print("%s  %s" % (time.strftime("%H:%M"), hold_text(name, hook_dead)),
+                      flush=True)
             continue
         if session_bus.delivery_errors(name):
             if name not in errored:
@@ -367,6 +396,74 @@ def selftest():
         with contextlib.redirect_stdout(io.StringIO()):
             tick(hist, cap_set, errored=err_set)
         check("a healthy session is nudged again", sent == ["%1"])
+    finally:
+        (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+         session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
+         session_peers.peek) = saved
+
+    # --- a parked staged spec (send --staged, zero offers) keeps its pane idle ---
+    sent = []
+    saved = (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
+             session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,
+             session_peers.peek)
+    session_peers.list_peers = lambda: [dict(pane)]
+    session_bus.live_sessions = lambda: {"alpha": 1}
+    session_bus.delivery_errors = lambda n, panes=None: []
+    bcast.send = lambda pid, text: sent.append(pid)
+    bcast.log = lambda *a, **k: None
+    bcast.input_box_empty = lambda lines: True
+    session_peers.peek = lambda p: []
+
+    def run_ticks(mail, n=3):
+        del sent[:]
+        session_bus.undelivered = lambda nm, created=None: [dict(m) for m in mail]
+        hist, cap_set, err_set = {}, set(), set()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for _ in range(n):
+                tick(hist, cap_set, errored=err_set)
+        return hist, cap_set, out.getvalue()
+
+    try:
+        hist, cap_set, out = run_ticks([{"id": "s", "staged": True, "_offers": 0}])
+        check("parked staged spec with zero offers: no nudge sent", sent == [])
+        check("parked skip costs no cap stamp and leaves no escalation state",
+              not hist.get("alpha") and not any(k.startswith(("pull:", "hooked:")) for k in hist))
+        check("the parked hold is announced exactly once",
+              out.count("HOLDING alpha") == 1)
+        check("hooked HOLDING text names the release condition and the 24h expiry",
+              "bus hook runs in that pane" in out and "/hooks" in out and "24h" in out
+              and "will not arrive" not in out)
+        cx = {"is_claude": False, "is_agent": True, "harness": "codex", "is_self": False,
+              "tmux_session": "alpha", "state": "idle", "name": "alpha:0", "pane_id": "%1",
+              "pane_pid": 7}
+        saved_h = getattr(session_peers, "HARNESSES", None)
+        session_peers.HARNESSES = {"codex": {"hook_in_pane": lambda p: False}}
+        try:
+            session_peers.list_peers = lambda: [dict(cx)]
+            _, _, out = run_ticks([{"id": "s", "staged": True, "_offers": 0}])
+            check("hookless pane: HOLDING says the hook is not delivering",
+                  "hook is not delivering: the spec will not arrive" in out
+                  and out.count("HOLDING alpha") == 1)
+            session_peers.HARNESSES = {"codex": {"hook_in_pane": lambda p: True}}
+            del sent[:]
+            session_bus.undelivered = lambda nm, created=None: [
+                {"id": "s", "staged": True, "_offers": 0}]
+            h2 = {"pull:%1:7:1": True}
+            o2 = io.StringIO()
+            with contextlib.redirect_stdout(o2):
+                tick(h2, set())
+            check("escalated pane (sticky pull state): HOLDING says the hook is not delivering",
+                  "will not arrive" in o2.getvalue() and sent == [])
+        finally:
+            session_peers.HARNESSES = saved_h
+            session_peers.list_peers = lambda: [dict(pane)]
+        run_ticks([{"id": "p", "_offers": 0}], n=1)
+        check("positive control: a plain zero-offer message IS nudged", sent == ["%1"])
+        run_ticks([{"id": "s", "staged": True, "_offers": 1}, {"id": "p", "_offers": 0}], n=1)
+        check("an offered staged spec plus fresh plain mail is nudged", sent == ["%1"])
+        run_ticks([{"id": "s", "staged": True, "_offers": 0}, {"id": "p", "_offers": 0}])
+        check("staged and plain both zero offers: not nudged", sent == [])
     finally:
         (session_peers.list_peers, session_bus.live_sessions, session_bus.undelivered,
          session_bus.delivery_errors, bcast.send, bcast.log, bcast.input_box_empty,

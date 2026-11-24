@@ -172,6 +172,15 @@ arrives as that command's output, again fenced and attributed. The loop reads th
 from tmux, because a Codex shell often cannot: the sandbox refuses the tmux socket, and a
 resumed session (`codex resume`) runs commands in the daemon.
 
+A staged handoff spec (`handoff_session.py` parks it with `send --staged`) is the exception:
+`bus_nudge.py` types nothing into that pane until the human's own typed prompt delivers the
+spec, so the pane stays idle. That delivery needs the bus hook to run in the pane: a Codex
+pane started with `--no-daemon` and with its hooks trusted in `/hooks`. In the default daemon
+mode, or with an untrusted hook, the typed prompt delivers nothing and the pull cannot show
+the spec either, so the spec stays unoffered and the pane stays held. Other mail to that
+session waits behind the spec, and everything expires after 24h; `bus_nudge` says so in its
+HOLDING line. A spec parked by a plain `send` is not protected.
+
 The desktop app has no tmux pane, so the bus does not reach it. The time-sense, pane-registry
 (a no-op without tmux) and em-dash hooks do run there once trusted.
 

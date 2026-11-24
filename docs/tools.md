@@ -61,7 +61,15 @@ not cover:
 
 - **Staged handoffs.** A native message to an idle session starts a turn.
   A staged spec must not: it waits on the bus until a human types in the
-  worker's pane, and that keystroke is the authorization.
+  worker's pane, and that keystroke is the authorization. `handoff_session.py`
+  parks the spec with `session_bus.py send --staged`, and `bus_nudge.py` leaves a
+  pane alone while a staged spec for it has zero offers; the human's first typed
+  prompt runs the hook, delivers the spec and releases the pane. Known limits: the spec is delivered only if the bus hook runs in
+  that pane (for Codex: `--no-daemon` and hooks trusted in `/hooks`); otherwise the
+  spec stays held, other mail to that session waits behind it, and all of it
+  expires after 24h (`bus_nudge` prints a HOLDING line saying so). A spec parked
+  with a plain `send` (a manual staged-go) is not protected, and a running
+  `bus_nudge` LaunchAgent keeps the old code until it is restarted.
 - **Mail from outside a session.** A script (a CI watcher, a cron job) can
   call `session_bus.append()` with a tmux session name. On this machine the
   inbox sockets are per process (observed), and the docs give no way for a
