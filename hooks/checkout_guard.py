@@ -15,6 +15,9 @@ linked worktree (whatever its branch), a main checkout on a non-default branch o
 HEAD, anything outside a git repo. Known limit: a program that writes on its own (a script such
 as `python3 bin/tool.py`) is not seen: only the listed commands, invoked directly or through
 bash -c/eval/the listed wrappers, are judged (not xargs, gsed, ruby -i, curl, rsync, patch).
+Also not seen: brace expansion (`mv README.md{,.bak}`), BSD `sed -I`, `awk -i inplace`, and a
+`cd` that never runs or runs only in a subshell or condition (`false && cd x`, `(cd x); ...`).
+`rm -rf <clone>` / `mv <clone> <clone>2` (a checkout's top-level directory) pass.
 
 ARM B, shell commands (Bash, and the Codex shell tools). Refused:
   * any raw `gh pr merge` invocation (not `--help`); `wt merge` is the gated way. Only an
@@ -109,19 +112,41 @@ def _nearest_dir(p):
     return d or "/"
 
 
+# Repo facts are resolved once per directory per hook call (one process = one call), so a glob
+# with hundreds of matches costs a handful of git calls, not five per match.
+_INFO_CACHE = {}
+_FACT_CACHE = {}
+
+
 def repo_info(path):
     """(toplevel, common git dir), both real paths, for the repo holding `path`; None if none."""
     d = _nearest_dir(path)
+    if d in _INFO_CACHE:
+        return _INFO_CACHE[d]
     r = _git(d, "rev-parse", "--show-toplevel", "--git-common-dir")
-    if r.returncode != 0:
-        return None
-    lines = r.stdout.splitlines()
-    if len(lines) < 2:
-        return None
-    common = lines[1]
-    if not os.path.isabs(common):
-        common = os.path.join(d, common)
-    return os.path.realpath(lines[0]), os.path.realpath(common)
+    info = None
+    lines = r.stdout.splitlines() if r.returncode == 0 else []
+    if len(lines) >= 2:
+        common = lines[1]
+        if not os.path.isabs(common):
+            common = os.path.join(d, common)
+        info = (os.path.realpath(lines[0]), os.path.realpath(common))
+    _INFO_CACHE[d] = info
+    return info
+
+
+def guarded_branch(top, common):
+    """The default branch `top` is on when edits there must go in a worktree (a main checkout
+    with an origin, on its default branch), else None. Memoized per checkout."""
+    key = (top, common)
+    if key not in _FACT_CACHE:
+        branch = None
+        if is_main_checkout(top, common) and has_origin(top):
+            b = current_branch(top)
+            if b and on_default_branch(top, b):
+                branch = b
+        _FACT_CACHE[key] = branch
+    return _FACT_CACHE[key]
 
 
 def is_main_checkout(top, common):
@@ -150,6 +175,33 @@ def has_origin(top):
 def is_tracked(top, real):
     return _git(top, "--literal-pathspecs", "ls-files", "--error-unmatch", "--",
                 real).returncode == 0
+
+
+_PATHSPEC_MAX = 50  # above this many candidates one whole-repo listing beats a long pathspec
+
+
+def tracked_paths(top, reals):
+    """The subset of `reals` (real paths under `top`) that is tracked: a tracked file, or a
+    directory holding one. ONE `git ls-files` call for all of them (a pathspec list for a few,
+    the whole listing for many); a git error falls back to one call per path."""
+    rels = {r: os.path.relpath(r, top) for r in reals}
+    args = ["--literal-pathspecs", "ls-files", "-z"]
+    if len(rels) <= _PATHSPEC_MAX:
+        args += ["--"] + list(dict.fromkeys(rels.values()))
+    r = _git(top, *args)
+    if r.returncode != 0:
+        return {x for x in reals if is_tracked(top, x)}
+    fold = _git(top, "config", "--get", "core.ignorecase").stdout.strip() == "true"
+    norm = (lambda x: x.lower()) if fold else (lambda x: x)
+    files = {norm(f) for f in r.stdout.split("\0") if f}
+    dirs = set()
+    for f in files:
+        while "/" in f:
+            f = f.rsplit("/", 1)[0]
+            if f in dirs:
+                break
+            dirs.add(f)
+    return {x for x, rel in rels.items() if norm(rel) in files or norm(rel) in dirs}
 
 
 def tree_dirty(tree, untracked):
@@ -209,8 +261,13 @@ def patch_paths(text):
     return _PATCH_RE.findall(text or "")
 
 
-def check_edit(paths, cwd, cfg):
-    for p in paths:
+def check_edit_at(paths, cwd, cfg):
+    """(refusal, index of the refused path in `paths`) or (None, None). Repo facts are memoized
+    and tracked-ness is decided with one `git ls-files` per repo. A path that IS a checkout's
+    top-level directory (`rm -rf <clone>`, `mv <clone> <clone>2`) passes: the files inside are
+    still judged when named or globbed."""
+    groups = {}
+    for i, p in enumerate(paths):
         ap = p if os.path.isabs(p) else os.path.join(cwd, p)
         real = os.path.realpath(ap)
         info = repo_info(real if os.path.isdir(real) else os.path.dirname(real))
@@ -219,16 +276,24 @@ def check_edit(paths, cwd, cfg):
         top, common = info
         if repo_exempt(cfg, top) or path_exempt(cfg, real):
             continue
-        if not is_main_checkout(top, common) or not has_origin(top):
-            continue  # no origin = no PR flow, and `wt new` needs one
-        branch = current_branch(top)
-        if not branch or not on_default_branch(top, branch):
+        if real == top or guarded_branch(top, common) is None:
             continue
-        if not is_tracked(top, real):
-            continue
-        return ("checkout_guard: %s is tracked on %s in %s; edits go in a worktree: run %s new "
-                "<name> first, then edit there." % (real, branch, top, wt_command()))
-    return None
+        groups.setdefault((top, common), []).append((i, real))
+    best = None
+    for (top, common), items in groups.items():
+        tracked = tracked_paths(top, [r for _, r in items])
+        for i, real in items:
+            if real in tracked and (best is None or i < best[0]):
+                best = (i, real, top, guarded_branch(top, common))
+    if best is None:
+        return None, None
+    i, real, top, branch = best
+    return ("checkout_guard: %s is tracked on %s in %s; edits go in a worktree: run %s new "
+            "<name> first, then edit there." % (real, branch, top, wt_command())), i
+
+
+def check_edit(paths, cwd, cfg):
+    return check_edit_at(paths, cwd, cfg)[0]
 
 
 # ------------------------------------------------------------------ Arm B
@@ -591,6 +656,9 @@ def _inplace_files(name, a):
             skip = False
         elif t in ("-e", "-f", "--expression", "--file") or re.fullmatch(r"-[A-Za-z0-9]*[ef]", t):
             have_script, skip = True, True
+        elif not t.startswith(("-M", "-m")) and (
+                t.startswith("-e") or re.fullmatch(r"-[A-Za-z0-9]*e.+", t)):
+            have_script = True  # the script is attached (`-es/a/b/`, `-pes/a/b/`): next is a file
         elif t.startswith(("--expression=", "--file=")):
             have_script = True
         elif t.startswith("-") and t != "-":
@@ -621,8 +689,11 @@ def _write_targets(argv, writes, cwd):
             d = os.path.expanduser(dest)
             if d.endswith("/") or os.path.basename(d) in (".", "..") or \
                     os.path.isdir(d if os.path.isabs(d) else os.path.join(cwd, d)):
-                cands += [(os.path.join(d, os.path.basename(t.rstrip("/"))), True)
-                          for t in srcs if os.path.basename(t.rstrip("/"))]
+                # expand a glob source first, then join each real name with the destination
+                for t in srcs:
+                    for x in _expand(t, cwd, True):
+                        if os.path.basename(x.rstrip("/")):
+                            cands.append((os.path.join(d, os.path.basename(x.rstrip("/"))), False))
             else:
                 cands.append((dest, True))
         elif name in ("rm", "truncate", "unlink"):
@@ -648,7 +719,7 @@ def _expand(path, d, globbable):
     p = p if os.path.isabs(p) else os.path.join(d, p)
     if not (globbable and _GLOB_CHARS.search(p)):
         return [p]
-    out = glob.glob(p)
+    out = sorted(glob.glob(p))
     return ([p] if os.path.lexists(p) else []) + out
 
 
@@ -663,18 +734,25 @@ def _dirs(cwd, base_cwd, reliable, chdir=None):
     return list(dict.fromkeys(out))
 
 
-def _shell_write(argv, writes, dirs, cfg):
+def _shell_write(argv, writes, dirs, cfg, fallback=None):
     """Arm A for a shell write: the refusal when a write target is a tracked file of a main
-    checkout on its default branch, judged from each directory in `dirs`."""
+    checkout on its default branch, judged from each directory in `dirs`. `fallback` is the
+    payload directory when a `cd` could not be followed: a relative target refused from it says so."""
     if cfg is None:
         return None
     for d in dirs:
-        cands = []
+        cands, rel = [], []
         for c, g in _write_targets(argv, writes, d):
             if c and not c.startswith("-"):
-                cands += _expand(c, d, g)
-        r = check_edit(cands, d, cfg) if cands else None
+                for x in _expand(c, d, g):
+                    cands.append(x)
+                    rel.append(not os.path.isabs(os.path.expanduser(c)))
+        r, i = check_edit_at(cands, d, cfg) if cands else (None, None)
         if r:
+            if fallback is not None and d == fallback and rel[i]:
+                r += (" That relative path was judged from %s, where the tool call started, "
+                      "because a `cd` earlier in this command could not be followed: use an "
+                      "absolute path, or run the `cd` as a separate tool call." % d)
             return r
     return None
 
@@ -701,7 +779,7 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
             saved = None
         dirs = _dirs(cwd, base_cwd, reliable)
         msg = _config_write([], writes, cwd, protected) \
-            or _shell_write([], writes, dirs, cfg)
+            or _shell_write([], writes, dirs, cfg, None if reliable else base_cwd)
         if msg:
             return msg
         try:
@@ -713,7 +791,8 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
         chdir = []
         argv = strip_prefix(argv, chdir)
         msg = _config_write(argv, [], cwd, protected) \
-            or _shell_write(argv, [], _dirs(cwd, base_cwd, reliable, chdir), cfg)
+            or _shell_write(argv, [], _dirs(cwd, base_cwd, reliable, chdir), cfg,
+                            None if reliable else base_cwd)
         if msg:
             return msg
         if not argv:
@@ -1578,13 +1657,18 @@ def selftest():
         touch(sw2, "new.txt", "n\n")
         touch(sw2, "scratch/u.txt", "u\n")
         for cmd in ("cp /tmp/README.md .", "cp /tmp/README.md %s/" % sw2, "cd sub && cp /tmp/README.md ..",
-                    "rm -rf %s" % sw2, "mv %s %s.bak" % (sw2, sw2), "rm -r docs/media",
+                    "rm -r docs/media",
                     "install /tmp/f.txt sub", "ln -sf /tmp/README.md .", "mv /tmp/README.md ."):
             check("F2 refuse: " + cmd, refused(bash(cmd, sw2)), cmd)
         for cmd in ("cp /tmp/shot.png docs/media/", "mv new.txt sub/", "cd sub && cp /tmp/new.txt .",
                     "rm -rf scratch", "rm -rf %s" % sw_wt, "cp /tmp/shot.png docs/media",
-                    "cp README.md out/"):
+                    "cp README.md out/",
+                    # the top-level directory of a checkout may be removed or moved (owner's call)
+                    "rm -rf %s" % sw2, "mv %s %s.bak" % (sw2, sw2), "rm -rf ."):
             check("F2 allow: " + cmd, passed(bash(cmd, sw2)), cmd)
+        for cmd in ("rm -rf %s/sub" % sw2, "rm -rf %s/*" % sw2, "rm %s/README.md" % sw2,
+                    "mv %s/README.md /tmp/zz" % sw2):
+            check("F2 refuse (inside a checkout root): " + cmd, refused(bash(cmd, nongit)), cmd)
         # F3: globs are shell globs, paths are literal for git
         for cmd in ("rm -rf logs/*", "mv out/* /tmp/", "rm -f *.tmp", "echo x > 'app/[id]/new.tsx'",
                     "rm -f nomatch*"):
@@ -1634,6 +1718,57 @@ def selftest():
         r = brun("echo x >> %s" % badcfg, sw2)
         check("F6 broken config: the config file itself is still protected", r.returncode == 2
               and "config" in r.stderr, r.stderr)
+
+        # Follow-up: latency, attached script flags, messages, glob sources into a directory
+        files = ["logs/f%03d.log" % i for i in range(300)] + ["README.md", "sub/f.txt"]
+        perf = mkrepo("perf", files)
+        os.makedirs(os.path.join(perf, "node_modules"))
+        for i in range(1500):
+            with open(os.path.join(perf, "node_modules", "m%04d.js" % i), "w") as fh:
+                fh.write("x\n")
+        import time
+        t0 = time.time()
+        r = bash("rm -rf node_modules/*", perf)
+        dt = time.time() - t0
+        check("P allow: rm -rf node_modules/* (1500 untracked) passes in under 2 s",
+              passed(r) and dt < 2, "%.2fs %s" % (dt, r.stderr))
+        t0 = time.time()
+        r = bash("rm -f logs/*.log", perf)
+        dt = time.time() - t0
+        check("P refuse: rm -f logs/*.log (300 tracked) refuses in under 2 s",
+              refused(r) and "logs/f000.log" in r.stderr and dt < 2, "%.2fs %s" % (dt, r.stderr))
+        for cmd in ("perl -i -pe's/a/b/' README.md", "perl -pi -es/a/b/ README.md",
+                    "sed -i '' -es/a/b/ README.md", "sed -i -e's/a/b/' README.md",
+                    "perl -i -lpe1 README.md", "perl -i -pe 's/a/b/' README.md",
+                    "sed -i -e 's/a/b/' README.md"):
+            check("G refuse (attached script flag): " + cmd, refused(bash(cmd, sw2)), cmd)
+            check("G refuse (config file): " + cmd.replace("README.md", env["SESSION_NOTES_CONFIG"]),
+                  refused(bash(cmd.replace("README.md", env["SESSION_NOTES_CONFIG"]), nongit)))
+            check("G allow (untracked file): " + cmd.replace("README.md", "/tmp/zz-out"),
+                  passed(bash(cmd.replace("README.md", "/tmp/zz-out"), sw2)))
+        r = bash('cd "$X" && rm README.md', sw2)
+        check("M message: unfollowable cd says the path was judged from the payload directory",
+              refused(r) and "could not be followed" in r.stderr and "absolute path" in r.stderr,
+              r.stderr)
+        r = bash("rm README.md", sw2)
+        check("M message: an ordinary refusal does not mention cd",
+              refused(r) and "could not be followed" not in r.stderr, r.stderr)
+        r = bash('cd "$X" && rm %s' % os.path.join(sw2, "README.md"), nongit)
+        check("M message: an absolute target never gets the cd clause",
+              refused(r) and "could not be followed" not in r.stderr, r.stderr)
+        shots = os.path.join(tmp, "shots")
+        os.makedirs(shots)
+        touch(shots, "b.png", "p\n")
+        for cmd in ("cp %s/*.png docs/media/" % shots, "mv %s/*.png docs/media" % shots,
+                    "cp %s/*.png docs/media/" % shots):
+            check("D allow: glob sources into a directory not touching a tracked file: " + cmd,
+                  passed(bash(cmd, sw2)), cmd)
+        touch(shots, "a.png", "p\n")
+        for cmd in ("cp %s/*.png docs/media/" % shots, "mv %s/*.png docs/media" % shots,
+                    "cp %s/a.png docs/media/" % shots):
+            check("D refuse: a source basename collides with a tracked file: " + cmd,
+                  refused(bash(cmd, sw2)) and "a.png" in bash(cmd, sw2).stderr, cmd)
+        check("D allow: glob that matches nothing", passed(bash("cp %s/*.gif docs/media/" % shots, sw2)))
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
