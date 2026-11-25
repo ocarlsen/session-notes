@@ -697,6 +697,38 @@ start when a class has nothing to look for. A hit blanks the watch panes and abo
 (teardown runs; a trip in the final hold exits nonzero); the message names the pane and the class
 of hit, never the matched text. A hit can be on screen for up to a second before it is seen.
 
+#### Dance scenario: `make dance-watch`
+
+A scripted story film on the same watch harness (`python3 tests/live/selftest_live.py --watch
+--scenario dance`, options through `ARGS` as above). A Claude session (left, Sonnet) and a Codex
+session (right, gpt-6.2-sol) work together in the sandbox, one chapter per scene, on the capped
+selftest keys (never your own login). It needs both CLIs; `--scenario` requires `--watch` and refuses
+`--feature`, `--only` and `--codex-alone`. The scenes, in order:
+
+1. Two agents, one setup: both sessions boot in the fresh sandbox; the `boot` row's checks (the standing
+   rules for Claude, the session-start marker for Codex, a clock line in both).
+2. Mail between models: Claude sends Codex a note over the bus, it arrives through Codex's prompt hook, Codex
+   replies, and the reply arrives in Claude's next prompt.
+3. A poem, one line each: two rounds over the bus; each line must be in both transcripts.
+4. The guard says no: Claude is asked to add the poem to a tracked `poem.md` on main; the checkout guard
+   refuses; Claude runs `wt new poem` and writes it in the worktree. Main stays untouched.
+5. One builds, the other reviews: Claude commits and runs `wt pr` (stub `gh`); `wt merge` refuses with no review;
+   Codex runs `$review 7` on gpt-6.2-sol at low effort; Claude ends on `merge #7?`; the harness types `yes` into
+   that pane (the status line says `user types: yes` first, so the film never shows it as a model decision); the
+   real consent hook records it and `wt merge` passes through the stub. If Codex answers CHANGES once, Claude
+   makes one fix commit and Codex reviews once more; the APPROVE must name the new head, and a second CHANGES
+   fails the scene.
+6. Everyone hears about it: the merge writes a live-context line; Codex's `$refresh` shows it.
+7. Separate memories: `/reflect` and `$reflect` each write their own store; `bin/nightly_check.py` reports both clean.
+8. The whole story, replayed: the bus log as a timeline; then the normal teardown (`--keep` keeps the sandbox).
+
+The consent hook (the Claude `settings.json` and the Codex `hooks.json` entries) and `wt` keep their grants and
+`seen/` markers in the sandbox (they are normally under the user's real home, so the sandbox swaps in two small
+launchers that set the same test override the selftests use). The
+`origin` of the scratch project ends in `o/r.git`, so the hook reads the repo as `o/r`, as the stub PR url says.
+`python3 tests/live/selftest_live.py --selftest` covers the scenes' offline parts (titles, plan, argument checks,
+the status note, the state paths and the merge ask read from real transcript shapes, the launchers); the live scenes need your own `--watch` run.
+
 #### Status file
 
 The runner writes `status.json` in the sandbox root (the path is printed at start), rewritten
@@ -711,8 +743,10 @@ atomically at each transition, so a storyboard can time chapter cards off it:
 `phase` is `title` (the chapter title is up, before the step runs), `running`, `result` (the step
 finished; `result` is PASS, FAIL or SKIP), `done` (the final table, in `table`, is up until `q`) or
 `aborted` (screen guard, `q`, Ctrl-C or any other abort; `note` says why; once written the file is
-final). `id` is the feature id and `cli` is `claude`,
+final). A scenario can also set `note` on a running step: a line for the viewer, shown on the status
+pane's last row (the dance writes `user types: yes` before it types the human's yes, and clears it after).
+`id` is the feature id and `cli` is `claude`,
 `codex` or `both`; `claude` and `codex` are `idle`, `working`, `pass`, `fail` or `skip`; `step` is 0
 during setup and `total` counts every step including the last one (`realdirs`). Chapter titles
-have no dashes, at most 8 words and no internal jargon; the table in `CHAPTERS` in
-`tests/live/selftest_live.py` is the list.
+have no dashes, at most 8 words and no internal jargon; the `CHAPTERS` table of the running class is the
+list: `tests/live/selftest_live.py` for the proof suite, `tests/live/dance.py` for the dance.
