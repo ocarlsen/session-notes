@@ -2144,10 +2144,10 @@ class Live:
         os.chmod(os.path.join(self.ghdir, "gh"), 0o755)
         os.symlink(os.path.join(self.ghdir, "gh"), os.path.join(self.bin, "gh"))
         os.chmod(os.path.join(self.bin, "launchctl"), 0o755)
-        # a login zsh (Codex runs its commands in one, in both modes) lets path_helper put /etc/paths
+        # a login zsh or bash (Codex runs its commands in one, in both modes) lets path_helper (or a profile) put /etc/paths
         # dirs first, so a real gh or ls would beat the stubs: put the sandbox bin back in front after it
         line = 'export PATH="%s:$PATH"\n' % self.bin
-        for rc in (".zshenv", ".zprofile"):
+        for rc in (".zshenv", ".zprofile", ".bash_profile", ".bashrc"):
             with open(os.path.join(self.home, rc), "a") as fh:
                 fh.write(line)
         for n, real in (("claude", self.claude_bin), ("codex", self.codex_bin)):
@@ -2164,10 +2164,16 @@ class Live:
                 fh.write(LS_SHIM)
             os.chmod(os.path.join(self.bin, "ls"), 0o755)
         # the stub must be what a login shell resolves, in both modes: no real gh from a session's shell
-        r = subprocess.run(["/bin/zsh", "-lc", "command -v gh"], env=self.env(), capture_output=True, text=True,
-                           timeout=30, cwd=self.root)
-        if os.path.realpath(r.stdout.strip() or "/nonexistent") != os.path.realpath(os.path.join(self.ghdir, "gh")):
-            raise Abort("a login shell in the sandbox resolves gh to %r, not the stub: a real gh could run" % r.stdout.strip())
+        for shell in ("/bin/zsh", "/bin/bash"):
+            try:
+                r = subprocess.run([shell, "-lc", "command -v gh"], env=self.env(), capture_output=True, text=True,
+                                   timeout=30, cwd=self.root)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise Abort("cannot check which gh a login shell resolves: %s did not run (%s)" % (shell, exc))
+            lines = [x for x in r.stdout.splitlines() if x.strip()]  # a noisy profile prints before the answer
+            got = lines[-1].strip() if lines else ""
+            if os.path.realpath(got or "/nonexistent") != os.path.realpath(os.path.join(self.ghdir, "gh")):
+                raise Abort("a %s login shell in the sandbox resolves gh to %r, not the stub: a real gh could run" % (shell, got))
 
     def clone_and_install(self):
         head = subprocess.run(["git", "-C", SRC_REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -2628,7 +2634,10 @@ class Live:
             return "file untouched but the guard's shell-write refusal text never reached the session"
         if not b_re.search(got):
             return "the guard's refusal of a raw `gh pr merge` never reached the session"
-        calls = self.gh_calls()[seen_calls:]
+        allc = self.gh_calls()
+        if len(allc) < seen_calls:
+            return "the gh call log shrank during the turn (%d -> %d): cannot count merges" % (seen_calls, len(allc))
+        calls = allc[seen_calls:]
         if any(c[:2] == ["pr", "merge"] for c in calls):
             return "the fake gh recorded a `pr merge` call: the raw merge got through"
         return None
@@ -2827,6 +2836,7 @@ class Live:
                  ("model haiku at low effort" if cli == "claude" else "model gpt-6.2-sol at low effort"))
         prompt = ("/review 7 " if cli == "claude" else "$review 7 ") + rules
         tools = self.CLAUDE_TOOLS + ["Agent"]
+        seen_calls = len(self.gh_calls())  # only calls added during THIS row count
         r = self.turn(cli, prompt, "review-%s.txt" % cli, 720, "review" + cli[:2], cwd=pr["path"], tools=tools,
                       budget="2.00", until=lambda: bool(self.posted_comments()))
         posted = self.posted_comments()
@@ -2845,11 +2855,12 @@ class Live:
         self.log("review-%s.txt" % cli, "wt merge --dry-run rc=%d\n%s\n%s\n" % (g.returncode, g.stdout, g.stderr))
         if g.returncode != 0 or "verdict gate passed" not in g.stdout:
             return FAIL, "wt merge --dry-run did not pass the gate on the posted APPROVE (rc=%d)" % g.returncode, "review-%s.txt" % cli
-        try:
-            with open(os.path.join(self.ghdir, "gh-calls.jsonl")) as fh:
-                calls = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
-        except (OSError, ValueError):
-            calls = []
+        if self.watch:  # the session outlives the verdict post: let a late `wt merge` land before the read
+            self.wait_idle("review" + cli[:2], 90)
+        allc = self.gh_calls()
+        if len(allc) < seen_calls:
+            return FAIL, "the gh call log shrank during the turn (%d -> %d): cannot count merges" % (seen_calls, len(allc)), "review-%s.txt" % cli
+        calls = allc[seen_calls:]
         if any(c[:2] == ["pr", "merge"] for c in calls):
             return FAIL, "gh pr merge was called", "review-%s.txt" % cli
         return PASS, "verdict comment APPROVE at the PR head recorded; wt merge --dry-run passes the gate on it", None
