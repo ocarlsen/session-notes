@@ -33,6 +33,7 @@ uses anything fancier fails loudly instead of being half-read.
     python3 notes_config.py            # print the resolved config as JSON
     python3 notes_config.py --stores [--cwd DIR]   # this folder's stores, as JSON
     python3 notes_config.py --live-path           # the live-context file's path
+    python3 notes_config.py --pin-state-dir [--dry-run]   # Codex-only machine: pin state_dir
     python3 notes_config.py --selftest
 """
 import copy
@@ -277,6 +278,57 @@ def config_path(env=None):
     if p:
         return os.path.expanduser(p)
     return os.path.expanduser("~/.config/session-notes/config.toml")
+
+
+def pin_state_dir(env=None, dry_run=False):
+    """For a machine with no Claude home (a Codex-only install): write `state_dir` under
+    $XDG_STATE_HOME (default ~/.local/state) into the config file, so the runtime state never
+    lands in a ~/.claude that does not exist. Never overwrites an explicit state_dir, never
+    runs on a machine that has a Claude home, and the default of an unpinned config stays
+    ~/.claude/session-notes/state (no existence check at runtime). Returns a one-line report
+    starting `pinned`, `would pin` or `unchanged`."""
+    env = os.environ if env is None else env
+    path = config_path(env)
+    cfg = load(path, env) if os.path.exists(path) or not env.get("SESSION_NOTES_CONFIG") else None
+    if cfg is None:  # SESSION_NOTES_CONFIG names a file that does not exist: create it
+        cfg = load(None, {k: v for k, v in env.items() if k != "SESSION_NOTES_CONFIG"})
+    home = cfg["paths"]["claude_home"]
+    if os.path.lexists(home):
+        return "unchanged: %s exists (a Claude Code machine keeps the default state_dir)" % home
+    text = ""
+    if os.path.islink(path) and not os.path.exists(path):
+        raise ConfigError("%s: symlink to missing file %s" % (path, os.readlink(path)))
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        if "state_dir" in (parse_toml(text).get("paths") or {}):
+            return "unchanged: %s already sets paths.state_dir" % path
+    xdg = (env.get("XDG_STATE_HOME") or "").strip()
+    if not xdg or not os.path.isabs(xdg):
+        xdg = os.path.expanduser("~/.local/state")
+    value = json.dumps(os.path.join(xdg, "session-notes", "state"))
+    line = "state_dir = %s" % value
+    lines = text.splitlines(True)
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\[paths\]\s*(#.*)?$", ln):
+            if not ln.endswith("\n"):
+                lines[i] = ln + "\n"
+            lines.insert(i + 1, line + "\n")
+            new = "".join(lines)
+            break
+    else:
+        new = text + ("" if not text or text.endswith("\n") else "\n") + ("\n" if text else "") \
+            + "[paths]\n" + line + "\n"
+    parse_toml(new)  # never write a file the loader would refuse
+    if dry_run:
+        return "would pin %s in %s" % (line, path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if text:
+        with open(path + ".bak-session-notes", "w", encoding="utf-8") as fh:
+            fh.write(text)
+    with open(path, "w", encoding="utf-8") as fh:  # through a symlink, never replacing it
+        fh.write(new)
+    return "pinned %s in %s" % (line, path)
 
 
 def _merge(base, over, where=""):
@@ -706,6 +758,51 @@ store = "/tmp/beta-store"
             check("non-positive minutes refused", True)
         check("missing file = defaults",
               load(os.path.join(d, "nope.toml"))["scopes"] == [])
+        # pin_state_dir (Codex-only install): pins only with no Claude home and no explicit value.
+        with tempfile.TemporaryDirectory() as hd:
+            saved_env = {k: os.environ.get(k) for k in ("HOME", "XDG_STATE_HOME")}
+            try:
+                os.environ["HOME"] = hd
+                os.environ.pop("XDG_STATE_HOME", None)
+                cp = os.path.join(hd, "cfg", "config.toml")
+                penv = {"SESSION_NOTES_CONFIG": cp}
+                want = os.path.join(hd, ".local", "state", "session-notes", "state")
+                check("unpinned default is the old one, with no existence check",
+                      load(os.path.join(hd, "none.toml"), env={})["paths"]["state_dir"]
+                      == os.path.join(hd, ".claude", "session-notes", "state"))
+                os.makedirs(os.path.dirname(cp))
+                open(cp, "w").close()
+                check("pin: dry run says what it would write and writes nothing",
+                      pin_state_dir(penv, dry_run=True).startswith("would pin") and open(cp).read() == "")
+                check("pin: no Claude home pins ~/.local/state", pin_state_dir(penv).startswith("pinned")
+                      and load(cp, env=penv)["paths"]["state_dir"] == want)
+                check("pin: a second run changes nothing", pin_state_dir(penv).startswith("unchanged"))
+                # a process started after something creates ~/.claude/session-notes/state still gets the pin
+                os.makedirs(os.path.join(hd, ".claude", "session-notes", "state"))
+                check("pin: the pinned dir holds even once ~/.claude/session-notes/state exists",
+                      load(cp, env=penv)["paths"]["state_dir"] == want)
+                with open(cp, "w") as fh:
+                    fh.write("# mine\n[paths]\nclaude_home = \"%s/nochome\"\n[time]\nstale_after_minutes = 5\n" % hd)
+                check("pin: an existing [paths] table gets the line, other keys kept",
+                      pin_state_dir(penv).startswith("pinned")
+                      and load(cp, env=penv)["paths"]["state_dir"] == want
+                      and load(cp, env=penv)["time"]["stale_after_minutes"] == 5
+                      and open(cp).read().startswith("# mine\n[paths]\nstate_dir ="))
+                with open(cp, "w") as fh:
+                    fh.write('[paths]\nclaude_home = "%s/nochome"\nstate_dir = "%s/mine"\n' % (hd, hd))
+                check("pin: an explicit state_dir is never overwritten",
+                      pin_state_dir(penv).startswith("unchanged")
+                      and load(cp, env=penv)["paths"]["state_dir"] == os.path.join(hd, "mine"))
+                with open(cp, "w") as fh:
+                    fh.write("")
+                check("pin: a machine with a Claude home pins nothing",
+                      pin_state_dir(penv).startswith("unchanged") and open(cp).read() == "")
+            finally:
+                for k, v in saved_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
         # Codex mode: every path under codex_home, Claude-side overrides ignored.
         with open(f, "w") as fh:
             fh.write('[paths]\nclaude_home = "%s/claude"\nglobal_store = "%s/claude/g"\n'
@@ -881,6 +978,9 @@ if __name__ == "__main__":
             sys.exit(0)
         if "--live-path" in sys.argv:
             print(load()["live"]["path"])
+            sys.exit(0)
+        if "--pin-state-dir" in sys.argv:
+            print(pin_state_dir(dry_run="--dry-run" in sys.argv))
             sys.exit(0)
         print(json.dumps(load(), indent=2))
     except ConfigError as exc:

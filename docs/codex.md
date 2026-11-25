@@ -18,7 +18,7 @@ which side it is on:
 | global store | `~/.claude/projects/<home>/memory` | `~/.codex/session-notes/global` |
 | project store | a configured scope's store | `~/.codex/session-notes/projects/<encoded root>` |
 | project root | the configured scope | the configured scope, else the cwd's git root |
-| reflect lock and state | `~/.claude/session-notes/state` | `~/.codex/session-notes/state` |
+| reflect lock and state | `paths.state_dir` (see below) | `~/.codex/session-notes/state` |
 | session id | `CLAUDE_CODE_SESSION_ID` | `CODEX_THREAD_ID` |
 | boot load | `@import` in CLAUDE.md | the SessionStart hook |
 | instruction files | CLAUDE.md | AGENTS.md |
@@ -27,16 +27,28 @@ In codex mode a resolved store under `paths.claude_home` is a config error, not
 a warning. `python3 bin/notes_config.py --stores` prints the stores for the
 current folder.
 
+The tmux-wide runtime state both agents share (bus mailbox, pane registry, nudge lock, last-check
+record) lives in `paths.state_dir`. Unset, it is `~/.claude/session-notes/state`, as it always was.
+`install.sh --codex` on a machine with no `~/.claude` pins `state_dir` to
+`$XDG_STATE_HOME/session-notes/state` (`~/.local/state/session-notes/state`) in the session-notes
+config (`python3 bin/notes_config.py --pin-state-dir`), so a Codex-only machine never gets a
+`~/.claude`. The choice is made once at install, never by looking at the disk at runtime; an
+explicit value is never overwritten, and a machine with a Claude home pins nothing. It holds no memory.
+
 ## Install
 
 ```sh
-sh install.sh --codex --dry-run   # see what it would do
-sh install.sh --codex
+sh install.sh --codex --dry-run --bin-dir ~/.local/bin   # see what it would do
+sh install.sh --codex --bin-dir ~/.local/bin
 ```
 
 It asks `[y/N]` before each step:
 
 1. Link the four Codex skills (`$reflect`, `$refresh`, `$rnr`, `$review`) into `~/.codex/skills/`.
+   Then link the commands the rules and `AGENTS.md` tell Codex to run (`wt`, `handoff_session`,
+   `session_peers`, `bcast`, `session_bus`, `bus_nudge`, and the memory tools) into `--bin-dir`,
+   which must be on the `PATH` your Codex shell sees (the desktop app's `PATH` lacks `~/.local/bin`
+   unless your shell profile adds it). Without `--bin-dir` no command is linked and the install says so.
 2. Write the hook launcher, `~/.local/bin/session-notes`: a small generated script with
    this checkout's path baked in (see Hooks below). It refuses to overwrite a file at that
    path that is not a session-notes launcher.
@@ -61,6 +73,19 @@ It asks `[y/N]` before each step:
 6. Add two lines to `~/.codex/rules/default.rules` that approve exactly one
    command, `python3 <repo>/bin/codex_save.py commit`, so the desktop app saves
    memory without asking (see Saving memory below).
+
+### Codex only
+
+A machine with Codex and no Claude Code needs nothing else: `install.sh --codex` is a complete
+install. It links the same commands the Claude install links (one shared step in `install.sh`),
+writes nothing under `~/.claude` and never creates it (neither do the hooks, the bus or the nudge
+loop at runtime: their state is in `~/.local/state/session-notes/state`), and offers the nightly memory checks and
+the `bus_nudge` LaunchAgent on macOS. What it does not set up: the Claude-only pieces
+(`~/.claude/settings.json` hooks, the `CLAUDE.md` import, the `/find-session` skill) and the
+tmux itself, which the tmux commands need and you install yourself. `make selftest-watch ARGS="--codex-alone"`
+runs the live suite that way: a sandbox home with no Claude install, only
+`install.sh --codex`, and the Codex column only. In your own shell (outside a Codex session)
+`handoff_session` launches Codex when no `claude` binary resolves; `--cli codex` says so explicitly.
 
 Install from the main checkout, not from a linked git worktree: `install.sh --codex` (and
 `codex_hooks.py merge` and `launcher`) refuse a worktree up front, before any step or prompt,

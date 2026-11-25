@@ -44,10 +44,22 @@ REPORT_MAX_CHARS = 20000
 DEFAULT_MAX_AGE_DAYS = 8
 
 
+def claude_home_exists(home):
+    """Claude Code's own directory exists. A directory holding only `session-notes` is the
+    legacy runtime-state dir of a machine that ran these tools (Codex-only), not Claude."""
+    if not os.path.isdir(home):
+        return False
+    try:
+        names = os.listdir(home)
+    except OSError:
+        return False
+    return not names or any(n != "session-notes" for n in names)
+
+
 def installed_kinds(cfg_for):
     """The agent kinds whose home exists, in a fixed order. cfg_for(kind) -> config."""
     kinds = []
-    if os.path.isdir(cfg_for("claude")["paths"]["claude_home"]):
+    if claude_home_exists(cfg_for("claude")["paths"]["claude_home"]):
         kinds.append("claude")
     if os.path.isdir(cfg_for("codex")["agent"]["codex_home"]):
         kinds.append("codex")
@@ -295,6 +307,17 @@ def selftest():
         buf = _Buf()
         check("no agent home: exit 1", run_all(env, run, buf) == 1 and not calls)
 
+        # session-notes' own legacy state dir under the Claude home is not a Claude install
+        os.makedirs(os.path.join(claude_home, "session-notes", "state"))
+        check("a Claude home holding only session-notes state is not Claude installed",
+              not claude_home_exists(claude_home))
+        run, calls = fake({})
+        buf = _Buf()
+        check("... so no Claude checks run on it", run_all(env, run, buf) == 1 and not calls)
+        os.makedirs(os.path.join(claude_home, "projects"))
+        check("a Claude home with anything else in it is Claude installed", claude_home_exists(claude_home))
+        command_rm = __import__("shutil").rmtree
+        command_rm(claude_home)
         os.makedirs(claude_home)
         run, calls = fake({})
         buf = _Buf()

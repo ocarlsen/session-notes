@@ -12,7 +12,9 @@ types in the new pane.
 
 WHICH CLI. --cli claude|codex picks the agent in the new pane. Without it: codex when
 SESSION_NOTES_AGENT=codex (set by `install.sh --codex` for Codex's shell, so a Codex session
-hands off to Codex), otherwise claude. The Claude path is unchanged. Codex launches as
+hands off to Codex), otherwise claude; and when no `claude` binary resolves but `codex` does (a
+Codex-only machine, typed in your own shell) it launches codex. With neither, the error names
+`--cli codex`. The Claude path is unchanged. Codex launches as
 `codex --no-daemon` (hooks run in the pane only without the daemon) with the prompt as its
 positional argument. Flag mapping for codex:
 
@@ -535,6 +537,33 @@ def _selftest():
                 os.environ.pop("SESSION_NOTES_AGENT", None)
             else:
                 os.environ["SESSION_NOTES_AGENT"] = saved_env
+        # A Codex-only machine (no claude on PATH or in ~/.local/bin), typed in the user's own shell:
+        # no --cli means codex when codex resolves; with neither binary the error names --cli codex.
+        saved = {k: os.environ.get(k) for k in ("SESSION_NOTES_AGENT", "PATH", "HOME")}
+        stub_which = shutil.which
+        with tempfile.TemporaryDirectory() as nohome:
+            try:
+                shutil.which = saved_which  # the real lookup, over the empty PATH below
+                os.environ.pop("SESSION_NOTES_AGENT", None)
+                os.environ["PATH"], os.environ["HOME"] = nohome, nohome
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                    rc = main(["--name", "x", "--prompt", "go.", "--dry-run", "--cwd", "/tmp",
+                               "--codex-bin", "cbin"])
+                check("no claude binary, codex resolves, no --cli: launches codex",
+                      rc == 0 and "'cbin' '--no-daemon'" in buf.getvalue(), "rc=%s %s" % (rc, buf.getvalue()[:300]))
+                errbuf = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errbuf):
+                    rc = main(["--name", "x", "--prompt", "go.", "--dry-run", "--cwd", "/tmp"])
+                check("no claude and no codex binary: rc 4, the error names --cli codex",
+                      rc == 4 and "--cli codex" in errbuf.getvalue(), errbuf.getvalue()[:300])
+            finally:
+                shutil.which = stub_which
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
         errbuf = io.StringIO()
         with contextlib.redirect_stderr(errbuf):
             rc1 = main(["--cli", "codex", "--name", "x", "--prompt", "go.", "--claude-bin", "c",
@@ -607,6 +636,11 @@ def main(argv=None):
         return 2
 
     cli = choose_cli(a.cli)
+    # No --cli, not a Codex session, and no claude binary here, but codex resolves (a Codex-only
+    # machine): launch codex instead of failing.
+    if (not a.cli and cli == "claude" and not a.claude_bin
+            and not resolve_claude() and resolve_codex(a.codex_bin)):
+        cli = "codex"
     if cli == "codex" and a.claude_bin:
         print("handoff_session: --claude-bin has no effect on a codex pane; use --codex-bin.",
               file=sys.stderr)
@@ -710,7 +744,8 @@ def main(argv=None):
     else:
         claude = resolve_claude(a.claude_bin)
         if not claude:
-            print("handoff_session: could not resolve the `claude` binary (pass --claude-bin)", file=sys.stderr)
+            print("handoff_session: could not resolve the `claude` binary (pass --claude-bin, or --cli codex "
+                  "to launch Codex)", file=sys.stderr)
             return 4
 
     # A live session already owns this name -> refuse (never clobber / re-address).

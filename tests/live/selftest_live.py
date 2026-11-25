@@ -12,6 +12,7 @@ into.
     make selftest-live
     make selftest-watch                                 # the same run, built to be watched and filmed
     python3 tests/live/selftest_live.py [--only claude|codex] [--feature boot,bus,...] [--keep]
+    python3 tests/live/selftest_live.py --codex-alone   # a Codex-only machine: no Claude install, no ~/.claude
     python3 tests/live/selftest_live.py --watch [--pace X] [--step] [--leak-terms FILE]
     python3 tests/live/selftest_live.py --selftest      # pure logic, no CLI, no network
 
@@ -831,6 +832,36 @@ def git_env(home):
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com", "LANG": "en_US.UTF-8"}
 
 
+# What the Codex rules and AGENTS.md tell the agent to run by its bare name.
+ALONE_COMMANDS = ("wt", "handoff_session", "session_peers", "bcast", "session_bus", "bus_nudge")
+
+
+def alone_install_problems(home, claude_dir, bin_dir, repo, path):
+    """After `install.sh --codex --yes --bin-dir <bin_dir>` on a machine with no Claude install:
+    what is wrong. No Claude config dir may exist, and every command the Codex rules name must be
+    a symlink to its bin/*.py AND be what PATH resolves first. [] = fine."""
+    out = []
+    if os.path.lexists(claude_dir):
+        out.append("the Codex-only install created %s" % os.path.relpath(claude_dir, home))
+    if os.path.lexists(os.path.join(home, ".claude")):
+        out.append("the sandbox home has a .claude")
+    for c in ALONE_COMMANDS:
+        link = os.path.join(bin_dir, c)
+        want = os.path.join(repo, "bin", c + ".py")
+        if not (os.path.islink(link) and os.readlink(link) == want):
+            out.append("%s is not a symlink to bin/%s.py in the bin dir" % (c, c))
+        elif shutil.which(c, path=path) != link:
+            out.append("%s does not resolve to the bin dir on PATH (got %s)" % (c, shutil.which(c, path=path)))
+    return out
+
+
+def tree_paths(root):
+    out = []
+    for dp, dn, fn in os.walk(root):
+        out += [os.path.join(dp, x) for x in dn + fn]
+    return sorted(out)
+
+
 def sh(args, cwd, env, check=True, timeout=60):
     r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
     if check and r.returncode != 0:
@@ -1641,6 +1672,100 @@ def selftest():
     else:
         print("skip layout and guard-through-panes checks: no tmux (set %s=1 to fail instead)" % REQUIRE_TMUX_ENV)
 
+    # --codex-alone: the setup path, no LLM. A sandbox home with NO Claude install, only
+    # `install.sh --codex --yes --bin-dir <sandbox bin>` (launchctl stubbed first on PATH), from a
+    # copy of this checkout (install.sh --codex refuses a linked worktree; a copy has no .git).
+    live = Live(argparse.Namespace(only="codex", feature=None, keep=False, selftest=False, codex_alone=True))
+    try:
+        check("codex-alone: the sandbox has no Claude config dir before install, no CLAUDE_CONFIG_DIR, no claude binary",
+              not os.path.lexists(live.claude_dir) and "CLAUDE_CONFIG_DIR" not in live.env() and live.claude_bin is None)
+        with open(os.path.join(live.bin, "launchctl"), "w") as fh:
+            fh.write('#!/bin/sh\nexit 0\n')
+        os.chmod(os.path.join(live.bin, "launchctl"), 0o755)
+        shutil.copytree(SRC_REPO, live.repo, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        path = live.env()["PATH"]
+        check("codex-alone: NEGATIVE control, before install the commands do not resolve",
+              len(alone_install_problems(live.home, live.claude_dir, live.bin, live.repo, path)) == len(ALONE_COMMANDS))
+        if shutil.which("launchctl", path=path) != os.path.join(live.bin, "launchctl"):
+            check("codex-alone: the launchctl stub is first on PATH", False, shutil.which("launchctl", path=path) or "none")
+        else:
+            try:
+                live.install_steps()
+                problems = []
+            except Abort as exc:
+                problems = [str(exc)]
+            except Exception as exc:
+                problems = ["install crashed: %r" % (exc,)]
+            check("codex-alone: install.sh --codex alone installs, links every command, creates no Claude dir",
+                  not problems, "; ".join(problems))
+            check("codex-alone: nothing under the sandbox home mentions .claude",
+                  not os.path.lexists(os.path.join(live.home, ".claude")))
+            check("codex-alone: the Codex install ran (skills, hooks.json, launcher)",
+                  os.path.islink(os.path.join(live.codex_dir, "skills", "reflect"))
+                  and os.path.isfile(os.path.join(live.codex_dir, "hooks.json"))
+                  and os.path.isfile(os.path.join(live.home, ".local", "bin", "session-notes")))
+            # What Codex's own hooks and the nudge loop do at runtime must not create a Claude dir:
+            # the registered SessionStart pane-registry hook, run from a pane of the sandbox tmux
+            # server the way Codex runs it, then one bus_nudge pass, then the run's real-dirs row.
+            if shutil.which("tmux"):
+                live.before, live.installed = snapshot(live.real_home), True
+                try:
+                    with open(os.path.join(live.codex_dir, "hooks.json")) as fh:
+                        hj = json.load(fh)
+                    hcmd = [h["command"] for g in hj["hooks"]["SessionStart"] for h in g["hooks"]
+                            if "session_pane_registry" in h["command"]][0]
+                    live.start_tmux()
+                    payload = json.dumps({"session_id": "s1", "hook_event_name": "SessionStart",
+                                          "source": "startup", "cwd": live.work})
+                    live.pane_run("hookpane", ["sh", "-c", "echo %s | %s; echo rc=$?" % (shlex.quote(payload), hcmd)],
+                                  "probe-hook.txt", timeout=30)
+                    nr = live.run([sys.executable, os.path.join(live.repo, "bin", "bus_nudge.py"), "--once"],
+                                  "probe-nudge.txt", timeout=60)
+                    live.stop_tmux()
+                    reg = os.path.join(live.home, ".local", "state", "session-notes", "state", "session_panes.json")
+                    check("codex-alone: the SessionStart pane-registry hook ran and wrote its registry outside .claude",
+                          os.path.isfile(reg), "no %s" % reg)
+                    check("codex-alone: the hook and one bus_nudge pass created no .claude in the sandbox home",
+                          not os.path.lexists(os.path.join(live.home, ".claude")),
+                          "found %s" % [f for f in tree_paths(live.home) if "/.claude" in f][:5])
+                    st, detail, _ = live.row_realdirs()
+                    check("codex-alone: after the hook and the nudge pass the real-dirs row passes", st == PASS, "%s %s" % (st, detail))
+                finally:
+                    live.stop_tmux()
+            else:
+                print("skip codex-alone runtime-state check: no tmux")
+            # The split repro: something else (the merge grant file) creates ~/.claude/session-notes/state
+            # after install. A process started afterwards must still resolve the pinned dir, so a
+            # long-lived bus_nudge and a new hook never disagree.
+            pinned = os.path.join(live.home, ".local", "state", "session-notes", "state")
+            os.makedirs(os.path.join(live.claude_dir, "session-notes", "state"))
+            r = live.run([sys.executable, os.path.join(live.repo, "bin", "notes_config.py")], "probe-config.txt", timeout=30)
+            try:
+                resolved = json.loads(r.stdout)["paths"]["shared_state_dir"]
+            except (ValueError, KeyError):
+                resolved = r.stdout[-200:]
+            check("codex-alone: a process started after ~/.claude/session-notes/state appears still resolves the pinned state dir",
+                  resolved == pinned, "resolved %s, pinned %s" % (resolved, pinned))
+            shutil.rmtree(live.claude_dir)
+            os.makedirs(live.claude_dir)
+            check("codex-alone: NEGATIVE control, a created Claude dir is reported",
+                  any(".claude" in x for x in alone_install_problems(live.home, live.claude_dir, live.bin, live.repo, path)))
+            os.rmdir(live.claude_dir)
+            os.remove(os.path.join(live.bin, "wt"))
+            check("codex-alone: NEGATIVE control, a command that was not linked is reported",
+                  any(x.startswith("wt ") for x in alone_install_problems(live.home, live.claude_dir, live.bin, live.repo, path)))
+        live.guard_repo = None
+        live.seed_claude()
+        check("codex-alone: seed_claude makes the guard repo and still no Claude config",
+              bool(live.guard_repo) and os.path.isdir(live.guard_repo) and not os.path.lexists(live.claude_dir))
+        live.before, live.installed = snapshot(live.real_home), True
+        os.makedirs(live.claude_dir)
+        st, detail, _ = live.row_realdirs()
+        check("codex-alone: NEGATIVE control, the real-dirs row fails if a Claude dir appeared",
+              st == FAIL and "Claude config dir" in detail, "%s %s" % (st, detail))
+    finally:
+        shutil.rmtree(live.root, ignore_errors=True)
+
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
@@ -1704,14 +1829,19 @@ class Live:
         self.claude_dir = os.path.join(self.home, ".claude")
         self.codex_dir = os.path.join(self.home, ".codex")
         self.cfg = j("config.toml")
-        for d in (self.home, self.claude_dir, self.codex_dir, self.bin, self.tmuxd, self.work, self.logs):
+        # --codex-alone: a machine with Codex and no Claude Code. No ~/.claude in the sandbox, no
+        # claude binary, no Claude install; only `install.sh --codex`.
+        self.alone = bool(getattr(a, "codex_alone", False))
+        for d in (self.home, self.codex_dir, self.bin, self.tmuxd, self.work, self.logs):
             os.makedirs(d, exist_ok=True)
+        if not self.alone:
+            os.makedirs(self.claude_dir, exist_ok=True)
         with open(self.cfg, "w") as fh:  # defaults, except where the Claude store lives
             fh.write('[paths]\nglobal_store = "%s/store-claude"\n' % self.root)
         self.results = []
         self.panes = set()
         self.t0 = time.time()
-        self.claude_bin = find_real_binary("claude", os.environ.get("SELFTEST_CLAUDE_BIN"))
+        self.claude_bin = None if self.alone else find_real_binary("claude", os.environ.get("SELFTEST_CLAUDE_BIN"))
         self.codex_bin = find_real_binary("codex", os.environ.get("SELFTEST_CODEX_BIN"))
         self.claude_model = os.environ.get("SELFTEST_CLAUDE_MODEL", "haiku")
         self.codex_model = os.environ.get("SELFTEST_CODEX_MODEL", "gpt-6.2-sol")
@@ -1768,12 +1898,14 @@ class Live:
         user = "user" if self.watch else os.environ.get("USER", "selftest")  # watch: nothing real on screen
         e = {"HOME": self.home, "PATH": os.pathsep.join(dirs), "TERM": "xterm-256color",
              "LANG": "en_US.UTF-8", "USER": user, "SHELL": "/bin/zsh",
-             "TMUX_TMPDIR": self.tmuxd, "CLAUDE_CONFIG_DIR": self.claude_dir, "CODEX_HOME": self.codex_dir,
+             "TMUX_TMPDIR": self.tmuxd, "CODEX_HOME": self.codex_dir,
              "SESSION_NOTES_CONFIG": self.cfg, "DISABLE_AUTOUPDATER": "1",
              "GIT_CONFIG_GLOBAL": os.path.join(self.root, "gitconfig"),
              "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
              "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
              "WT_GH": os.path.join(self.bin, "gh")}
+        if not self.alone:  # a Codex-only machine has no Claude config dir to point at
+            e["CLAUDE_CONFIG_DIR"] = self.claude_dir
         if self.watch:
             e.update(LOGNAME=user, PS1="$ ", PROMPT="$ ")
         e.update(extra)
@@ -2214,11 +2346,26 @@ class Live:
         # No remote: nothing in the sandbox clone can push or fetch anywhere.
         self.run(["git", "-C", self.repo, "remote", "remove", "origin"], "clone.txt", check=True)
         self.installed = True  # from here on a stray write could reach the real dirs: always check
+        self.install_steps()
+
+    def install_steps(self):
+        """The install a new user runs. Codex-alone: ONLY `install.sh --codex`, commands linked into
+        the sandbox bin, and the result is checked (no Claude dir, every command resolves)."""
+        if self.alone:
+            self.run(["sh", "install.sh", "--codex", "--yes", "--bin-dir", self.bin], "install-codex.txt",
+                     cwd=self.repo, check=True)
+            problems = alone_install_problems(self.home, self.claude_dir, self.bin, self.repo, self.env()["PATH"])
+            if problems:
+                raise Abort("codex-alone install is wrong: " + "; ".join(problems))
+            return
         self.run(["sh", "install.sh", "--all", "--yes", "--bin-dir", self.bin], "install-claude.txt",
                  cwd=self.repo, check=True)
         self.run(["sh", "install.sh", "--codex", "--yes"], "install-codex.txt", cwd=self.repo, check=True)
 
     def seed_claude(self):
+        if self.alone:  # no Claude config; the guard repo the Codex rows use still exists
+            self.guard_repo = make_origin_repo(self.root, "guardproj", git_env(self.home))
+            return
         sp = os.path.join(self.claude_dir, "settings.json")
         try:
             with open(sp) as fh:
@@ -2759,7 +2906,9 @@ class Live:
         """The OTHER CLI's pane writes a note with live.py; a FRESH `cli` session then boots and its
         start-of-session injection (in its own transcript) must carry the note. The column is the reader."""
         other = "codex" if cli == "claude" else "claude"
-        if not (self.have["claude"] and self.have["codex"]):
+        if self.alone:  # no Claude on this machine: the other Codex pane writes, a fresh Codex reads
+            other = "codex"
+        elif not (self.have["claude"] and self.have["codex"]):
             return SKIP, "needs both CLIs", None
         writer = self.pane_pair(other)[0]
         if writer not in self.panes:
@@ -2830,12 +2979,13 @@ class Live:
     def trust_path(self, path):
         """Pre-trust a directory created mid-run, in the sandbox's Claude and Codex configs."""
         for p in {path, os.path.realpath(path)}:
-            cj = os.path.join(self.claude_dir, ".claude.json")
-            with open(cj) as fh:
-                doc = json.load(fh)
-            doc.setdefault("projects", {})[p] = {"hasTrustDialogAccepted": True, "allowedTools": []}
-            with open(cj, "w") as fh:
-                json.dump(doc, fh, indent=2)
+            if not self.alone:
+                cj = os.path.join(self.claude_dir, ".claude.json")
+                with open(cj) as fh:
+                    doc = json.load(fh)
+                doc.setdefault("projects", {})[p] = {"hasTrustDialogAccepted": True, "allowedTools": []}
+                with open(cj, "w") as fh:
+                    json.dump(doc, fh, indent=2)
             with open(os.path.join(self.codex_dir, "config.toml"), "a") as fh:
                 fh.write('\n[projects."%s"]\ntrust_level = "trusted"\n' % p)
 
@@ -2983,15 +3133,17 @@ class Live:
     CODEX_STATUS = ("Workspace", "Approve for me")
 
     def row_hookpath(self):
-        with open(os.path.join(self.claude_dir, "settings.json")) as fh:
-            sj = json.load(fh)
+        sj = None
+        if not self.alone:
+            with open(os.path.join(self.claude_dir, "settings.json")) as fh:
+                sj = json.load(fh)
         hj_path = os.path.join(self.codex_dir, "hooks.json")
         hj = None
         if os.path.isfile(hj_path):
             with open(hj_path) as fh:
                 hj = json.load(fh)
         ccmds, xcmds = hook_commands(sj, None), hook_commands(None, hj)
-        if not ccmds:
+        if not ccmds and not self.alone:
             return FAIL, "no hook commands in the Claude settings.json", None
         if not xcmds:
             return FAIL, "no hook commands in the Codex hooks.json", None
@@ -3006,16 +3158,20 @@ class Live:
         c1 = [c.replace(self.repo, ghost) for c in ccmds if self.repo in c][:1]
         c2 = [c.replace(os.path.join(self.home, ".local", "bin"), os.path.join(ghost, "bin")) for c in xcmds
               if os.path.join(self.home, ".local", "bin") in c][:1]
-        if not c1 or not check_hook_paths(c1, self.home, launcher_repo):
+        if not self.alone and (not c1 or not check_hook_paths(c1, self.home, launcher_repo)):
             return FAIL, "negative control: a Claude hook naming a deleted worktree was NOT reported", None
         if not c2 or not check_hook_paths(c2, self.home, launcher_repo):
             return FAIL, "negative control: a Codex hook through a missing launcher was NOT reported", None
         if problems:
             return FAIL, "; ".join(problems[:3]), None
+        if self.alone:
+            return PASS, "%d Codex hook commands resolve (no Claude install); the negative control reported red" % len(xcmds), None
         return PASS, "%d Claude + %d Codex hook commands resolve; both negative controls reported red" % (
             len(ccmds), len(xcmds)), None
 
     def row_realdirs(self):
+        if self.alone and (os.path.lexists(self.claude_dir) or os.path.lexists(os.path.join(self.home, ".claude"))):
+            return FAIL, "the Codex-alone run left a Claude config dir in the sandbox home", None
         after = snapshot(self.real_home)
         needles = [os.path.basename(self.root), self.tok]
         diffs, benign = fatal_diffs(self.before, after, needles)
@@ -3081,10 +3237,15 @@ class Live:
             if os.path.lexists(link):
                 link_selftest_socket(self.sock_dir, "/nonexistent")  # raises the Abort naming the link
         self.before = snapshot(self.real_home)
-        ck, ck_why = keychain_key(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest"), self.keychain)
+        if self.alone:  # no Claude on this machine: its key is never fetched
+            ck, ck_why = None, "--codex-alone"
+        else:
+            ck, ck_why = keychain_key(os.environ.get("SELFTEST_CLAUDE_KEYCHAIN_SERVICE", "session-notes-selftest"), self.keychain)
         ok, ok_why = keychain_key(os.environ.get("SELFTEST_OPENAI_KEYCHAIN_SERVICE", "session-notes-selftest-openai"), self.keychain)
         for cli, key, why, binp in (("claude", ck, ck_why, self.claude_bin), ("codex", ok, ok_why, self.codex_bin)):
-            if self.a.only and self.a.only != cli:
+            if self.alone and cli == "claude":
+                self.why[cli] = "--codex-alone"
+            elif self.a.only and self.a.only != cli:
                 self.why[cli] = "--only %s" % self.a.only
             elif not binp:
                 self.why[cli] = "no %s binary" % cli
@@ -3177,6 +3338,8 @@ def main():
     ap = argparse.ArgumentParser(description="Live selftest: real Claude Code and Codex sessions in a sandbox")
     ap.add_argument("--only", choices=("claude", "codex"))
     ap.add_argument("--feature", type=lambda s: set(s.split(",")), help="comma list of: " + ",".join(f for f, _, _ in FEATURES))
+    ap.add_argument("--codex-alone", action="store_true",
+                    help="a Codex-only machine: no Claude install and no ~/.claude in the sandbox; only install.sh --codex, Codex rows only")
     ap.add_argument("--keep", action="store_true", help="keep the sandbox and print its path")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--watch", action="store_true",
@@ -3193,6 +3356,11 @@ def main():
         return 0
     if a.selftest:
         return selftest()
+    if a.codex_alone:
+        if a.only == "claude":
+            print("--codex-alone has no Claude: it cannot be combined with --only claude", file=sys.stderr)
+            return 2
+        a.only = "codex"
     if not a.watch and (a.pace is not None or a.step or a.leak_terms or a.no_hold_final):
         print("--pace, --step, --leak-terms and --no-hold-final need --watch", file=sys.stderr)
         return 2

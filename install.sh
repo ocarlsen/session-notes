@@ -35,8 +35,10 @@
 #   sh install.sh --dry-run          show what would happen
 #   sh install.sh --git-hooks <repo>  install the session-notes pre-commit into a git repo
 #                                    (chains any hook already there; see docs/tools.md, wt)
-#   sh install.sh --codex            set up OpenAI Codex instead (docs/codex.md): link the
-#                                    Codex skills into ~/.codex/skills, write the hook
+#   sh install.sh --codex --bin-dir ~/.local/bin
+#                                    set up OpenAI Codex instead (docs/codex.md): link the
+#                                    Codex skills into ~/.codex/skills, link the commands
+#                                    into --bin-dir, write the hook
 #                                    launcher, refresh hooks.json and config.toml edits,
 #                                    the rules block, the model defaults and profiles;
 #                                    never touches ~/.claude
@@ -63,7 +65,7 @@ while [ $# -gt 0 ]; do
                  [ -n "$2" ] || { echo "install.sh: --git-hooks needs a non-empty repo path" >&2; exit 2; }
                  GITHOOKS="$2"; GITHOOKS_SET=1; shift 2 ;;
     --codex) CODEX=1; shift ;;
-    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -106,12 +108,15 @@ link() {  # link SRC DEST: create or refresh a symlink, never clobber a real fil
 # $SESSION_NOTES/bin, so nothing they need has to be on PATH.
 SKILLS="reflect refresh rnr"
 TOOLS="handoff_session session_peers bcast wt"
+TOOLS_ALL="$TOOLS session_bus bus_nudge reflect_lock append_memory_index memory_index_lint \
+         boot_budget memory_hygiene_canary nightly_check launch_agents notes_config"
 if [ "$ALL" = 1 ]; then
   # skills/codex/ holds the Codex variants (install.sh --codex), not a Claude skill.
   SKILLS=$(for d in "$REPO"/skills/*/; do n=$(basename "$d"); [ "$n" = codex ] || echo "$n"; done)
-  TOOLS="$TOOLS session_bus bus_nudge reflect_lock append_memory_index memory_index_lint \
-         boot_budget memory_hygiene_canary nightly_check launch_agents notes_config"
+  TOOLS="$TOOLS_ALL"
 fi
+# Codex has no Claude install behind it, so --codex links the full command set.
+if [ "$CODEX" = 1 ]; then TOOLS="$TOOLS_ALL"; fi
 
 # In a terminal (or with --yes) every step asks first; otherwise links are made as before and
 # the two edits are printed for a by-hand paste.
@@ -123,6 +128,27 @@ ask() {  # ask QUESTION: 0 on a yes. --yes answers yes; no answer means no.
   printf '%s [y/N] ' "$1"
   read -r answer || answer=""
   case "$answer" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+count() { set -- $1; echo $#; }
+
+# link_commands: symlink each command in $TOOLS into $BIN_DIR (one step, one question), then say
+# if $BIN_DIR is not on PATH. The one place both installs (Claude and --codex) link commands.
+link_commands() {
+  [ -n "$BIN_DIR" ] || return 0
+  if [ "$ASK" = 1 ]; then echo; echo "Commands to link into $(tilde "$BIN_DIR"): $TOOLS"; fi
+  if [ "$ASK" = 0 ] || ask "Link these $(count "$TOOLS") commands?"; then
+    run mkdir -p "$BIN_DIR"
+    for tool in $TOOLS; do
+      [ -f "$REPO/bin/$tool.py" ] && link "$REPO/bin/$tool.py" "$BIN_DIR/$tool"
+    done
+    case ":$PATH:" in
+      *":$BIN_DIR:"*) ;;
+      *) echo "Note: $(tilde "$BIN_DIR") is not on your PATH; add it (for example export PATH=\"$(tilde "$BIN_DIR"):\$PATH\" in your shell profile) so the commands resolve." ;;
+    esac
+  else
+    echo "Skipped the commands."
+  fi
 }
 
 # shq WORD: WORD quoted so it pastes back into a shell, spaces and all.
@@ -213,6 +239,35 @@ if [ "$CODEX" = 1 ]; then
     done
   else
     echo "Skipped the skills."
+  fi
+
+  # The commands the standing rules and AGENTS.md name (wt, handoff_session, session_peers, bcast,
+  # session_bus, bus_nudge ...). Without --bin-dir nothing is linked, as on the Claude path.
+  echo
+  if [ -z "$BIN_DIR" ]; then
+    echo "Commands not linked: pass --bin-dir DIR (a directory on your PATH, for example ~/.local/bin)"
+    echo "to link $TOOLS there."
+  fi
+  link_commands
+
+  # Runtime state (bus mailbox, pane registry, locks) defaults to ~/.claude/session-notes/state.
+  # With no Claude home on this machine, pin it under $XDG_STATE_HOME (~/.local/state) in the
+  # session-notes config instead, so Codex never makes a ~/.claude. Decided here, once, never at
+  # runtime; an explicit state_dir is left alone and a Claude Code machine pins nothing.
+  echo
+  if PIN=$(python3 "$REPO/bin/notes_config.py" --pin-state-dir --dry-run 2>&1); then
+    echo "State directory: $PIN"
+    case $PIN in
+      "would pin"*)
+        if [ "$DRY" = 1 ]; then :
+        elif [ "$ASK" = 1 ]; then
+          if ask "Pin it (keeping a .bak-session-notes copy of an existing config)?"; then
+            python3 "$REPO/bin/notes_config.py" --pin-state-dir || echo "Failed (see above)."
+          else echo "Skipped; state will be kept under the default ~/.claude/session-notes/state."; fi
+        else echo "To apply: python3 $(shq "$REPO/bin/notes_config.py") --pin-state-dir"; fi ;;
+    esac
+  else
+    echo "State directory: not pinned ($PIN)"
   fi
 
   # The live-context file sits outside both agent homes; Codex may write it only if its
@@ -356,8 +411,6 @@ TXT
   exit 0
 fi
 
-count() { set -- $1; echo $#; }
-
 if [ "$ASK" = 1 ]; then
   echo "Skills to link into $(tilde "$SKILLS_DIR"): $(echo $SKILLS | sed 's/[^ ][^ ]*/\/&/g')"
 fi
@@ -370,17 +423,7 @@ else
   echo "Skipped the skills."
 fi
 
-if [ -n "$BIN_DIR" ]; then
-  [ "$ASK" = 1 ] && { echo; echo "Commands to link into $(tilde "$BIN_DIR"): $TOOLS"; }
-  if [ "$ASK" = 0 ] || ask "Link these $(count "$TOOLS") commands?"; then
-    run mkdir -p "$BIN_DIR"
-    for tool in $TOOLS; do
-      [ -f "$REPO/bin/$tool.py" ] && link "$REPO/bin/$tool.py" "$BIN_DIR/$tool"
-    done
-  else
-    echo "Skipped the commands."
-  fi
-fi
+link_commands
 
 PR="python3 $SHOWN/hooks/session_pane_registry.py"
 BUS="python3 $SHOWN/hooks/session_bus_hook.py"

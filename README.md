@@ -126,6 +126,13 @@ bus for scripts, a clock hook and an example guard hook), described in
 `bin/wt.py` gives any git repo a worktree per change and a PR that merges only on a recorded
 review verdict, green CI and the user's own yes (also in docs/tools.md).
 
+## Codex only
+
+No Claude Code on the machine? `sh install.sh --codex --bin-dir ~/.local/bin` is the whole install:
+the four Codex skills, the commands (`wt`, `handoff_session`, `session_peers`, `bcast`, `session_bus`,
+`bus_nudge`, ...) linked into `--bin-dir` (put it on your `PATH`), the hooks and the standing rules.
+It never creates `~/.claude`. Details in [docs/codex.md](docs/codex.md).
+
 ## Works with Codex
 
 The memory loop also runs in OpenAI Codex, in the CLI and the desktop app.
