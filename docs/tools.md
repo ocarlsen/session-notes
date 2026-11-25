@@ -162,7 +162,7 @@ authorize a merge. The session ends its reply with a final sentence that IS the 
 `merge #N?`, optionally after a short lead-in ending in `:` or followed by ` in owner/repo`, with
 no other `#N` and no negation in it. The user answers a bare yes (yes, y, yep, yeah, ok, go, do
 it, merge it) or types `merge #N`. The `hooks/merge_consent.py` UserPromptSubmit hook (Claude Code
-and Codex) records that human prompt in `~/.claude/session-notes/state/merge-consent/grants.json`
+and Codex) records that human prompt in `~/.local/state/session-notes/merge-consent/grants.json`
 (the passwd home of the user and a fixed path: `$HOME`, `SESSION_NOTES_CONFIG` and the configured
 state dir do not move it): repo, PR number, time, the prompt verbatim, the session. A yes counts
 only when the previous reply's final sentence is that ask and no human prompt came after the
@@ -197,7 +197,7 @@ command parser, not a sandbox. Known limits, left open on purpose:
 - `cp -R <tree>/ <state dir>` copies the CONTENTS of a source that ends in `/`, so a purpose-built
   tree plants files in the grant store (same class as `rsync`).
 - The guard judges the path a command names. It follows no variable or directory change reliably:
-  `cd "$HOME/.claude/session-notes/state/merge-consent" && echo ... > grants.json`, and `mkdir -p`
+  `cd "$HOME/.local/state/session-notes/merge-consent" && echo ... > grants.json`, and `mkdir -p`
   of that directory followed by a `cd` into it and a relative redirect, both write the file.
 - A session can type into its own pane (`tmux send-keys`), set `CLAUDE_CODE_ENTRYPOINT` before a
   headless run, or start `claude --resume <id> "merge #N"` or `codex exec resume <id> "merge #N"`;

@@ -1665,9 +1665,9 @@ def selftest():
         # B3: the $HOME spelling, a parent directory, a hard link
         rel = os.path.relpath(gfile, pwhome)
         for cmd in ('echo x > "$HOME/%s"' % rel, "echo x > ${HOME}/%s" % rel, "tee $HOME/%s" % rel,
-                    "mv $HOME/.claude/session-notes/state $HOME/.claude/session-notes/state.x",
-                    "mv " + os.path.dirname(gdir) + " /tmp/gone", "rm -rf " + os.path.join(pwhome, ".claude"),
-                    "mv " + os.path.join(pwhome, ".claude") + " /tmp/gone2", "rm -rf ~/.claude/session-notes",
+                    "mv $HOME/.local/state/session-notes $HOME/.local/state/session-notes.x",
+                    "mv " + os.path.dirname(gdir) + " /tmp/gone", "rm -rf " + os.path.join(pwhome, ".local", "state"),
+                    "mv " + os.path.join(pwhome, ".local") + " /tmp/gone2", "rm -rf ~/.local/state/session-notes",
                     "cp -r /tmp/forged " + gdir, "cp /tmp/forged " + gdir + "/", "ln " + gfile + " /tmp/hl",
                     "ln -f " + gfile + " /tmp/hl2", "ln -s " + gdir + " /tmp/sl", "ln /tmp/x " + gfile):
             r = bash_p(cmd, tmp)
@@ -1675,14 +1675,18 @@ def selftest():
         for cmd in ("mv /tmp/a /tmp/b", "rm -f /tmp/zzz-not-protected", "ln -s /tmp/a /tmp/b",
                     "cp -r " + os.path.join(pwhome, ".claude") + " /tmp/backup-claude"):
             check("B3 control passes: " + cmd, passed(bash_p(cmd, tmp)))
+        # the store is agent-neutral: ~/.claude is no longer its ancestor (Arm A may still refuse it)
+        for cmd in ("rm -rf ~/.claude/session-notes", "mv ~/.claude /tmp/x"):
+            r = bash_p(cmd, tmp)
+            check("grant store is not under ~/.claude: " + cmd, "grant store" not in r.stderr, r.stderr)
         # R2: a copy, move or link INTO a directory above the grant dir is judged by its computed target
         for cmd, where in (("cp report.html ~/", tmp), ("cp report.html ~", tmp), ("mv build.log ~", tmp),
                            ("ln -s /opt/tool/bin/tool ~/", tmp), ("mv Downloads/a.pdf .", pwhome),
                            ("cp /tmp/x .", pwhome), ("cp notes.md ..", os.path.join(pwhome, "Projects")),
                            ("cp x.txt /", tmp),
-                           ("cp /tmp/x.json ~/.claude/session-notes/state/", tmp)):
+                           ("cp /tmp/x.json ~/.local/state/session-notes/", tmp)):
             check("R2 control passes: %s (cwd %s)" % (cmd, os.path.basename(where)), passed(bash_p(cmd, where)))
-        for cmd in ("mv /tmp/state ~/.claude/session-notes/", "cp -r /tmp/state ~/.claude/session-notes/", "rm -rf /", "rm -rf ~", "rm -rf ."):
+        for cmd in ("mv /tmp/merge-consent ~/.local/state/session-notes/", "cp -r /tmp/merge-consent ~/.local/state/session-notes/", "rm -rf /", "rm -rf ~", "rm -rf ."):
             r = bash_p(cmd, pwhome)
             check("R2 still refused: " + cmd, refused(r) and "grant store" in r.stderr, r.stderr)
         r = bash_p("rm -rf /", tmp)

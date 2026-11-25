@@ -35,7 +35,7 @@ The grant records the repo, resolved in this order: owner/repo of the session cw
 one `owner/repo` or github PR URL the reply's final paragraph names; the one git checkout child of
 a configured scope root that the cwd is (its `origin` on github). When none resolves the repo is
 null and `wt merge` REFUSES that grant (it never matches by PR number alone). Also the PR number, the time, the user's
-prompt verbatim and the session id, in `~/.claude/session-notes/state/merge-consent/grants.json` under the passwd home of the user
+prompt verbatim and the session id, in `~/.local/state/session-notes/merge-consent/grants.json` under the passwd home of the user
 (never $HOME, never the config). checkout_guard refuses the ordinary ways an agent could write it. `wt.py` imports this module for the
 grant lookup, so the format has one definition.
 
@@ -73,7 +73,7 @@ def _cfg(cfg=None):
 # Test-only: a selftest patches this module constant in-process. It is never read from the
 # environment or the config, so no variable on a command line can move the grant store.
 GRANTS_PATH_OVERRIDE = None
-GRANTS_REL = (".claude", "session-notes", "state", "merge-consent", "grants.json")
+GRANTS_REL = (".local", "state", "session-notes", "merge-consent", "grants.json")
 
 
 def grants_path():
