@@ -28,8 +28,15 @@ What a staged change can be:
                                  hashes to SHA (`codex_save.py hash --store ...` prints it);
                                  otherwise commit skips it and says to re-read and restage.
 
-Everything resolves under the Codex store (notes_config in codex mode); a path outside it,
-a name with a slash, or MEMORY.md/REFERENCE.md as a --file is refused at stage time.
+Everything resolves under the Codex store (notes_config in codex mode), or under the shared
+store root (paths.shared_stores_dir) for a scope that opted in with `shared_store = true`: that
+scope's project store is the same folder Claude reads and writes. A path outside both, a name
+with a slash, or MEMORY.md/REFERENCE.md as a --file is refused at stage time.
+A --resume write that would leave RESUME.md over its budget (boot_budget's resume_bytes) is
+refused by resume_guard at stage time and again at commit: move finished items to
+RESUME-archive.md first. `--harness claude|codex` on --file stamps `harness:` frontmatter and on
+--index-line prefixes the hook with `[harness]`, so the other agent knows to skip what does not
+apply to it (absent = applies to all).
 Commit needs CODEX_THREAD_ID (set by Codex for every command) to find its own queue.
 
     codex_save.py stage --store global --file feedback_x.md < body.md
@@ -55,6 +62,8 @@ import notes_config  # noqa: E402
 import append_memory_index  # noqa: E402
 import memory_index_lint  # noqa: E402
 import reflect_lock  # noqa: E402
+import resume_guard  # noqa: E402
+import shared_store  # noqa: E402
 
 LOCK_TIMEOUT = 15 * 60
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
@@ -86,10 +95,17 @@ def resolve_store(which, cwd=None):
     if not path:
         raise SaveError("no project store for %s (not in a configured scope or a git repo);"
                         " use --store global" % (cwd or os.getcwd()))
-    base = os.path.join(cfg["agent"]["codex_home"], "session-notes")
-    if not notes_config._under(path, base):
-        raise SaveError("store %s is outside %s" % (path, base))
+    check_root(path, cfg)
     return path
+
+
+def check_root(path, cfg):
+    """A store must sit under the Codex home's session-notes folder or the shared stores root;
+    anything else is refused."""
+    base = os.path.join(cfg["agent"]["codex_home"], "session-notes")
+    shared = cfg["paths"]["shared_stores_dir"]
+    if not (notes_config._under(path, base) or notes_config._under(path, shared)):
+        raise SaveError("store %s is outside %s and the shared stores root %s" % (path, base, shared))
 
 
 def file_hash(path):
@@ -100,18 +116,48 @@ def file_hash(path):
         return "absent"
 
 
+HARNESSES = shared_store.HARNESSES
+
+
+def _new_resume_text(content):
+    return content if content.endswith("\n") else content + "\n"
+
+
+def guard_resume(path, content):
+    """Refuse (SaveError) a RESUME.md write that leaves it over budget (resume_guard)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            old = fh.read()
+    except FileNotFoundError:
+        old = ""
+    msg = resume_guard.check_write(path, old, _new_resume_text(content))
+    if msg:
+        raise SaveError(msg)
+
+
 def stage(args, content):
     store = resolve_store(args.store)
     item = {"store": store, "ts": time.time()}
+    harness = getattr(args, "harness", None)
+    if harness and not (args.file or args.index_line):
+        raise SaveError("--harness goes with --file or --index-line")
     if args.file:
         if not _NAME_RE.match(args.file) or args.file in ("MEMORY.md", "REFERENCE.md", "RESUME.md"):
             raise SaveError("--file must be a plain NAME.md (not MEMORY.md, REFERENCE.md or"
                             " RESUME.md; use --index-line or --resume): %r" % args.file)
         if not content.strip():
             raise SaveError("--file needs the memory body on stdin")
-        item.update(kind="file", name=args.file, content=content)
+        try:
+            labeled = shared_store.with_harness(content, harness)
+        except ValueError as exc:
+            raise SaveError("%s: %s" % (args.file, exc)) from None
+        item.update(kind="file", name=args.file, content=labeled)
     elif args.index_line:
         line = args.index_line.strip()
+        if harness:
+            if not shared_store._INDEX_RE.match(line):
+                raise SaveError("--harness needs an index line shaped `- [Title](file.md) - hook`")
+            line = shared_store.label_index_line(line, harness)
         # Refuse an over-cap line now, while the model can still shorten it.
         result = memory_index_lint.check_line(line)
         if not result["ok"]:
@@ -122,6 +168,7 @@ def stage(args, content):
             raise SaveError("--resume needs --base (from `codex_save.py hash --store ...`)")
         if not content.strip():
             raise SaveError("--resume needs the whole new RESUME.md on stdin")
+        guard_resume(os.path.join(store, "RESUME.md"), content)
         item.update(kind="resume", base=args.base, content=content)
     else:
         raise SaveError("stage needs one of --file, --index-line, --resume")
@@ -146,9 +193,7 @@ def _atomic_write(path, text):
 def apply_item(item):
     """Apply one staged change. Returns a one-line report."""
     store = item["store"]
-    base = os.path.join(notes_config.load()["agent"]["codex_home"], "session-notes")
-    if not notes_config._under(store, base):
-        raise SaveError("staged store %s is outside %s" % (store, base))
+    check_root(store, notes_config.load())
     if item["kind"] == "file":
         path = os.path.join(store, item["name"])
         _atomic_write(path, item["content"])
@@ -164,6 +209,7 @@ def apply_item(item):
         if now != item["base"]:
             return ("SKIPPED %s: it changed since you read it (another session wrote it);"
                     " re-read it, merge, and stage --resume again" % path)
+        guard_resume(path, item["content"])
         _atomic_write(path, item["content"])
         return "wrote %s" % path
     raise SaveError("unknown staged kind %r" % item.get("kind"))
@@ -231,6 +277,7 @@ def main(argv=None):
     g.add_argument("--resume", action="store_true")
     s.add_argument("--base")
     s.add_argument("--pin", action="store_true")
+    s.add_argument("--harness", choices=HARNESSES)
     h = sub.add_parser("hash")
     h.add_argument("--store", choices=["global", "project"], required=True)
     sub.add_parser("commit")

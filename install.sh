@@ -460,7 +460,8 @@ $(hook "$BUS")
     {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "$PR"}]}
   ],
   "PreToolUse": [
-    {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "hooks": [{"type": "command", "command": "python3 $SHOWN/hooks/checkout_guard.py"}]}
+    {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "hooks": [{"type": "command", "command": "python3 $SHOWN/hooks/checkout_guard.py"}]},
+    {"matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{"type": "command", "command": "python3 $SHOWN/hooks/resume_size_guard.py"}]}
   ]$EXTRA_EVENTS
 }
 EOF

@@ -6,7 +6,8 @@
 [agent]
 # Which agent these tools serve: "claude" or "codex". $SESSION_NOTES_AGENT overrides
 # it per process; install.sh --codex sets that variable for Codex, so one config file
-# serves both agents. The two keep separate memories: in codex mode every store and
+# serves both agents. The two keep separate memories (except a scope with
+# `shared_store = true`, which has one store for both): in codex mode every store and
 # the state dir live under <codex_home>/session-notes/, the [paths] stores below and a
 # scope's `store` are ignored, and a path under claude_home is refused.
 kind = "claude"
@@ -26,6 +27,9 @@ state_dir = "~/.claude/session-notes/state"
 # The global memory store. Empty = ~/.claude/projects/<your encoded home>/memory,
 # the folder Claude Code already uses for sessions started in your home dir.
 global_store = ""
+# Where the shared per-scope stores live: one folder per scope slug, for scopes with
+# `shared_store = true`. Data, outside every agent's home.
+shared_stores_dir = "~/.local/share/session-notes/stores"
 # Where nightly_check.py records its last run (read by `nightly_check.py status`).
 # Empty = <state_dir>/last-check.json, which stays put in codex mode so every agent
 # reads the same file.
@@ -142,6 +146,11 @@ max_chars = 240
 # #   "own": reads and writes ONLY `live_file` (an isolated scope with its own file).
 # #   "none": isolated; reads nothing, writes nothing.
 # live = "shared"
+# # Optional, default false: ONE memory store for this scope shared by Claude and Codex, at
+# # <shared_stores_dir>/<slug> (see docs/tools.md, "Shared store"). Refused with a non-shared
+# # `live` and with `store`. Claude reads it through autoMemoryDirectory in the scope's
+# # .claude/settings.local.json: `bin/shared_store.py settings-line --scope NAME` prints the line.
+# shared_store = false
 # # Required with live = "own", refused otherwise. Relative to root. A `<file>.lock` sits beside
 # # it, so inside a repo gitignore both, or put the file outside the tree.
 # live_file = ""
