@@ -54,8 +54,13 @@ def _read(path):
         return ""
 
 
-def build_context(cwd, cfg=None):
-    """The additionalContext text for cwd, or "" when the stores hold nothing."""
+def plan_context(cwd, cfg=None):
+    """(text, entries) for cwd. text is the additionalContext (what build_context returns);
+    entries is one dict per candidate file in the hook's own order: path, label, chars
+    (len of the text, the unit the cap counts), bytes, status ("loaded" or "dropped"),
+    reason. The live block, when it prints, is the last entry (status "loaded", or
+    "truncated" when older entries were cut). boot_budget.py reads this to report what a
+    Codex session loads; the packing lives only here."""
     cfg = cfg or notes_config.load()
     stores = notes_config.stores_for(cwd, cfg)
     cap = cfg["agent"]["codex_boot_bytes"]
@@ -69,6 +74,7 @@ def build_context(cwd, cfg=None):
             if text:
                 files.append((label, path, text))
     parts = []
+    entries = []
     if files:
         parts.append(HEADER)
         if stores["project"]:
@@ -76,15 +82,23 @@ def build_context(cwd, cfg=None):
     used = sum(len(p) + 2 for p in parts)
     for label, path, text in files:
         block = "## %s %s (%s)\n\n%s" % (label, os.path.basename(path), path, text)
+        left = cap - used - 2
+        entry = {"path": path, "label": label, "chars": len(text),
+                 "bytes": len(text.encode("utf-8"))}
         if used + len(block) + 2 <= cap:
             parts.append(block)
             used += len(block) + 2
+            entry.update(status="loaded", reason="")
         else:
             line = ("## %s %s (%s): %d bytes, over the boot budget, NOT loaded. "
                     "Read it before relying on memory." % (label, os.path.basename(path),
                                                             path, len(text.encode("utf-8"))))
             parts.append(line)
             used += len(line) + 2
+            entry.update(status="dropped",
+                         reason="needs %d chars, %d left of the %d cap" % (
+                             len(block) + 2, max(left, 0), cap))
+        entries.append(entry)
     try:
         block = live.render(cwd, cfg, budget=cap - used - 2)
     except Exception:
@@ -92,7 +106,24 @@ def build_context(cwd, cfg=None):
         _trace("live")
     if block:
         parts.append(block)
-    return "\n\n".join(parts)
+        trunc = "older entries not shown" in block
+        entries.append({"path": live_path(cwd, cfg), "label": "live", "chars": len(block),
+                        "bytes": len(block.encode("utf-8")),
+                        "status": "truncated" if trunc else "loaded",
+                        "reason": "older live entries cut to fit" if trunc else ""})
+    return "\n\n".join(parts), entries
+
+
+def live_path(cwd, cfg):
+    try:
+        return live.scope_for(cwd, cfg)[2]
+    except Exception:
+        return ""
+
+
+def build_context(cwd, cfg=None):
+    """The additionalContext text for cwd, or "" when the stores hold nothing."""
+    return plan_context(cwd, cfg)[0]
 
 
 def _trace_dir():
@@ -129,6 +160,11 @@ def main():
     except Exception:
         _trace()
     return 0
+
+
+# build_context output captured from the pre-refactor hook on the fixture in selftest()
+# (paths and time stamps normalized); plan_context must keep printing exactly this.
+GOLDEN_BEFORE_REFACTOR = 'session-notes memory for this Codex session (loaded at session start, from the Codex store; it does not update mid-session: run $refresh to re-read it).\n\nProject store: <D>/codex/session-notes/projects/SLUG (root <D>/repo)\n\n## global MEMORY.md (<D>/codex/session-notes/global/MEMORY.md)\n\n# Memory Index\n\n- [Prefers tabs](user_tabs.md) - tabs\n\n## global RESUME.md (<D>/codex/session-notes/global/RESUME.md): 5000 bytes, over the boot budget, NOT loaded. Read it before relying on memory.\n\n## project RESUME.md (<D>/codex/session-notes/projects/SLUG/RESUME.md)\n\n# RESUME\n\n- parser fix shipped\n\nLive context (newest first, from <D>/live/l.md; loaded at session start, re-read with live.py show):\n- TS [repo] event number 29 with padding text to take room\n- TS [repo] event number 28 with padding text to take room\n- TS [repo] event number 27 with padding text to take room\n- TS [repo] event number 26 with padding text to take room\n- TS [repo] event number 25 with padding text to take room\n- TS [repo] event number 24 with padding text to take room\n- TS [repo] event number 23 with padding text to take room\n- TS [repo] event number 22 with padding text to take room\n- TS [repo] event number 21 with padding text to take room\n(21 older entries not shown)'
 
 
 def selftest():
@@ -216,6 +252,41 @@ def selftest():
         wtext = build_context(cwt, cfg)
         check("isolated scope's worktree: nothing from the shared file",
               "event number" not in wtext and "Live context" not in wtext)
+    with tempfile.TemporaryDirectory() as d:  # golden fixture: same files as the capture
+        import re
+        d = os.path.realpath(d)
+        cf = os.path.join(d, "c.toml")
+        with open(cf, "w") as fh:
+            fh.write('[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
+                     '[live]\npath = "%s/live/l.md"\n'
+                     '[agent]\ncodex_home = "%s/codex"\ncodex_boot_bytes = 2000\n' % (d, d, d, d))
+        gcfg = notes_config.load(cf)
+        grepo = os.path.join(d, "repo")
+        os.makedirs(grepo)
+        subprocess.run(["git", "init", "-q", grepo], check=True)
+        gg = gcfg["paths"]["global_store"]
+        gp = notes_config.codex_project_store(grepo, gcfg["agent"]["codex_home"])
+        os.makedirs(gg)
+        os.makedirs(gp)
+        for path, body in ((os.path.join(gg, "MEMORY.md"),
+                            "# Memory Index\n\n- [Prefers tabs](user_tabs.md) - tabs\n"),
+                           (os.path.join(gg, "RESUME.md"), "x" * 5000),
+                           (os.path.join(gp, "RESUME.md"), "# RESUME\n\n- parser fix shipped\n")):
+            with open(path, "w") as fh:
+                fh.write(body)
+        for i in range(30):
+            live.add(grepo, "event number %d with padding text to take room" % i, gcfg)
+        gtext = build_context(grepo, gcfg)
+        norm = re.sub(r"\d{4}-\d{2}-\d{2} [0-9:]{5} [A-Z]+", "TS",
+                      gtext.replace(os.path.basename(gp), "SLUG").replace(d, "<D>"))
+        check("output byte-identical to the pre-refactor hook on a fixture",
+              norm == GOLDEN_BEFORE_REFACTOR)
+        ptext, ents = plan_context(grepo, gcfg)
+        check("plan_context entries: hook order, dropped file named, live last",
+              [(os.path.basename(e["path"]), e["status"]) for e in ents][:3]
+              == [("MEMORY.md", "loaded"), ("RESUME.md", "dropped"), ("RESUME.md", "loaded")]
+              and ents[-1]["label"] == "live" and ents[-1]["status"] == "truncated"
+              and ptext == gtext)
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 

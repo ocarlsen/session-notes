@@ -342,12 +342,19 @@ match the rule and falls back to an approval prompt.
 - `memory_hygiene_canary.py` checks Codex's own stores in codex mode (index and
   files agree, frontmatter, index size). Its `@import` checks are Claude Code
   only and are skipped. A store Codex has not saved to yet is not reported.
-- Two checks are Claude Code only and print a one-line skip in codex mode:
-  `boot_budget.py` (it measures Claude Code's boot prefix; the Codex hook caps
-  its own output instead, and Codex has no budget check yet) and
-  `skill_feedback.py canary` (Codex documents its transcript format as unstable).
-- `nightly_check.py` runs the canary once per installed agent, each against its
-  own stores, plus `boot_budget.py check` for Claude. On macOS,
+- `skill_feedback.py canary` is Claude Code only and prints a one-line skip in codex
+  mode (Codex documents its transcript format as unstable).
+- `boot_budget.py --agent codex report` (or `check`, or plain `report` with
+  `SESSION_NOTES_AGENT=codex`) measures what a Codex session loads at start, per
+  configured scope: the AGENTS.md chain (global file, then the project files from the git
+  root down to the scope root) against `project_doc_max_bytes` from `config.toml` (32,768
+  bytes by default; that cap counts bytes), and what the SessionStart hook prints against
+  `agent.codex_boot_bytes` (that cap is compared with the text's length in characters).
+  Every file is listed as loaded, truncated or dropped, with the reason. `check` is silent
+  when everything fits and exits 1 with one `FILE` or `SCOPE` line per dropped or truncated
+  file otherwise. `check-file` stays Claude only.
+- `nightly_check.py` runs the canary and `boot_budget.py check` once per installed agent,
+  each against its own stores. On macOS,
   `launch_agents.py install nightly-check` runs it every night.
 - Without the rule from install step 6, the desktop app asks once per save,
   for `codex_save.py commit`. "Allow similar commands" on that prompt saves

@@ -448,6 +448,7 @@ cp -R examples /tmp/notes-demo              # play on a copy; the checkout stays
 export SESSION_NOTES_CONFIG=/tmp/notes-demo/config.toml
 python3 bin/notes_config.py                 # the resolved config
 python3 bin/boot_budget.py report           # what loads at boot, against budgets
+python3 bin/boot_budget.py --agent codex report  # the same for a Codex session
 python3 bin/memory_hygiene_canary.py        # silent and exit 0 = store is consistent
 python3 bin/append_memory_index.py --scope recipes-app \
   "- [Fractions parse exactly](project_fractions.md) - use Fraction, never float"
