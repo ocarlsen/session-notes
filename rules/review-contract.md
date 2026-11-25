@@ -46,7 +46,11 @@ them.
 
 ## Merging
 Rebase onto the default branch and run the checks BEFORE asking for review, so the approved sha is
-the one that merges. A build the user ordered merges on that APPROVE. If the default branch moves
+the one that merges. On that APPROVE the session ends its
+reply with a question naming exactly one PR, `merge #N?`, and runs `wt merge` only after the user
+answers yes (or types `merge #N`). A hook records that human prompt as the authorization (30
+minutes, that PR, once); an APPROVE alone merges nothing, and a session that merges without the
+user's yes is outside the contract. A failing or pending CI check also blocks `wt merge`. If the default branch moves
 and a rebase is needed after the verdict, the head sha changes and the change needs a fresh
 verdict from the reviewer. The session posts only the verdict the reviewer returned, never one
 of its own. Anything whose acceptance needs a live run the user types (for example a Codex

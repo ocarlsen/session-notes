@@ -854,6 +854,15 @@ def make_origin_repo(parent, name, env):
     return main
 
 
+WT_TEST_LAUNCH = (
+    "import importlib.util, sys\n"
+    "p, g = sys.argv[1], sys.argv[2]\n"
+    "spec = importlib.util.spec_from_file_location('wt_under_test', p)\n"
+    "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+    "m.merge_consent.GRANTS_PATH_OVERRIDE = g\n"
+    "sys.exit(m.main(sys.argv[3:]))\n")
+
+
 def wt_row(wt_py, tmp):
     """wt new / pr / merge against a local bare origin with a stubbed gh. (status, detail)."""
     home = os.path.join(tmp, "wthome")
@@ -871,7 +880,10 @@ def wt_row(wt_py, tmp):
     env.update(SESSION_NOTES_CONFIG=cfg, WT_GH=gh)
     try:
         main = make_origin_repo(tmp, "proj", env)
-        wt = [sys.executable, wt_py]
+        # the grant file lives at a fixed path under the passwd home; the launcher points this
+        # run at a temp path by patching the module constant in-process (no env var can)
+        grants = os.path.join(tmp, "grants", "grants.json")
+        wt = [sys.executable, "-c", WT_TEST_LAUNCH, wt_py, grants]
         r = sh(wt + ["new", "feat"], main, env)
         path = r.stdout.strip().splitlines()[-1]
         with open(os.path.join(path, "tracked.txt"), "a") as fh:
@@ -882,6 +894,19 @@ def wt_row(wt_py, tmp):
             return FAIL, "wt pr failed rc=%d: %s" % (r.returncode, (r.stderr or r.stdout)[-200:])
         head = sh(["git", "rev-parse", "HEAD"], path, env).stdout.strip()
         view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7"}
+
+
+        def grant(on):
+            """The user's yes to `merge #7` for o/r, as hooks/merge_consent.py records it."""
+            if os.path.exists(grants):
+                os.remove(grants)
+            if on:
+                os.makedirs(os.path.dirname(grants), exist_ok=True)
+                with open(grants, "w") as fh:
+                    json.dump({"grants": [{"repo": "o/r", "pr": 7, "ts": time.time(), "prompt": "yes",
+                                           "session": "s", "used": False}]}, fh)
+
+        grant(True)
 
         def scenario(comments):
             with open(os.path.join(stubdir, "scenario.json"), "w") as fh:
@@ -901,6 +926,9 @@ def wt_row(wt_py, tmp):
         if r2.returncode != 6:
             return FAIL, "merge with a stale-sha verdict: rc=%d (want 6)" % r2.returncode
         scenario([comment("APPROVE", head)])
+        grant(False)
+        r3a = sh(wt + ["merge", "feat", "--dry-run"], path, env, check=False)
+        grant(True)
         r3 = sh(wt + ["merge", "feat", "--dry-run"], path, env, check=False)
         with open(os.path.join(stubdir, "gh-calls.jsonl")) as fh:
             calls = [json.loads(x) for x in fh.read().splitlines()]
@@ -912,11 +940,14 @@ def wt_row(wt_py, tmp):
         if r3.returncode != 0 or "verdict gate passed" not in r3.stdout:
             return FAIL, "positive control (APPROVE at head) did not pass the gate: rc=%d %s" % (
                 r3.returncode, (r3.stderr or r3.stdout)[-160:])
+        if r3a.returncode != 7 or "merge #7?" not in r3a.stderr:
+            return FAIL, "APPROVE at head with NO user grant was not refused with rc 7: rc=%d %s" % (
+                r3a.returncode, (r3a.stderr or r3a.stdout)[-160:])
         if merged:
             return FAIL, "gh pr merge was called during a refused or dry-run merge: %r" % merged
         if not any(c[:2] == ["pr", "create"] for c in calls):
             return FAIL, "wt pr never called gh pr create"
-        return PASS, "no verdict rc6, stale sha rc6, APPROVE at head passes the gate, no pr merge call"
+        return PASS, "no verdict rc6, stale sha rc6, APPROVE without a grant rc7, APPROVE with a grant passes the gate, no pr merge call"
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         return FAIL, "wt row error: %s" % exc
 
@@ -1195,6 +1226,7 @@ def selftest():
             fh.write(src.replace(sentinel, "    return True, 'mutated'\n" + sentinel, 1))
         sys.path_importer_cache.clear()
         shutil.copytree(os.path.join(SRC_REPO, "bin"), os.path.join(d, "binc"))
+        shutil.copytree(os.path.join(SRC_REPO, "hooks"), os.path.join(d, "hooks"))
         shutil.copy(broken, os.path.join(d, "binc", "wt.py"))
         r2 = os.path.join(d, "r2")
         os.makedirs(r2)
@@ -2774,7 +2806,8 @@ class Live:
         os.makedirs(home, exist_ok=True)
         env = git_env(home)
         env.update(SESSION_NOTES_CONFIG=cfg, WT_GH=os.path.join(self.bin, "gh"))
-        wt = [sys.executable, os.path.join(self.repo, "bin", "wt.py")]
+        grants = os.path.join(parent, "grants", "grants.json")  # see WT_TEST_LAUNCH
+        wt = [sys.executable, "-c", WT_TEST_LAUNCH, os.path.join(self.repo, "bin", "wt.py"), grants]
         main = make_origin_repo(parent, "proj", env)
         path = sh(wt + ["new", "feat"], main, env).stdout.strip().splitlines()[-1]
         with open(os.path.join(path, "tracked.txt"), "a") as fh:
@@ -2792,7 +2825,7 @@ class Live:
             os.remove(os.path.join(self.ghdir, "posted.jsonl"))
         except OSError:
             pass
-        return {"path": path, "head": head, "env": env, "wt": wt}
+        return {"path": path, "head": head, "env": env, "wt": wt, "grants": grants}
 
     def trust_path(self, path):
         """Pre-trust a directory created mid-run, in the sandbox's Claude and Codex configs."""
@@ -2851,6 +2884,11 @@ class Live:
             return FAIL, "the verdict names sha %s, not the PR head %s" % (m.group(2)[:10], pr["head"][:10]), "review-%s.txt" % cli
         if m.group(1) != "APPROVE":
             return FAIL, "the reviewer returned CHANGES on a one line correct change (marker and sha were well formed)", "review-%s.txt" % cli
+        # the user's yes to `merge #7?` (the review itself needs none), as hooks/merge_consent.py records it
+        os.makedirs(os.path.dirname(pr["grants"]), exist_ok=True)
+        with open(pr["grants"], "w") as fh:
+            json.dump({"grants": [{"repo": "o/r", "pr": 7, "ts": time.time(), "prompt": "yes",
+                                   "session": "s", "used": False}]}, fh)
         g = sh(pr["wt"] + ["merge", "feat", "--dry-run"], pr["path"], pr["env"], check=False)
         self.log("review-%s.txt" % cli, "wt merge --dry-run rc=%d\n%s\n%s\n" % (g.returncode, g.stdout, g.stderr))
         if g.returncode != 0 or "verdict gate passed" not in g.stdout:

@@ -93,7 +93,7 @@ fixed line (never the message) into its empty input box. Codex panes started wit
 | Skill feedback | `bin/skill_feedback.py`; a ledger `<claude_home>/skill-feedback/<skill>.jsonl` per skill | Logs how the user corrects a skill's own output (edit / reject / approve, quoted verbatim), captured by `/reflect` (Step 2b). `propose` groups unresolved rows by habit and reports which have enough evidence (default: 3+ rows from 2+ sessions) to act on; it never edits a SKILL.md itself. `canary` prints the derived "N skills used, M rows logged" line. |
 | Session coordination | `bin/session_peers.py`, `session_lineage.py`, `handoff_session.py`, `bcast.py`; `hooks/session_pane_registry.py` | List and peek at sibling sessions, launch a worker session and record who launched it, show the lineage tree, broadcast a line you type to every session. |
 | Bus | `bin/session_bus.py`, `bus_nudge.py`; `hooks/session_bus_hook.py` | Staged specs and mail from scripts, addressed by tmux session name, delivered at least once; wake idle recipients. |
-| Worktrees | `bin/wt.py`, `githooks/pre-commit` | A worktree per change, a PR that merges only on a review verdict, and a staged-content pre-commit. See the `wt` section below. |
+| Worktrees | `bin/wt.py`, `githooks/pre-commit`, `hooks/merge_consent.py` | A worktree per change, a PR that merges only on a review verdict, green CI and the user's yes, and a staged-content pre-commit. See the `wt` section below. |
 | Review | `bin/review.py`, `bin/test_edit_check.py`, `skills/review` | Prepares a fresh-context reviewer's prompt for a PR and posts its verdict as the comment `wt merge` reads. See the `review` section below. |
 | Environment | `bin/environment_render.py`, `templates/environment.md`, `templates/codex-auto-review-policy.md` | One private Markdown file describing your environment, rendered into Claude Code's `autoMode.environment` and Codex's `[auto_review] policy` (the pinned bundled policy with your entries inserted). `diff` shows the change, `apply` backs up and writes, `check` (run by `nightly_check.py`) reports drift, `upstream` reports when Codex's bundled policy changed. `apply --target codex` also allows `session_bus.py send` in `default.rules`. See `docs/codex.md`. |
 | Standing rules | `rules/core.md`, `rules/review-contract.md`, `bin/rules_block.py` | The rules every session follows, for both agents. `rules_block.py apply` writes them, with `AGENTS.snippet.md` and an optional private addendum (`rules.local` in the config), into a marked block in `~/.codex/AGENTS.md` that every `install.sh --codex` rewrites (a file with an older install of the snippet is migrated, and anything outside the markers is kept; each change keeps a timestamped backup, and only the newest 3 are kept); `claude-apply` adds `@import` lines to `~/.claude/CLAUDE.md`. `codex-defaults` and `profiles` set Codex's model and effort where unset and create `build` and `review` profiles. |
@@ -116,14 +116,14 @@ working tree.
 | --- | --- |
 | `wt.py new <name>` | Fetch, then `git worktree add <path> -b <name> origin/<default>`; prints the path. On a repo's first use it installs the pre-commit hook (below). |
 | `wt.py pr [--title T] [--body B] [--dry-run]` | From a worktree on a non-default branch: refuses a dirty tree (exit 4) and a branch that already has a MERGED PR (exit 5), then pushes and opens the PR. `--dry-run` prints the push and create commands and runs nothing. wt never auto-commits. |
-| `wt.py merge [name] [--dry-run]` | Refuses a dirty or unpushed worktree (4), runs the verdict gate (6), then squash-merges (pinned to the gated head with `--match-head-commit`, so a later push cannot slip in), removes the worktree and its local branch (kept, with a note, if it gained work since the gate), and fast-forwards the main checkout if it is on the default branch and clean. |
+| `wt.py merge [name] [--dry-run]` | Refuses a dirty or unpushed worktree (4), runs the verdict gate (6), the CI gate (8) and the user-consent gate (7), then squash-merges (pinned to the gated head with `--match-head-commit`, so a later push cannot slip in), removes the worktree and its local branch (kept, with a note, if it gained work since the gate), and fast-forwards the main checkout if it is on the default branch and clean. |
 | `wt.py list` | The repo's worktrees: dirty, commits ahead of origin, PR state (`?` offline). A worktree whose directory was deleted by hand shows as its own `missing` row; if it is really gone, `wt.py rm <name> --force` removes just that one record (without `--force` it is refused, exit 4). |
 | `wt.py rm <name> [--force]` | Removes a worktree and branch; refuses dirty work, or commits reachable from HEAD that are on no remote branch (a detached HEAD included), without `--force`. |
 | `wt.py gc [--yes]` | Lists worktrees whose PR is merged or closed, or whose remote branch is gone. Skips, and says why, any that is dirty or holds commits on no remote branch. Asks y/N per item on a terminal; `--yes` removes all listed; without a terminal and without `--yes` it only lists. A worktree whose directory is gone is only listed (never removed, even with `--yes`): it may sit on an unmounted volume. Run it by hand, never from a scheduled job. |
 | `wt.py install-hooks [repo] [--dry-run]` | Installs or repairs the pre-commit (below); `--dry-run` writes nothing (`sh install.sh --dry-run --git-hooks <repo>` does the same). |
 
 Exit codes: 1 usage or fatal, 2 not in a worktree, 3 token command failed, 4 dirty or unpushed,
-5 branch already merged, 6 verdict gate refused.
+5 branch already merged, 6 verdict gate refused, 7 no user consent, 8 CI gate refused.
 
 **Where a worktree goes**, first rule that applies: (1) the deepest `[[scopes]]` entry that
 contains the repo and sets `worktree_root` (relative to the scope root, or absolute):
@@ -152,9 +152,54 @@ A verdict comment that was edited after posting (its `updated_at` differs from `
 is not trusted: the gate refuses, and you post a fresh verdict comment and delete the edited one.
 `parse_verdict` and `verdict_line` in `wt.py` are the one definition of the format.
 
-**What the gate does and does not protect.** It stops other GitHub accounts from approving. It
-does not stop you: one login can author the code and post the APPROVE, and `$WT_GH` and
-`token_command` are trusted local configuration, so anyone who can change them can bypass it.
+**The CI gate.** After the verdict, `merge` reads the head sha's check runs and commit statuses.
+Any failing or still-running check refuses (8) and is named; no checks at all proceeds. A check
+that is also red on the base branch still blocks. A pending check is refused, not waited on:
+rerun when CI finishes.
+
+**The consent gate.** An APPROVE comment is something any session can post, so it does not
+authorize a merge. The session ends its reply with a final sentence that IS the ask:
+`merge #N?`, optionally after a short lead-in ending in `:` or followed by ` in owner/repo`, with
+no other `#N` and no negation in it. The user answers a bare yes (yes, y, yep, yeah, ok, go, do
+it, merge it) or types `merge #N`. The `hooks/merge_consent.py` UserPromptSubmit hook (Claude Code
+and Codex) records that human prompt in `~/.claude/session-notes/state/merge-consent/grants.json`
+(the passwd home of the user and a fixed path: `$HOME`, `SESSION_NOTES_CONFIG` and the configured
+state dir do not move it): repo, PR number, time, the prompt verbatim, the session. A yes counts
+only when the previous reply's final sentence is that ask and no human prompt came after the
+reply (a "no, rebase first" in between voids it); the previous reply is read from the Claude
+transcript or the Codex rollout. The first prompt of a session, bus nudges and bcast lines grant
+nothing. The repo comes from the cwd's `origin`, else the one `owner/repo` or PR URL the reply
+names, else the one github checkout under a configured scope root; a reply that names a repo
+other than the cwd's grants nothing; with none, `merge` refuses the grant and says to ask from
+inside the repo or name it (`merge #N in owner/repo?`).
+
+`merge` then requires an unexpired (30 minutes), unused grant for that repo and PR, and a newest
+APPROVE verdict whose GitHub `created_at` is EARLIER than the yes (a push after the yes needs a
+new review, then a new ask). It spends the grant (recording the head sha), posts
+`Merge authorized by the user: "<prompt>" (<time>)` on the PR, and merges; with no live grant it
+exits 7 telling the session to ask the user. `checkout_guard` refuses the ordinary ways an agent
+could write the grant directory (an edit, a redirect or `tee` naming the path, moving a parent
+directory, a hard link) and refuses to run or import the hook or to call the merge API directly
+(`gh api` PUT `pulls/N/merge`, a `mergePullRequest` mutation).
+
+**What the gate does and does not protect.** The verdict gate stops other GitHub accounts from
+approving. It does not stop you: one login can author the code and post the APPROVE, and
+`$WT_GH` and `token_command` are trusted local configuration, so anyone who can change them can
+bypass it. The consent gate stops a session that FOLLOWS its refusals. It does not stop one that
+deliberately forges: any process running as the same user can write the grant file through an
+interpreter (`python3 -c`, `node -e`, `rsync`, a variable-built path) and `checkout_guard` is a
+command parser, not a sandbox. Known limits, left open on purpose:
+
+- The guard judges the path a command names. It follows no variable or directory change reliably:
+  `cd "$HOME/.claude/session-notes/state/merge-consent" && echo ... > grants.json`, and `mkdir -p`
+  of that directory followed by a `cd` into it and a relative redirect, both write the file.
+- A session can type into its own pane (`tmux send-keys`), set `CLAUDE_CODE_ENTRYPOINT` before a
+  headless run, or start `claude --resume <id> "merge #N"` or `codex exec resume <id> "merge #N"`;
+  each presents its text as a human prompt to the hook, which cannot tell it from the user's.
+- A grant is usable by any session on the machine, not only the one the user answered.
+- A yes is tied to the PR, the repo and the time, not to the code: the APPROVE-before-yes check
+  catches a push after the yes only when a new APPROVE is posted, and `--match-head-commit` pins
+  the merge to the head the gates saw.
 
 ## review: the reviewer's prompt, and the verdict comment
 
@@ -168,7 +213,8 @@ it reuses `wt.py`'s GitHub access (`[wt].token_command`, `$WT_GH`) and its verdi
 
 Exit codes: 1 fatal, a refusal or a selftest failure, 2 usage error (argparse), 3 token command failed, 4 the head moved since `prepare`. A PR diff that is not UTF-8 is a clear exit 1. `test_edit_check.py` decodes a non-UTF-8 diff (file or stdin) with replacement and a warning.
 The `/review` skill (and `$review` in Codex) is the procedure: checks and rebase, `prepare`, a
-reviewer sub-agent at high effort, `post`, then `wt merge`.
+reviewer sub-agent at high effort, `post`, then ask the user `merge #N?` (name `owner/repo`
+when not inside the checkout) and, on their yes, `wt merge`.
 
 `bin/test_edit_check.py` reads a unified diff on stdin (or `--diff-file`) and reports every
 removed or changed line in a test, fixture or guard file, every deleted test file, and every

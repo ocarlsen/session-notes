@@ -36,7 +36,7 @@ launcher would point at a checkout that goes away): install from the main checko
 
 What gets registered (every command is prefixed SESSION_NOTES_AGENT=codex):
   SessionStart      codex_session_start (boot load), session_pane_registry
-  UserPromptSubmit  time_sense, session_bus_hook
+  UserPromptSubmit  time_sense, session_bus_hook, merge_consent
   Stop              session_bus_hook
   PreToolUse        Bash|apply_patch: checkout_guard
   PostToolUse       apply_patch: em_dash_guard
@@ -60,7 +60,7 @@ import sys
 import tempfile
 
 OWNED = ("codex_session_start.py", "time_sense.py", "session_bus_hook.py",
-         "session_pane_registry.py", "em_dash_guard.py", "checkout_guard.py")
+         "session_pane_registry.py", "em_dash_guard.py", "checkout_guard.py", "merge_consent.py")
 # Hooks that fail CLOSED (exit 2) when their script is missing. One source: the launcher
 # script is generated from this tuple.
 GUARDS = ("em_dash_guard", "checkout_guard")
@@ -91,7 +91,8 @@ def desired(launcher):
         ],
         "UserPromptSubmit": [
             {"hooks": [h("time_sense.py", timeout=10),
-                       h("session_bus_hook.py", timeout=10, additionalContextLimit=6000)]},
+                       h("session_bus_hook.py", timeout=10, additionalContextLimit=6000),
+                       h("merge_consent.py", timeout=10)]},
         ],
         "Stop": [
             # no additionalContextLimit: Stop cannot add context, and Codex warns on it
@@ -501,7 +502,7 @@ def selftest():
                        "statusMessage": "Loading session notes", "timeout": 10,
                        "additionalContextLimit": 4000}]})
         check("fresh: prompt hooks", [c.rsplit(" ", 1)[1] for c in cmds(d, "UserPromptSubmit")]
-              == ["time_sense", "session_bus_hook"])
+              == ["time_sense", "session_bus_hook", "merge_consent"])
         check("fresh: stop hooks", [c.rsplit(" ", 1)[1] for c in cmds(d, "Stop")]
               == ["session_bus_hook"])
         check("fresh: the pane registry hook is on SessionStart only", [
