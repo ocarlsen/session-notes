@@ -52,9 +52,14 @@ fi
 # under ~/.claude/session-notes and its config under ~/.config/session-notes,
 # so anything created or changed there during this run is a leak out of the
 # sandbox. (The private leak-terms file is the user's own and is excluded.)
+# The consent hook in every LIVE session writes seen/<session uuid> on that
+# session's first prompt, so a marker named like a real session id (and the
+# seen directory's own mtime) is not a leak; any other name there still is.
+UUID='????????-????-????-????-????????????'
 for d in "$REAL_HOME/.claude/session-notes" "$REAL_HOME/.config/session-notes" "$REAL_HOME/.local/state/session-notes-consent"; do
   [ -e "$d" ] || continue
-  stray=$(find "$d" -newer "$MARK" ! -name leak-terms.txt ! -path "$d" 2>/dev/null)
+  stray=$(find "$d" -newer "$MARK" ! -name leak-terms.txt ! -path "$d" \
+            ! -path "$d/seen" ! -path "$d/seen/$UUID" 2>/dev/null)
   if [ -n "$stray" ]; then
     echo "FAIL real HOME touched by the test run:"; echo "$stray" | sed 's/^/    /'; fail=1
   fi
