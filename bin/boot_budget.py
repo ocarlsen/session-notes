@@ -1001,8 +1001,9 @@ def selftest_codex(check):
             check(rc == 1 and "BLIND" in out and "config.toml" in out,
                   "unreadable config.toml: a BLIND line and exit 1 through the CLI")
             _write(Path(codex_home) / "config.toml", "")
-            os.remove(os.path.join(repo, "AGENTS.md"))
-            os.remove(os.path.join(sub, "AGENTS.md"))
+        for f in (os.path.join(repo, "AGENTS.md"), os.path.join(sub, "AGENTS.md")):
+            if os.path.exists(f):
+                os.remove(f)
 
         # B3: building the report must not change this process's agent
         saved_agent = os.environ.pop("SESSION_NOTES_AGENT", None)
