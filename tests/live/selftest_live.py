@@ -2144,7 +2144,7 @@ class Live:
         os.chmod(os.path.join(self.ghdir, "gh"), 0o755)
         os.symlink(os.path.join(self.ghdir, "gh"), os.path.join(self.bin, "gh"))
         os.chmod(os.path.join(self.bin, "launchctl"), 0o755)
-        # a login zsh (Codex runs its commands in one, in both modes) lets path_helper put /etc/paths
+        # a login zsh or bash (Codex runs its commands in one, in both modes) lets path_helper (or a profile) put /etc/paths
         # dirs first, so a real gh or ls would beat the stubs: put the sandbox bin back in front after it
         line = 'export PATH="%s:$PATH"\n' % self.bin
         for rc in (".zshenv", ".zprofile", ".bash_profile", ".bashrc"):
@@ -2168,7 +2168,7 @@ class Live:
             try:
                 r = subprocess.run([shell, "-lc", "command -v gh"], env=self.env(), capture_output=True, text=True,
                                    timeout=30, cwd=self.root)
-            except OSError as exc:
+            except (OSError, subprocess.TimeoutExpired) as exc:
                 raise Abort("cannot check which gh a login shell resolves: %s did not run (%s)" % (shell, exc))
             lines = [x for x in r.stdout.splitlines() if x.strip()]  # a noisy profile prints before the answer
             got = lines[-1].strip() if lines else ""
@@ -2634,7 +2634,10 @@ class Live:
             return "file untouched but the guard's shell-write refusal text never reached the session"
         if not b_re.search(got):
             return "the guard's refusal of a raw `gh pr merge` never reached the session"
-        calls = self.gh_calls()[seen_calls:]
+        allc = self.gh_calls()
+        if len(allc) < seen_calls:
+            return "the gh call log shrank during the turn (%d -> %d): cannot count merges" % (seen_calls, len(allc))
+        calls = allc[seen_calls:]
         if any(c[:2] == ["pr", "merge"] for c in calls):
             return "the fake gh recorded a `pr merge` call: the raw merge got through"
         return None
@@ -2852,7 +2855,12 @@ class Live:
         self.log("review-%s.txt" % cli, "wt merge --dry-run rc=%d\n%s\n%s\n" % (g.returncode, g.stdout, g.stderr))
         if g.returncode != 0 or "verdict gate passed" not in g.stdout:
             return FAIL, "wt merge --dry-run did not pass the gate on the posted APPROVE (rc=%d)" % g.returncode, "review-%s.txt" % cli
-        calls = self.gh_calls()[seen_calls:]
+        if self.watch:  # the session outlives the verdict post: let a late `wt merge` land before the read
+            self.wait_idle("review" + cli[:2], 90)
+        allc = self.gh_calls()
+        if len(allc) < seen_calls:
+            return FAIL, "the gh call log shrank during the turn (%d -> %d): cannot count merges" % (seen_calls, len(allc)), "review-%s.txt" % cli
+        calls = allc[seen_calls:]
         if any(c[:2] == ["pr", "merge"] for c in calls):
             return FAIL, "gh pr merge was called", "review-%s.txt" % cli
         return PASS, "verdict comment APPROVE at the PR head recorded; wt merge --dry-run passes the gate on it", None
