@@ -72,6 +72,8 @@ def main():
         missing = [c for c in COMMANDS
                    if "would: ln -s %s/bin/%s.py %s/%s" % (repo, c, binx, c) not in out]
         check("dry run: lists a link into --bin-dir for every command", not missing, "missing: %s" % missing)
+        check("dry run: says it would pin state_dir and writes no config",
+              "would pin" in out and open(env["SESSION_NOTES_CONFIG"]).read() == "", out[-300:])
         check("dry run: creates no bin dir and no ~/.claude",
               not os.path.exists(binx) and not os.path.exists(os.path.join(home, ".claude")))
 
@@ -82,6 +84,9 @@ def main():
                if not (os.path.islink(os.path.join(binx, c))
                        and os.readlink(os.path.join(binx, c)) == os.path.join(repo, "bin", c + ".py"))]
         check("--yes install: every command is a symlink to its bin/*.py", not bad, "bad: %s" % bad)
+        cfgtxt = open(env["SESSION_NOTES_CONFIG"]).read()
+        check("--yes install: no Claude home, so state_dir is pinned under ~/.local/state in the config",
+              'state_dir = "%s/.local/state/session-notes/state"' % home in cfgtxt, cfgtxt)
         check("--yes install: no ~/.claude of any kind",
               not os.path.exists(os.path.join(home, ".claude")),
               "found: %s" % [f for f in tree_files(home) if "/.claude" in f][:5])
@@ -129,6 +134,17 @@ def main():
         rc, out, err = install("--yes", "--bin-dir", bin2, flag="--all", home_dir=home2)
         check("--all --yes install: exits 0", rc == 0, (out + err)[-300:])
         hint_paths(bin2, "--all links")
+
+        # 3c. a machine that already has ~/.claude pins nothing
+        home3 = os.path.join(tmp, "home3")
+        os.makedirs(os.path.join(home3, ".claude"))
+        cfg3 = os.path.join(tmp, "config3.toml")
+        open(cfg3, "w").close()
+        e3 = dict(env, HOME=home3, SESSION_NOTES_CONFIG=cfg3)
+        r3 = subprocess.run(["sh", "install.sh", "--codex", "--yes", "--bin-dir", os.path.join(tmp, "bin3")],
+                            cwd=repo, env=e3, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        check("a Claude home present: state_dir is not pinned", r3.returncode == 0 and open(cfg3).read() == "",
+              (r3.stdout + r3.stderr)[-300:])
 
         # 4. no --bin-dir: nothing linked, and it says so
         rc, out, err = install("--dry-run")

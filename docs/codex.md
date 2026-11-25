@@ -28,10 +28,12 @@ a warning. `python3 bin/notes_config.py --stores` prints the stores for the
 current folder.
 
 The tmux-wide runtime state both agents share (bus mailbox, pane registry, nudge lock, last-check
-record) lives in `paths.state_dir`. Unset, it is `~/.claude/session-notes/state` when that directory
-already exists (an existing machine keeps what it has), otherwise
-`$XDG_STATE_HOME/session-notes/state` (`~/.local/state/session-notes/state`), so a Codex-only
-machine never gets a `~/.claude`. An explicit value always wins. It holds no memory.
+record) lives in `paths.state_dir`. Unset, it is `~/.claude/session-notes/state`, as it always was.
+`install.sh --codex` on a machine with no `~/.claude` pins `state_dir` to
+`$XDG_STATE_HOME/session-notes/state` (`~/.local/state/session-notes/state`) in the session-notes
+config (`python3 bin/notes_config.py --pin-state-dir`), so a Codex-only machine never gets a
+`~/.claude`. The choice is made once at install, never by looking at the disk at runtime; an
+explicit value is never overwritten, and a machine with a Claude home pins nothing. It holds no memory.
 
 ## Install
 

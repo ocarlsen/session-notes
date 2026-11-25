@@ -250,6 +250,26 @@ if [ "$CODEX" = 1 ]; then
   fi
   link_commands
 
+  # Runtime state (bus mailbox, pane registry, locks) defaults to ~/.claude/session-notes/state.
+  # With no Claude home on this machine, pin it under $XDG_STATE_HOME (~/.local/state) in the
+  # session-notes config instead, so Codex never makes a ~/.claude. Decided here, once, never at
+  # runtime; an explicit state_dir is left alone and a Claude Code machine pins nothing.
+  echo
+  if PIN=$(python3 "$REPO/bin/notes_config.py" --pin-state-dir --dry-run 2>&1); then
+    echo "State directory: $PIN"
+    case $PIN in
+      "would pin"*)
+        if [ "$DRY" = 1 ]; then :
+        elif [ "$ASK" = 1 ]; then
+          if ask "Pin it (keeping a .bak-session-notes copy of an existing config)?"; then
+            python3 "$REPO/bin/notes_config.py" --pin-state-dir || echo "Failed (see above)."
+          else echo "Skipped; state will be kept under the default ~/.claude/session-notes/state."; fi
+        else echo "To apply: python3 $(shq "$REPO/bin/notes_config.py") --pin-state-dir"; fi ;;
+    esac
+  else
+    echo "State directory: not pinned ($PIN)"
+  fi
+
   # The live-context file sits outside both agent homes; Codex may write it only if its
   # directory is a writable root too.
   LIVE_DIR=$(SESSION_NOTES_AGENT=codex python3 "$REPO/bin/notes_config.py" --live-path 2>/dev/null)

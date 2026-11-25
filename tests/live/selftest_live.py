@@ -1734,6 +1734,19 @@ def selftest():
                     live.stop_tmux()
             else:
                 print("skip codex-alone runtime-state check: no tmux")
+            # The split repro: something else (the merge grant file) creates ~/.claude/session-notes/state
+            # after install. A process started afterwards must still resolve the pinned dir, so a
+            # long-lived bus_nudge and a new hook never disagree.
+            pinned = os.path.join(live.home, ".local", "state", "session-notes", "state")
+            os.makedirs(os.path.join(live.claude_dir, "session-notes", "state"))
+            r = live.run([sys.executable, os.path.join(live.repo, "bin", "notes_config.py")], "probe-config.txt", timeout=30)
+            try:
+                resolved = json.loads(r.stdout)["paths"]["shared_state_dir"]
+            except (ValueError, KeyError):
+                resolved = r.stdout[-200:]
+            check("codex-alone: a process started after ~/.claude/session-notes/state appears still resolves the pinned state dir",
+                  resolved == pinned, "resolved %s, pinned %s" % (resolved, pinned))
+            shutil.rmtree(live.claude_dir)
             os.makedirs(live.claude_dir)
             check("codex-alone: NEGATIVE control, a created Claude dir is reported",
                   any(".claude" in x for x in alone_install_problems(live.home, live.claude_dir, live.bin, live.repo, path)))

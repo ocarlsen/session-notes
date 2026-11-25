@@ -18,13 +18,11 @@ codex_boot_bytes = 12000
 # Claude Code's own directory (transcripts live under projects/).
 claude_home = "~/.claude"
 # Runtime state: bus mailbox, locks, audit logs, pane registry.
-# Never memory content. Commented out = derived: ~/.claude/session-notes/state where that
-# already exists, else ~/.local/state/session-notes/state (under $XDG_STATE_HOME if set).
-# An explicit value always wins.
+# Never memory content.
 # The bus mailbox, bcast's log and pane state stay here in codex mode too, because
 # every agent on the machine must share them; Codex memory and its other state move
 # under codex_home.
-# state_dir = "~/.local/state/session-notes/state"
+state_dir = "~/.claude/session-notes/state"
 # The global memory store. Empty = ~/.claude/projects/<your encoded home>/memory,
 # the folder Claude Code already uses for sessions started in your home dir.
 global_store = ""

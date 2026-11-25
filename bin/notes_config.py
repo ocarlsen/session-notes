@@ -33,6 +33,7 @@ uses anything fancier fails loudly instead of being half-read.
     python3 notes_config.py            # print the resolved config as JSON
     python3 notes_config.py --stores [--cwd DIR]   # this folder's stores, as JSON
     python3 notes_config.py --live-path           # the live-context file's path
+    python3 notes_config.py --pin-state-dir [--dry-run]   # Codex-only machine: pin state_dir
     python3 notes_config.py --selftest
 """
 import copy
@@ -75,12 +76,8 @@ DEFAULTS = {
         # Where Claude Code itself lives (transcripts under projects/).
         "claude_home": "~/.claude",
         # Where session-notes keeps its own runtime state: bus mailbox, locks,
-        # audit logs, the pane registry. Never memory content. Empty = derive it:
-        # ~/.claude/session-notes/state where that already exists (nothing moves on a
-        # machine that has it), else $XDG_STATE_HOME/session-notes/state (default
-        # ~/.local/state/session-notes/state), so a machine with no Claude Code never
-        # grows a ~/.claude. See default_state_dir().
-        "state_dir": "",
+        # audit logs, the pane registry. Never memory content.
+        "state_dir": "~/.claude/session-notes/state",
         # The global memory store. Empty means "derive it": the projects/
         # folder Claude Code uses for your home directory, plus /memory.
         "global_store": "",
@@ -283,6 +280,57 @@ def config_path(env=None):
     return os.path.expanduser("~/.config/session-notes/config.toml")
 
 
+def pin_state_dir(env=None, dry_run=False):
+    """For a machine with no Claude home (a Codex-only install): write `state_dir` under
+    $XDG_STATE_HOME (default ~/.local/state) into the config file, so the runtime state never
+    lands in a ~/.claude that does not exist. Never overwrites an explicit state_dir, never
+    runs on a machine that has a Claude home, and the default of an unpinned config stays
+    ~/.claude/session-notes/state (no existence check at runtime). Returns a one-line report
+    starting `pinned`, `would pin` or `unchanged`."""
+    env = os.environ if env is None else env
+    path = config_path(env)
+    cfg = load(path, env) if os.path.exists(path) or not env.get("SESSION_NOTES_CONFIG") else None
+    if cfg is None:  # SESSION_NOTES_CONFIG names a file that does not exist: create it
+        cfg = load(None, {k: v for k, v in env.items() if k != "SESSION_NOTES_CONFIG"})
+    home = cfg["paths"]["claude_home"]
+    if os.path.lexists(home):
+        return "unchanged: %s exists (a Claude Code machine keeps the default state_dir)" % home
+    text = ""
+    if os.path.islink(path) and not os.path.exists(path):
+        raise ConfigError("%s: symlink to missing file %s" % (path, os.readlink(path)))
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        if "state_dir" in (parse_toml(text).get("paths") or {}):
+            return "unchanged: %s already sets paths.state_dir" % path
+    xdg = (env.get("XDG_STATE_HOME") or "").strip()
+    if not xdg or not os.path.isabs(xdg):
+        xdg = os.path.expanduser("~/.local/state")
+    value = json.dumps(os.path.join(xdg, "session-notes", "state"))
+    line = "state_dir = %s" % value
+    lines = text.splitlines(True)
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\[paths\]\s*(#.*)?$", ln):
+            if not ln.endswith("\n"):
+                lines[i] = ln + "\n"
+            lines.insert(i + 1, line + "\n")
+            new = "".join(lines)
+            break
+    else:
+        new = text + ("" if not text or text.endswith("\n") else "\n") + ("\n" if text else "") \
+            + "[paths]\n" + line + "\n"
+    parse_toml(new)  # never write a file the loader would refuse
+    if dry_run:
+        return "would pin %s in %s" % (line, path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if text:
+        with open(path + ".bak-session-notes", "w", encoding="utf-8") as fh:
+            fh.write(text)
+    with open(path, "w", encoding="utf-8") as fh:  # through a symlink, never replacing it
+        fh.write(new)
+    return "pinned %s in %s" % (line, path)
+
+
 def _merge(base, over, where=""):
     for k, v in over.items():
         if k not in base:
@@ -297,20 +345,6 @@ def _merge(base, over, where=""):
                 raise ConfigError("%s: expected %s, got %r"
                                   % (where + k, type(base[k]).__name__, v))
             base[k] = v
-
-
-def default_state_dir(env=None):
-    """The runtime-state dir when paths.state_dir is not set: the legacy
-    ~/.claude/session-notes/state if it already exists, else the agent-neutral
-    $XDG_STATE_HOME/session-notes/state (~/.local/state/... when unset or relative)."""
-    env = os.environ if env is None else env
-    legacy = os.path.expanduser("~/.claude/session-notes/state")
-    if os.path.isdir(legacy):
-        return legacy
-    xdg = (env.get("XDG_STATE_HOME") or "").strip()
-    if not xdg or not os.path.isabs(xdg):
-        xdg = os.path.expanduser("~/.local/state")
-    return os.path.join(xdg, "session-notes", "state")
 
 
 def _abs(path, base):
@@ -346,11 +380,8 @@ def _resolve(cfg, base=None, env=None):
     if a["codex_boot_bytes"] <= 0:
         raise ConfigError("agent.codex_boot_bytes must be positive, got %r" % a["codex_boot_bytes"])
     p = cfg["paths"]
-    if not isinstance(p["state_dir"], str):
-        raise ConfigError("paths.state_dir must be a path string, got %r" % (p["state_dir"],))
-    p["claude_home"] = _abs(p["claude_home"], base)
-    p["state_dir"] = (_abs(p["state_dir"], base) if p["state_dir"].strip()
-                      else default_state_dir(env))
+    for k in ("claude_home", "state_dir"):
+        p[k] = _abs(p[k], base)
     # Tmux-wide state that every agent on the machine must agree on (the bus
     # mailbox, bcast's log, pane state, the pane registry): the configured
     # state_dir, NOT moved by codex mode. It holds no memory, so the
@@ -727,28 +758,45 @@ store = "/tmp/beta-store"
             check("non-positive minutes refused", True)
         check("missing file = defaults",
               load(os.path.join(d, "nope.toml"))["scopes"] == [])
-        # state_dir default: agent-neutral unless the legacy Claude-home dir already exists.
+        # pin_state_dir (Codex-only install): pins only with no Claude home and no explicit value.
         with tempfile.TemporaryDirectory() as hd:
             saved_env = {k: os.environ.get(k) for k in ("HOME", "XDG_STATE_HOME")}
             try:
                 os.environ["HOME"] = hd
                 os.environ.pop("XDG_STATE_HOME", None)
-                nope = os.path.join(d, "nope.toml")
-                check("state_dir default with no Claude home: under ~/.local/state, nothing created",
-                      load(nope, env={})["paths"]["state_dir"] == os.path.join(hd, ".local", "state", "session-notes", "state")
-                      and not os.path.exists(os.path.join(hd, ".claude")))
-                check("state_dir default honors XDG_STATE_HOME",
-                      load(nope, env={"XDG_STATE_HOME": os.path.join(hd, "xs")})["paths"]["state_dir"]
-                      == os.path.join(hd, "xs", "session-notes", "state"))
-                os.makedirs(os.path.join(hd, ".claude", "session-notes", "state"))
-                check("state_dir default: an existing ~/.claude/session-notes/state keeps being used",
-                      load(nope, env={"XDG_STATE_HOME": os.path.join(hd, "xs")})["paths"]["state_dir"]
+                cp = os.path.join(hd, "cfg", "config.toml")
+                penv = {"SESSION_NOTES_CONFIG": cp}
+                want = os.path.join(hd, ".local", "state", "session-notes", "state")
+                check("unpinned default is the old one, with no existence check",
+                      load(os.path.join(hd, "none.toml"), env={})["paths"]["state_dir"]
                       == os.path.join(hd, ".claude", "session-notes", "state"))
-                ex = os.path.join(d, "explicit.toml")
-                with open(ex, "w") as fh:
-                    fh.write('[paths]\nstate_dir = "%s/mine"\n' % hd)
-                check("state_dir: an explicit config value always wins",
-                      load(ex, env={})["paths"]["state_dir"] == os.path.join(hd, "mine"))
+                os.makedirs(os.path.dirname(cp))
+                open(cp, "w").close()
+                check("pin: dry run says what it would write and writes nothing",
+                      pin_state_dir(penv, dry_run=True).startswith("would pin") and open(cp).read() == "")
+                check("pin: no Claude home pins ~/.local/state", pin_state_dir(penv).startswith("pinned")
+                      and load(cp, env=penv)["paths"]["state_dir"] == want)
+                check("pin: a second run changes nothing", pin_state_dir(penv).startswith("unchanged"))
+                # a process started after something creates ~/.claude/session-notes/state still gets the pin
+                os.makedirs(os.path.join(hd, ".claude", "session-notes", "state"))
+                check("pin: the pinned dir holds even once ~/.claude/session-notes/state exists",
+                      load(cp, env=penv)["paths"]["state_dir"] == want)
+                with open(cp, "w") as fh:
+                    fh.write("# mine\n[paths]\nclaude_home = \"%s/nochome\"\n[time]\nstale_after_minutes = 5\n" % hd)
+                check("pin: an existing [paths] table gets the line, other keys kept",
+                      pin_state_dir(penv).startswith("pinned")
+                      and load(cp, env=penv)["paths"]["state_dir"] == want
+                      and load(cp, env=penv)["time"]["stale_after_minutes"] == 5
+                      and open(cp).read().startswith("# mine\n[paths]\nstate_dir ="))
+                with open(cp, "w") as fh:
+                    fh.write('[paths]\nclaude_home = "%s/nochome"\nstate_dir = "%s/mine"\n' % (hd, hd))
+                check("pin: an explicit state_dir is never overwritten",
+                      pin_state_dir(penv).startswith("unchanged")
+                      and load(cp, env=penv)["paths"]["state_dir"] == os.path.join(hd, "mine"))
+                with open(cp, "w") as fh:
+                    fh.write("")
+                check("pin: a machine with a Claude home pins nothing",
+                      pin_state_dir(penv).startswith("unchanged") and open(cp).read() == "")
             finally:
                 for k, v in saved_env.items():
                     if v is None:
@@ -930,6 +978,9 @@ if __name__ == "__main__":
             sys.exit(0)
         if "--live-path" in sys.argv:
             print(load()["live"]["path"])
+            sys.exit(0)
+        if "--pin-state-dir" in sys.argv:
+            print(pin_state_dir(dry_run="--dry-run" in sys.argv))
             sys.exit(0)
         print(json.dumps(load(), indent=2))
     except ConfigError as exc:

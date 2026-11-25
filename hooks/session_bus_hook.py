@@ -66,11 +66,9 @@ def fallback_errors_dir():
     except Exception:
         try:
             import notes_config
-            root = notes_config.default_state_dir()
+            root = os.path.expanduser(notes_config.DEFAULTS["paths"]["state_dir"])
         except Exception:
             root = os.path.expanduser("~/.claude/session-notes/state")
-            if not os.path.isdir(root):
-                root = os.path.expanduser("~/.local/state/session-notes/state")
     return os.path.join(root, "session-bus", "errors")
 
 
