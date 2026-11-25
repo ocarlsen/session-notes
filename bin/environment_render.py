@@ -527,7 +527,7 @@ def atomic_write(path, data, backup=True):
     if os.path.exists(real):
         mode = os.stat(real).st_mode & 0o7777
         if backup:
-            stamp = time.strftime("%Y%m%d-%H%M%S")
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())  # UTC, like rules_block
             bak = path + BAK + stamp
             # On a same-second clash: the number after every existing one (never a pruned
             # lower name), so ranking backups by name stays correct.

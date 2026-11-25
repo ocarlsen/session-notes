@@ -699,184 +699,16 @@ def codex_boot_findings(cfg):
             for label, n in rows if n >= CODEX_BOOT_WARN_FRACTION * cap]
 
 
-try:  # Python 3.11+
-    import tomllib as _tomllib
-except ImportError:
-    try:
-        import tomli as _tomllib
-    except ImportError:
-        _tomllib = None
-
-_CODEX_KEYS = ("project_doc_max_bytes", "project_doc_fallback_filenames")
+import codex_config  # noqa: E402  (one reader for the Codex doc-size keys, shared with rules_block)
+from codex_config import (_CODEX_KEYS, _Bad, _scan_top_level, _toml_string, _toml_value,  # noqa: E402,F401
+                          _tomllib)
 # Where Codex lives when the config carries no agent.codex_home. The selftest points this at
 # a path that does not exist so no host ~/.codex leaks into it.
 _DEFAULT_CODEX_HOME = notes_config.DEFAULTS["agent"]["codex_home"]
 
 
-def _skip_string(text, i):
-    """text[i] opens a TOML string; the index just past it. ValueError if unterminated."""
-    n = len(text)
-    for q in ('"""', "'''"):
-        if text.startswith(q, i):
-            j = i + 3
-            while True:
-                j = text.find(q, j)
-                if j < 0:
-                    raise ValueError("unterminated multi-line string")
-                if q == "'''" or (len(text[:j]) - len(text[:j].rstrip("\\"))) % 2 == 0:
-                    j += 3
-                    while j < n and text[j] == q[0]:  # up to two extra quotes belong to the string
-                        j += 1
-                    return j
-                j += 1
-    q = text[i]
-    j = i + 1
-    while j < n and text[j] != "\n":
-        if q == '"' and text[j] == "\\":
-            j += 2
-            continue
-        if text[j] == q:
-            return j + 1
-        j += 1
-    raise ValueError("unterminated string")
-
-
-def _scan_top_level(text):
-    """[(key, value_text, line)] of the top-level key/value pairs, up to the first table header
-    outside any string or array. Tracks multi-line strings and bracket depth, so a key-looking
-    line inside a string or array is never mistaken for a key. Comments are dropped from the
-    value text. ValueError on text it cannot follow."""
-    out, i, n = [], 0, len(text)
-    while True:
-        while i < n and (text[i].isspace()):
-            i += 1
-        while i < n and text[i] == "#":
-            while i < n and text[i] != "\n":
-                i += 1
-            while i < n and text[i].isspace():
-                i += 1
-        if i >= n or text[i] == "[":
-            return out
-        line = text.count("\n", 0, i) + 1
-        parts = []
-        while True:
-            while i < n and text[i] in " \t":
-                i += 1
-            if i < n and text[i] in "\"'":
-                j = _skip_string(text, i)
-                parts.append(_toml_string(text[i:j]))
-                i = j
-            else:
-                m = re.compile(r"[A-Za-z0-9_-]+").match(text, i)
-                if not m:
-                    raise ValueError("cannot parse a key at line %d" % line)
-                parts.append(m.group(0))
-                i = m.end()
-            while i < n and text[i] in " \t":
-                i += 1
-            if i < n and text[i] == ".":
-                i += 1
-                continue
-            break
-        if i >= n or text[i] != "=":
-            raise ValueError("expected '=' at line %d" % line)
-        i += 1
-        buf, depth = [], 0
-        while i < n:
-            c = text[i]
-            if c in "\"'":
-                j = _skip_string(text, i)
-                buf.append(text[i:j])
-                i = j
-                continue
-            if c == "#":
-                while i < n and text[i] != "\n":
-                    i += 1
-                continue
-            if c in "[{":
-                depth += 1
-            elif c in "]}":
-                depth -= 1
-            elif c == "\n" and depth <= 0:
-                break
-            buf.append(c)
-            i += 1
-        out.append((".".join(parts), "".join(buf).strip(), line))
-
-
-def _toml_string(tok):
-    if tok.startswith('"""') or tok.startswith("'''"):
-        body = tok[3:-3]
-        return body[1:] if body.startswith("\n") else body
-    if tok[0] == "'":
-        return tok[1:-1]
-    import json
-    try:
-        return json.loads(tok)
-    except ValueError:
-        raise ValueError("bad string %s" % tok) from None
-
-
-def _toml_value(raw):
-    """int, str or list of those from the value text; ValueError for anything else."""
-    raw = raw.strip()
-    if re.fullmatch(r"[+-]?\d+(?:_\d+)*", raw):
-        return int(raw.replace("_", ""))
-    if raw in ("true", "false"):
-        return raw == "true"
-    if not raw:
-        raise ValueError("empty value")
-    if raw.startswith(('"', "'")):
-        if _skip_string(raw, 0) != len(raw):
-            raise ValueError("trailing text")
-        return _toml_string(raw)
-    if raw.startswith("[") and raw.endswith("]"):
-        items, i, body = [], 0, raw[1:-1]
-        while True:
-            while i < len(body) and body[i].isspace():
-                i += 1
-            if i >= len(body):
-                return items
-            if body[i] not in "\"'":
-                raise ValueError("array item is not a string")
-            j = _skip_string(body, i)
-            items.append(_toml_string(body[i:j]))
-            i = j
-            while i < len(body) and body[i].isspace():
-                i += 1
-            if i < len(body):
-                if body[i] != ",":
-                    raise ValueError("expected ',' in array")
-                i += 1
-    raise ValueError("unsupported value")
-
-
 def _codex_config_values(text):
-    """{key: python value or _Bad(reason)} for the two keys, from the Codex config text. Uses
-    tomllib/tomli when importable, else the scanner above. A reason string means unreadable."""
-    found = {}
-    if _tomllib is not None:
-        try:
-            data = _tomllib.loads(text)
-        except _tomllib.TOMLDecodeError as exc:
-            return {"": _Bad("invalid TOML: %s" % exc)}
-        return {k: data[k] for k in _CODEX_KEYS if k in data}
-    try:
-        pairs = _scan_top_level(text)
-    except ValueError as exc:
-        return {"": _Bad("cannot read the config: %s" % exc)}
-    for key, raw, line in pairs:
-        if key in _CODEX_KEYS:
-            try:
-                found[key] = _toml_value(raw)
-            except ValueError as exc:
-                found[key] = _Bad("%s (value %s)" % (exc, raw) if raw.strip() else str(exc))
-    return found
-
-
-class _Bad(object):
-    def __init__(self, reason):
-        self.reason = reason
+    return codex_config.config_values(text, _tomllib)   # _tomllib here so a selftest can force the scanner
 
 
 def _codex_home_of(cfg):
@@ -901,20 +733,10 @@ def _codex_doc_settings(codex_home):
     except UnicodeDecodeError:
         return cap, fallbacks, "CODEX CONFIG %s: not valid UTF-8; project_doc_max_bytes unknown, " \
             "assuming %d" % (cfg_path, cap)
-    for key, v in _codex_config_values(text).items():
-        where = "CODEX CONFIG %s: %s" % (cfg_path, key or "config")
-        if isinstance(v, _Bad):
-            problems.append("%s: %s" % (where, v.reason))
-        elif key == "project_doc_max_bytes":
-            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
-                problems.append("%s = %r: must be a non-negative integer" % (where, v))
-            else:
-                cap = v
-        elif key == "project_doc_fallback_filenames":
-            if not isinstance(v, list) or not all(isinstance(x, str) and x and "/" not in x for x in v):
-                problems.append("%s = %r: must be a list of file names" % (where, v))
-            else:
-                fallbacks = v
+    values, found = codex_config.read_settings(text, _tomllib)
+    problems = ["CODEX CONFIG %s: %s" % (cfg_path, p) for p in found]
+    cap = values.get("project_doc_max_bytes", cap)
+    fallbacks = values.get("project_doc_fallback_filenames", fallbacks)
     return cap, fallbacks, "; ".join(problems) or None
 
 
