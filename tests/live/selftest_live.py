@@ -379,14 +379,14 @@ def seen(token, text):
     return token in re.sub(r"\s+", "", text or "")
 
 
-def render_table(results, pane_rows=()):
+def render_table(results, pane_rows=(), features=None):
     """results: dicts with feature/title/cli (claude|codex|both)/status/detail. -> table text.
     `pane_rows`: feature ids whose title gets a " (pane)" mark (watch mode: they ran in a pane)."""
     by = {}
     for r in results:
         by.setdefault(r["feature"], {})[r["cli"]] = r
     rows = [("feature", "claude", "codex")]
-    for fid, title, _scope in FEATURES:
+    for fid, title, _scope in (FEATURES if features is None else features):
         if fid not in by:
             continue
         cells = []
@@ -1592,6 +1592,37 @@ def selftest():
     tbl = render_table([{"feature": "boot", "title": "boot context + clock line", "cli": "claude", "status": PASS, "detail": ""}],
                        pane_rows=PANE_ROWS)
     check("table: pane rows carry a (pane) mark in watch mode", "(pane)" in tbl and "(pane)" not in render_table(res), tbl)
+    # the step-table seam: a subclass supplies its own steps, titles and pane rows; go() is setup then run_steps
+    class Alt(Live):
+        FEATURES = [("alt1", "Alt step one", "cli")]
+        CHAPTERS = {"alt1": "Alt chapter one"}
+        PANE_ROWS = ("alt1",)
+    alt_ns = argparse.Namespace(only=None, feature=None, keep=False, selftest=False, watch=True, pace=0.0, step=False,
+                                leak_terms=None, no_hold_final=True)
+    alt = Alt(alt_ns)
+    try:
+        alt_tbl = render_table([{"feature": "alt1", "title": "x", "cli": "claude", "status": PASS, "detail": ""}],
+                               pane_rows=alt.PANE_ROWS, features=alt.FEATURES)
+        check("seam: render_table prints a subclass's own feature titles", "Alt step one (pane)" in alt_tbl, alt_tbl)
+        check("seam: the default tables are unchanged on Live",
+              Live.FEATURES is FEATURES and Live.CHAPTERS is CHAPTERS and Live.PANE_ROWS is PANE_ROWS)
+        alt.have = {"claude": True, "codex": True}
+        alt.plan = [("alt1", "claude")]
+        alt.begin_step("alt1", "claude")
+        check("seam: begin_step's status title comes from the subclass's CHAPTERS",
+              alt.status_log[-1]["title"] == "Alt chapter one", str(alt.status_log[-1]))
+        order = []
+        alt.setup = lambda: order.append("setup")
+        alt.run_steps = lambda: order.append("run_steps")
+        alt.stop_tmux = lambda: order.append("stop_tmux")
+        alt.go()
+        check("seam: go() runs setup, then run_steps (watch keeps the sandbox up)", order == ["setup", "run_steps"], str(order))
+        alt.watch = False
+        order.clear()
+        alt.go()
+        check("seam: go() stops tmux last when not watching", order == ["setup", "run_steps", "stop_tmux"], str(order))
+    finally:
+        shutil.rmtree(alt.root, ignore_errors=True)
 
     # the real layout, the screen guard through real panes, link removal at teardown (needs tmux)
     if shutil.which("tmux"):
@@ -1817,6 +1848,10 @@ class Quit(Abort):
 
 class Live:
     CLAUDE_TOOLS = ["Bash", "Write", "Edit", "Read", "Skill"]
+    # The step tables a scenario subclass overrides (the defaults are the module-level suite).
+    FEATURES = FEATURES
+    CHAPTERS = CHAPTERS
+    PANE_ROWS = PANE_ROWS
 
     def __init__(self, a):
         self.a = a
@@ -1932,7 +1967,7 @@ class Live:
             fh.write(redact(text))
 
     def record(self, feature, cli, status, detail="", evidence=None):
-        title = next(t for f, t, _ in FEATURES if f == feature)
+        title = next(t for f, t, _ in self.FEATURES if f == feature)
         self.results.append({"feature": feature, "title": title, "cli": cli, "status": status,
                              "detail": detail, "evidence": evidence})
 
@@ -2247,7 +2282,7 @@ class Live:
         self.step_no += 1
         self.enter_pending = False
         self.state = {"claude": "idle", "codex": "idle"}
-        self.write_status(step=self.step_no, total=len(self.plan), id=fid, cli=cli, title=CHAPTERS[fid],
+        self.write_status(step=self.step_no, total=len(self.plan), id=fid, cli=cli, title=self.CHAPTERS[fid],
                           phase="title", result="")
         if not self.stopping:  # after a trip the panes stay cleared: never re-attach a session
             self.default_focus()
@@ -2276,7 +2311,7 @@ class Live:
         """Table into the status pane (zoomed), then (unless the run failed to finish) wait for q."""
         if not self.watch or not self.panes_of:
             return
-        table = render_table(self.results, pane_rows=PANE_ROWS).splitlines()
+        table = render_table(self.results, pane_rows=self.PANE_ROWS, features=self.FEATURES).splitlines()
         if self.guard_tripped or self.quit or self.aborted:  # the panes were blanked or the viewer left: nothing to show
             return
         self.write_status(phase="done", title="Finished", table=table, step=self.cur.get("total", 0))
@@ -3226,7 +3261,7 @@ class Live:
                 plan += [(fid, "claude"), (fid, "codex")]
         return plan + [("realdirs", "both")]
 
-    def go(self):
+    def setup(self):
         if self.watch:
             gone = empty_classes(self.needles, bool(getattr(self.a, "leak_terms", None)))
             if gone:  # a class with nothing to look for would let that kind of leak onto a public frame
@@ -3253,7 +3288,7 @@ class Live:
                 self.why[cli] = why
             else:
                 self.have[cli] = True
-        if not any(self.have.values()) and any(self.want(f) for f, _, sc in FEATURES if sc == "cli"):
+        if not any(self.have.values()) and any(self.want(f) for f, _, sc in self.FEATURES if sc == "cli"):
             raise Abort("nothing live ran: no CLI was usable (%s)" % "; ".join(
                 "%s: %s" % kv for kv in sorted(self.why.items())))
         self.plan = self.build_plan()
@@ -3269,6 +3304,8 @@ class Live:
             self.link_socket()
             print("watch: attach with   tmux -L sn-watch attach\nwatch: status file %s" % self.status_path)
             sys.stdout.flush()
+
+    def run_steps(self):
         if any(self.want(f) for f in ("peers", "bcast", "bus", "refresh", "live")):
             if self.have["claude"]:
                 for n in ("cA", "cB"):
@@ -3287,6 +3324,10 @@ class Live:
         for fid, name in (("review", "row_review"), ("live", "row_live"), ("env", "row_env")):
             for cli in ("claude", "codex"):
                 self.do(fid, cli, getattr(self, name), cli)
+
+    def go(self):
+        self.setup()
+        self.run_steps()
         if not self.watch:
             self.stop_tmux()
 
@@ -3376,7 +3417,7 @@ def main():
         return 2
     live = Live(a)
     results, lines, kept = execute(live)
-    out = [render_table(results, pane_rows=PANE_ROWS if live.watch else ())] + [redact(ln) for ln in lines]
+    out = [render_table(results, pane_rows=live.PANE_ROWS if live.watch else (), features=live.FEATURES)] + [redact(ln) for ln in lines]
     if kept:
         out.append("sandbox kept: %s" % kept)
     try:
