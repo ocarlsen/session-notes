@@ -178,7 +178,7 @@ APPROVE verdict whose GitHub `created_at` is EARLIER than the yes (a push after 
 new review, then a new ask). It spends the grant (recording the head sha), posts
 `Merge authorized by the user: "<prompt>" (<time>)` on the PR, and merges; with no live grant it
 exits 7 telling the session to ask the user. `checkout_guard` refuses the ordinary ways an agent
-could write the grant directory (an edit, a redirect, `$HOME` spellings, moving a parent
+could write the grant directory (an edit, a redirect or `tee` naming the path, moving a parent
 directory, a hard link) and refuses to run or import the hook or to call the merge API directly
 (`gh api` PUT `pulls/N/merge`, a `mergePullRequest` mutation).
 
@@ -190,6 +190,9 @@ deliberately forges: any process running as the same user can write the grant fi
 interpreter (`python3 -c`, `node -e`, `rsync`, a variable-built path) and `checkout_guard` is a
 command parser, not a sandbox. Known limits, left open on purpose:
 
+- The guard judges the path a command names. It follows no variable or directory change reliably:
+  `cd "$HOME/.claude/session-notes/state/merge-consent" && echo ... > grants.json`, and `mkdir -p`
+  of that directory followed by a `cd` into it and a relative redirect, both write the file.
 - A session can type into its own pane (`tmux send-keys`), set `CLAUDE_CODE_ENTRYPOINT` before a
   headless run, or start `claude --resume <id> "merge #N"` or `codex exec resume <id> "merge #N"`;
   each presents its text as a human prompt to the hook, which cannot tell it from the user's.

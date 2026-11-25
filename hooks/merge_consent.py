@@ -302,7 +302,8 @@ def parse_ask(text):
     q = final_question(text)
     if not q:
         return None
-    q = re.sub(r"[`*_]", "", q).strip().strip("\"'()[] ")
+    # code and bold marks go anywhere; an underscore (emphasis) only at the ends, so my_repo survives
+    q = re.sub(r"[`*]", "", q).strip().strip("_\"'()[] ").strip()
     m = _ASK.match(q)
     if not m or len(re.findall(r"#\d+", q)) != 1:
         return None
@@ -663,6 +664,15 @@ def selftest():
                                                       "content": [{"type": "input_text", "text": "<environment_context>x"}]}})
         check("B5 Codex (control): injected context is not a human prompt",
               (prompt("ok", session="b5f", env=cx) or {}).get("pr") == 12)
+
+        # N1: an underscore inside owner/repo survives; emphasis marks at the ends are stripped
+        transcript("Ready: merge #12 in my-org/my_repo?")
+        check("N1: `in my-org/my_repo` is read whole", (at(plain, "", "n1a") or {}).get("repo") == "my-org/my_repo")
+        transcript("_Ready: merge #12 in my-org/my_repo?_")
+        check("N1: emphasis at the ends is stripped, the repo is unchanged",
+              (at(plain, "", "n1b") or {}).get("repo") == "my-org/my_repo")
+        transcript("**Ready: `merge #12 in my-org/my_repo?`**")
+        check("N1: bold and code marks are stripped", (at(plain, "", "n1c") or {}).get("repo") == "my-org/my_repo")
 
         # N2: the reply names another repo than the cwd's origin
         transcript("Ready: merge #12 in other-owner/other-repo?")
