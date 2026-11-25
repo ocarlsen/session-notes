@@ -23,6 +23,14 @@ which side it is on:
 | boot load | `@import` in CLAUDE.md | the SessionStart hook |
 | instruction files | CLAUDE.md | AGENTS.md |
 
+**Shared store (opt-in).** A scope with `shared_store = true` has one project store for both
+agents, at `~/.local/share/session-notes/stores/<encoded root>` (`paths.shared_stores_dir`), so a
+fact either agent saves is in the other's next session. The Codex side needs nothing else: the
+SessionStart hook, `codex_save.py` and `boot_budget.py --agent codex` all read the resolved store.
+`codex_save.py` accepts that root (and still refuses any other path outside the Codex home). The
+Claude side needs `autoMemoryDirectory` in the scope's `.claude/settings.local.json`:
+`python3 bin/shared_store.py settings-line --scope NAME` prints it. See `docs/tools.md` (shared store).
+
 In codex mode a resolved store under `paths.claude_home` is a config error, not
 a warning. `python3 bin/notes_config.py --stores` prints the stores for the
 current folder.
@@ -321,6 +329,11 @@ A RESUME change carries the hash of the file the model read
 skips that change and says to re-read and stage again, instead of overwriting.
 A command with anything in front of `commit` (a `cd`, an env prefix) does not
 match the rule and falls back to an approval prompt.
+
+A new RESUME.md that would leave the file over its budget (`boot_budget`'s `resume_bytes`) is
+refused by `resume_guard`, at `stage` and again at `commit`: move finished items to
+`RESUME-archive.md` first. `stage --harness claude|codex` on a `--file` adds `harness:` to its
+frontmatter, and on an `--index-line` marks the hook `[harness]`.
 
 ## Limits
 

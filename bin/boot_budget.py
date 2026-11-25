@@ -428,8 +428,59 @@ def scope_slug(root):
     return notes_config.encode_project_dir(os.path.abspath(_tilde(root)))
 
 
+def shared_scope_for(root):
+    """The configured scope at `root` that opted into a shared store (`shared_store = true`),
+    else None."""
+    rp = os.path.realpath(os.path.abspath(_tilde(root)))
+    for s in _cfg().get("scopes", []):
+        if s.get("shared_store") and os.path.realpath(os.path.abspath(_tilde(s["root"]))) == rp:
+            return s
+    return None
+
+
 def native_memory_path(root):
+    """Where Claude Code's native auto memory reads MEMORY.md for sessions started at `root`.
+    For a scope that opted into a shared store that is the shared store (the scope's
+    .claude/settings.local.json points autoMemoryDirectory there; shared_store_findings()
+    checks it does), not the per-harness projects/ folder."""
+    shared = shared_scope_for(root)
+    if shared:
+        return os.path.join(shared["store"], "MEMORY.md")
     return os.path.join(_config_dir(), "projects", scope_slug(root), "memory", "MEMORY.md")
+
+
+def shared_store_findings():
+    """One finding per shared-store scope whose Claude settings do not point native auto memory
+    at the shared store: until `autoMemoryDirectory` is set in the scope's
+    .claude/settings.local.json (the only project file Claude Code honors it from), Claude
+    keeps reading and writing the old per-harness store. [] when clean or no scope opted in."""
+    out = []
+    for s in _cfg().get("scopes", []):
+        if not s.get("shared_store"):
+            continue
+        p = os.path.join(_tilde(s["root"]), ".claude", "settings.local.json")
+        data = _read_settings(p, s["root"])
+        val = data.get("autoMemoryDirectory") if data else None
+        want = os.path.realpath(s["store"])
+        if not isinstance(val, str) or os.path.realpath(os.path.expanduser(val)) != want:
+            out.append(f"SHARED STORE {s['name']}: {_display(p)} does not set autoMemoryDirectory to "
+                       f"{_display(s['store'])} (got {val!r}); Claude would keep using the old store. "
+                       f"Run: shared_store.py settings-line --scope {s['name']}")
+        # Claude's boot set (CLAUDE.md @imports) must reach the shared RESUME.md and nothing under
+        # an old per-harness store, or Claude boots stale files while /reflect writes the new one.
+        import shared_store
+        shared_resume = os.path.join(s["store"], "RESUME.md")
+        boot = [os.path.realpath(f) for f in boot_files_for_scope(s["root"])]
+        if os.path.isfile(shared_resume) and os.path.realpath(shared_resume) not in boot:
+            out.append(f"SHARED STORE {s['name']}: Claude's boot set does not import {_display(shared_resume)}. "
+                       f"Add `@{_display(shared_resume)}` to the scope's CLAUDE.md "
+                       f"(shared_store.py settings-line --scope {s['name']} prints it)")
+        for old in shared_store.legacy_stores(_cfg(), s).values():
+            stale = [f for f in boot if notes_config._under(f, old)]
+            for f in stale:
+                out.append(f"SHARED STORE {s['name']}: Claude's boot set still imports {_display(f)} from the "
+                           f"old store; replace it with the shared store's file (settings-line prints the line)")
+    return out
 
 
 _DISABLE_ENV_TRUE = {"1", "true", "yes"}
@@ -865,6 +916,7 @@ def check_mode():
     for path, chars, budget in file_violations():
         violations.append(f"FILE {_display(path)}: {chars:,} chars over budget {budget:,}")
     violations.extend(unlisted_claude_md_findings())
+    violations.extend(shared_store_findings())
     violations.extend(blind_lines())
     if not violations:
         return 0  # silent when clean

@@ -81,6 +81,9 @@ DEFAULTS = {
         # The global memory store. Empty means "derive it": the projects/
         # folder Claude Code uses for your home directory, plus /memory.
         "global_store": "",
+        # Where the shared per-scope stores live (scopes with `shared_store = true`): one
+        # folder per scope slug, outside every agent's home. Data, not state.
+        "shared_stores_dir": "~/.local/share/session-notes/stores",
         # Where nightly_check records its last run (read by `nightly_check.py status`).
         # Empty = <shared_state_dir>/last-check.json, the same file for every agent.
         "last_check": "",
@@ -168,7 +171,8 @@ DEFAULTS = {
         "test_globs": [],
     },
     # Each scope is a project folder with its own memory store. `store` may be
-    # empty, meaning ~/.claude/projects/<encoded root>/memory.
+    # empty, meaning ~/.claude/projects/<encoded root>/memory. `shared_store = true` opts the
+    # scope into ONE store for both agents under paths.shared_stores_dir (see store_for).
     "scopes": [],
     # Per-file boot budgets that win over the per-kind ones in [budgets]: one
     # [[budget_file]] block per file, with `path` and `bytes`.
@@ -367,6 +371,28 @@ def codex_project_store(root, codex_home):
                         encode_project_dir(root))
 
 
+def store_for(scope, agent, cfg):
+    """THE resolver for a scope's project store, for `agent` ("claude" or "codex").
+
+    A scope that opted in with `shared_store = true` has one store, the same for both agents:
+    <paths.shared_stores_dir>/<slug>. Every other scope keeps its per-agent store: Claude's
+    `store` key or ~/.claude/projects/<slug>/memory, Codex's <codex_home>/session-notes/
+    projects/<slug>. `scope` is a dict with `root`, plus `shared_store` and (optionally, for a
+    custom Claude store) `claude_store`; a resolved scope has no `claude_store` and so gets the
+    default Claude store, which is why shared_store.py takes --claude-store. Every reader and writer of a
+    project store goes through here (via the resolved scope's `store`)."""
+    if agent not in AGENTS:
+        raise ConfigError("store_for: agent must be one of %s, got %r" % ("/".join(AGENTS), agent))
+    p = cfg["paths"]
+    root = scope["root"]
+    slug = encode_project_dir(root)
+    if scope.get("shared_store"):
+        return os.path.join(p["shared_stores_dir"], slug)
+    if agent == "codex":
+        return codex_project_store(root, cfg["agent"]["codex_home"])
+    return scope.get("claude_store") or os.path.join(p["claude_home"], "projects", slug, "memory")
+
+
 def _resolve(cfg, base=None, env=None):
     env = os.environ if env is None else env
     a = cfg["agent"]
@@ -400,6 +426,10 @@ def _resolve(cfg, base=None, env=None):
         p["global_store"] = os.path.join(
             p["claude_home"], "projects", encode_project_dir("~"), "memory")
     p["global_store"] = _abs(p["global_store"], base)
+    if not isinstance(p["shared_stores_dir"], str) or not p["shared_stores_dir"].strip():
+        raise ConfigError("paths.shared_stores_dir must be a non-empty path string, got %r"
+                          % (p["shared_stores_dir"],))
+    p["shared_stores_dir"] = _abs(p["shared_stores_dir"], base)
     # The home of the running agent: skills/ and skill-feedback/ live here.
     p["agent_home"] = a["codex_home"] if kind == "codex" else p["claude_home"]
     lv = cfg["live"]
@@ -417,15 +447,23 @@ def _resolve(cfg, base=None, env=None):
     for i, s in enumerate(cfg["scopes"]):
         if not isinstance(s, dict) or not s.get("name") or not s.get("root"):
             raise ConfigError("scopes[%d] needs a name and a root" % i)
-        unknown = set(s) - {"name", "root", "store", "manifest", "worktree_root", "live", "live_file"}
+        unknown = set(s) - {"name", "root", "store", "manifest", "worktree_root", "live", "live_file",
+                              "shared_store"}
         if unknown:
             raise ConfigError("scopes[%d]: unknown key(s) %s" % (i, sorted(unknown)))
         root = _abs(s["root"], base)
-        if kind == "codex":
-            store = codex_project_store(root, a["codex_home"])
-        else:
-            store = s.get("store") or os.path.join(
-                p["claude_home"], "projects", encode_project_dir(root), "memory")
+        shared = s.get("shared_store", False)
+        if type(shared) is not bool:
+            raise ConfigError("scopes[%d] (%s): shared_store must be true or false, got %r"
+                              % (i, s["name"], shared))
+        if shared and s.get("store"):
+            raise ConfigError("scopes[%d] (%s): shared_store = true and store = %r are exclusive:"
+                              " the shared store IS the scope's store" % (i, s["name"], s["store"]))
+        # The resolved scope the rest of the code sees: `store` is this agent's store, from
+        # the one resolver below.
+        store = store_for({"root": root, "shared_store": shared,
+                           "claude_store": _abs(s["store"], base) if s.get("store") else ""},
+                          kind, cfg)
         manifest = s.get("manifest", "")
         if not isinstance(manifest, str):
             raise ConfigError("scopes[%d] (%s): manifest must be a path string" % (i, s["name"]))
@@ -446,13 +484,17 @@ def _resolve(cfg, base=None, env=None):
         if live != "own" and lf.strip():
             raise ConfigError("scopes[%d] (%s): live_file = %r is only allowed with live = \"own\""
                               " (live is %r)" % (i, s["name"], lf, live))
+        if shared and live != "shared":
+            raise ConfigError("scopes[%d] (%s): shared_store = true is refused for an isolated "
+                              "scope (live = %r): an isolated scope never shares memory across "
+                              "agents" % (i, s["name"], live))
         # A relative manifest is relative to the scope ROOT, which both agents share.
-        scopes.append({"name": s["name"], "root": root,
+        scopes.append({"name": s["name"], "root": root, "shared_store": shared,
                        "worktree_root": _abs(wtr, root) if wtr.strip() else "",
                        "store": _abs(store, base),
                        "live": live,
                        "live_file": _abs(lf, root) if lf.strip() else "",
-                       "store_derived": kind == "codex" or not s.get("store"),
+                       "store_derived": shared or kind == "codex" or not s.get("store"),
                        "manifest": _abs(manifest, root) if manifest.strip() else ""})
     cfg["scopes"] = scopes
     seen = {}
@@ -616,8 +658,8 @@ def selftest():
     import tempfile
     fails = []
 
-    def check(name, cond):
-        print(("ok   " if cond else "FAIL ") + name)
+    def check(name, cond, detail=""):
+        print(("ok   " if cond else "FAIL ") + name + ("" if cond else "  " + str(detail)))
         if not cond:
             fails.append(name)
 
@@ -950,6 +992,47 @@ store = "/tmp/beta-store"
             check("review.test_globs non-list refused", False)
         except ConfigError as exc:
             check("review.test_globs non-list refused", "review.test_globs" in str(exc))
+    # shared_store: default off, one resolver for both agents, refused where it would leak.
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "s.toml")
+        with open(f, "w") as fh:
+            fh.write('[paths]\nclaude_home = "%s/c"\nshared_stores_dir = "%s/st"\n[agent]\ncodex_home = "%s/x"\n'
+                     '[[scopes]]\nname = "p"\nroot = "/r/p"\nshared_store = true\n'
+                     '[[scopes]]\nname = "q"\nroot = "/r/q"\n' % (d, d, d))
+        envs = {a: {"SESSION_NOTES_AGENT": a} for a in AGENTS}
+        got = {a: {s["name"]: s for s in load(f, env=envs[a])["scopes"]} for a in AGENTS}
+        check("shared_store: both agents resolve the one shared path",
+              got["claude"]["p"]["store"] == got["codex"]["p"]["store"] == os.path.join(d, "st", "-r-p"))
+        check("shared_store: a scope that did not opt in keeps its per-agent store",
+              got["claude"]["q"]["store"] == os.path.join(d, "c", "projects", "-r-q", "memory")
+              and got["codex"]["q"]["store"] == os.path.join(d, "x", "session-notes", "projects", "-r-q")
+              and not got["claude"]["q"]["shared_store"])
+        check("shared_store: default shared_stores_dir is under ~/.local/share",
+              load(os.path.join(d, "none.toml"))["paths"]["shared_stores_dir"]
+              == os.path.expanduser("~/.local/share/session-notes/stores"))
+    # shared_store refusals name their reason (real newlines in the fixtures), with loading controls
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "r.toml")
+        head = '[paths]\nshared_stores_dir = "%s/st"\n' % d
+        for tag, body, want in (
+                ("live = none", 'shared_store = true\nlive = "none"\n', "isolated scope"),
+                ("live = own", 'shared_store = true\nlive = "own"\nlive_file = "%s/l.md"\n' % d, "isolated scope"),
+                ("store set", 'shared_store = true\nstore = "%s/s"\n' % d, "exclusive"),
+                ("a string", 'shared_store = "yes"\n', "must be true or false")):
+            with open(f, "w") as fh:
+                fh.write(head + '[[scopes]]\nname = "x"\nroot = "/r/x"\n' + body)
+            try:
+                load(f)
+                got = "loaded"
+            except ConfigError as exc:
+                got = str(exc)
+            check("shared_store refused with %s" % tag, want in got and "shared_store" in got
+                  and "cannot parse" not in got, got)
+        for tag, body in (("false + live none", 'shared_store = false\nlive = "none"\n'),
+                          ("false + store", 'shared_store = false\nstore = "%s/s"\n' % d)):
+            with open(f, "w") as fh:
+                fh.write(head + '[[scopes]]\nname = "x"\nroot = "/r/x"\n' + body)
+            check("control loads: shared_store %s" % tag, bool(load(f)["scopes"]))
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)
