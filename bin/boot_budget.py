@@ -984,22 +984,25 @@ def selftest_codex(check):
         _write(Path(codex_home) / "config.toml", "")
 
         # B2: run as a script, an unreadable file is a BLIND finding (one module, one blind record)
-        _write(Path(sub) / "AGENTS.md", "tiny\n")
-        _write(Path(repo) / "AGENTS.md", "tiny\n")
-        os.chmod(os.path.join(sub, "AGENTS.md"), 0)
-        rc, out = run("--agent", "codex", "check")
-        os.chmod(os.path.join(sub, "AGENTS.md"), 0o644)
-        check(rc == 1 and "BLIND" in out and "AGENTS.md" in out,
-              "chmod 000 AGENTS.md: a BLIND line and exit 1 through the CLI")
-        _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 50000\n")
-        os.chmod(os.path.join(codex_home, "config.toml"), 0)
-        rc, out = run("--agent", "codex", "check")
-        os.chmod(os.path.join(codex_home, "config.toml"), 0o644)
-        check(rc == 1 and "BLIND" in out and "config.toml" in out,
-              "unreadable config.toml: a BLIND line and exit 1 through the CLI")
-        _write(Path(codex_home) / "config.toml", "")
-        os.remove(os.path.join(repo, "AGENTS.md"))
-        os.remove(os.path.join(sub, "AGENTS.md"))
+        if os.geteuid() == 0:  # root reads a chmod 000 file, so the case cannot be built (CI runs as root)
+            print("  [SKIP] BLIND checks need a non-root user")
+        else:
+            _write(Path(sub) / "AGENTS.md", "tiny\n")
+            _write(Path(repo) / "AGENTS.md", "tiny\n")
+            os.chmod(os.path.join(sub, "AGENTS.md"), 0)
+            rc, out = run("--agent", "codex", "check")
+            os.chmod(os.path.join(sub, "AGENTS.md"), 0o644)
+            check(rc == 1 and "BLIND" in out and "AGENTS.md" in out,
+                  "chmod 000 AGENTS.md: a BLIND line and exit 1 through the CLI")
+            _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 50000\n")
+            os.chmod(os.path.join(codex_home, "config.toml"), 0)
+            rc, out = run("--agent", "codex", "check")
+            os.chmod(os.path.join(codex_home, "config.toml"), 0o644)
+            check(rc == 1 and "BLIND" in out and "config.toml" in out,
+                  "unreadable config.toml: a BLIND line and exit 1 through the CLI")
+            _write(Path(codex_home) / "config.toml", "")
+            os.remove(os.path.join(repo, "AGENTS.md"))
+            os.remove(os.path.join(sub, "AGENTS.md"))
 
         # B3: building the report must not change this process's agent
         saved_agent = os.environ.pop("SESSION_NOTES_AGENT", None)
