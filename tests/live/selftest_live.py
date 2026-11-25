@@ -855,6 +855,13 @@ def alone_install_problems(home, claude_dir, bin_dir, repo, path):
     return out
 
 
+def tree_paths(root):
+    out = []
+    for dp, dn, fn in os.walk(root):
+        out += [os.path.join(dp, x) for x in dn + fn]
+    return sorted(out)
+
+
 def sh(args, cwd, env, check=True, timeout=60):
     r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
     if check and r.returncode != 0:
@@ -1697,6 +1704,36 @@ def selftest():
                   os.path.islink(os.path.join(live.codex_dir, "skills", "reflect"))
                   and os.path.isfile(os.path.join(live.codex_dir, "hooks.json"))
                   and os.path.isfile(os.path.join(live.home, ".local", "bin", "session-notes")))
+            # What Codex's own hooks and the nudge loop do at runtime must not create a Claude dir:
+            # the registered SessionStart pane-registry hook, run from a pane of the sandbox tmux
+            # server the way Codex runs it, then one bus_nudge pass, then the run's real-dirs row.
+            if shutil.which("tmux"):
+                live.before, live.installed = snapshot(live.real_home), True
+                try:
+                    with open(os.path.join(live.codex_dir, "hooks.json")) as fh:
+                        hj = json.load(fh)
+                    hcmd = [h["command"] for g in hj["hooks"]["SessionStart"] for h in g["hooks"]
+                            if "session_pane_registry" in h["command"]][0]
+                    live.start_tmux()
+                    payload = json.dumps({"session_id": "s1", "hook_event_name": "SessionStart",
+                                          "source": "startup", "cwd": live.work})
+                    live.pane_run("hookpane", ["sh", "-c", "echo %s | %s; echo rc=$?" % (shlex.quote(payload), hcmd)],
+                                  "probe-hook.txt", timeout=30)
+                    nr = live.run([sys.executable, os.path.join(live.repo, "bin", "bus_nudge.py"), "--once"],
+                                  "probe-nudge.txt", timeout=60)
+                    live.stop_tmux()
+                    reg = os.path.join(live.home, ".local", "state", "session-notes", "state", "session_panes.json")
+                    check("codex-alone: the SessionStart pane-registry hook ran and wrote its registry outside .claude",
+                          os.path.isfile(reg), "no %s" % reg)
+                    check("codex-alone: the hook and one bus_nudge pass created no .claude in the sandbox home",
+                          not os.path.lexists(os.path.join(live.home, ".claude")),
+                          "found %s" % [f for f in tree_paths(live.home) if "/.claude" in f][:5])
+                    st, detail, _ = live.row_realdirs()
+                    check("codex-alone: after the hook and the nudge pass the real-dirs row passes", st == PASS, "%s %s" % (st, detail))
+                finally:
+                    live.stop_tmux()
+            else:
+                print("skip codex-alone runtime-state check: no tmux")
             os.makedirs(live.claude_dir)
             check("codex-alone: NEGATIVE control, a created Claude dir is reported",
                   any(".claude" in x for x in alone_install_problems(live.home, live.claude_dir, live.bin, live.repo, path)))

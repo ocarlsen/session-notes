@@ -694,9 +694,11 @@ def nudge_restart_line(cfg=None, agent_installed=None):
     if agent_installed:
         import launch_agents
         return launch_agents.kickstart_line("bus-nudge")
+    nudge = os.path.join(LAUNCH_BIN, "bus_nudge.py")
+    if not os.path.exists(nudge):  # launched as the install.sh link `session_bus`: use the real script
+        nudge = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bus_nudge.py")
     return "tmux new-session -d -s %s 'python3 %s'" % (
-        nudge_session_name(cfg),
-        os.path.join(LAUNCH_BIN, "bus_nudge.py").replace(os.path.expanduser("~"), "~", 1))
+        nudge_session_name(cfg), nudge.replace(os.path.expanduser("~"), "~", 1))
 
 
 def nudge_down_note(cfg=None):

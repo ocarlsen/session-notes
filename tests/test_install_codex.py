@@ -56,11 +56,13 @@ def main():
             print("FAIL the launchctl stub is not first on PATH; refusing to run install.sh")
             return 1
 
-        def install(*args, extra_path=None):
+        def install(*args, extra_path=None, flag="--codex", home_dir=None):
             e = dict(env)
+            if home_dir:
+                e["HOME"] = home_dir
             if extra_path:
-                e["PATH"] = os.pathsep.join([extra_path, path])
-            r = subprocess.run(["sh", "install.sh", "--codex"] + list(args), cwd=repo, env=e,
+                e["PATH"] = os.pathsep.join([stubs, extra_path, py, "/usr/bin", "/bin"])  # the stub stays first
+            r = subprocess.run(["sh", "install.sh", flag] + list(args), cwd=repo, env=e,
                                capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             return r.returncode, r.stdout, r.stderr
 
@@ -100,6 +102,33 @@ def main():
         rc, out, err = install("--yes", "--bin-dir", binx, extra_path=binx)
         check("rerun with --bin-dir on PATH: exits 0, no PATH note",
               rc == 0 and "is not on your PATH" not in out, (out + err)[-300:])
+
+        # 3b. the hint lines the tools print when launched as a link (no .py) name a file that exists
+        probe = (
+            "import importlib.machinery as m, os, sys\n"
+            "d = sys.argv[1]\n"
+            "nb = m.SourceFileLoader('nb_link', os.path.join(d, 'bus_nudge')).load_module()\n"
+            "sb = m.SourceFileLoader('sb_link', os.path.join(d, 'session_bus')).load_module()\n"
+            "pull = os.path.expanduser(nb._BUS_CLI)\n"
+            "line = sb.nudge_restart_line({}, agent_installed=False)\n"
+            "restart = os.path.expanduser(line.rsplit(' ', 1)[1].rstrip(\"'\"))\n"
+            "print(pull); print(restart)\n")
+
+        def hint_paths(bindir, label):
+            e = dict(env, PYTHONPATH=os.path.join(repo, "bin"), PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run([sys.executable, "-c", probe, bindir], env=e, capture_output=True,
+                               text=True, timeout=60, stdin=subprocess.DEVNULL)
+            got = r.stdout.split()
+            check("%s: the nudge and restart hints name files that exist" % label,
+                  r.returncode == 0 and len(got) == 2 and all(os.path.isfile(x) for x in got),
+                  (r.stdout + r.stderr)[-300:])
+
+        hint_paths(binx, "--codex links")
+        home2, bin2 = os.path.join(tmp, "home2"), os.path.join(tmp, "bin2")
+        os.makedirs(home2)
+        rc, out, err = install("--yes", "--bin-dir", bin2, flag="--all", home_dir=home2)
+        check("--all --yes install: exits 0", rc == 0, (out + err)[-300:])
+        hint_paths(bin2, "--all links")
 
         # 4. no --bin-dir: nothing linked, and it says so
         rc, out, err = install("--dry-run")

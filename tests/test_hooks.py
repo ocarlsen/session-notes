@@ -87,7 +87,8 @@ def main():
 
         # The pane-registry hook on turn events: working/idle per pane, nothing printed.
         pane_env = {"TMUX_PANE": "%5", "CLAUDE_PID": "1234"}
-        state_file = os.path.join(home, ".claude", "session-notes", "state", "pane_state", "5.json")
+        # state_dir defaults outside ~/.claude when that has no session-notes/state yet (notes_config.default_state_dir)
+        state_file = os.path.join(home, ".local", "state", "session-notes", "state", "pane_state", "5.json")
 
         def recorded():
             try:

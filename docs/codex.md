@@ -18,7 +18,7 @@ which side it is on:
 | global store | `~/.claude/projects/<home>/memory` | `~/.codex/session-notes/global` |
 | project store | a configured scope's store | `~/.codex/session-notes/projects/<encoded root>` |
 | project root | the configured scope | the configured scope, else the cwd's git root |
-| reflect lock and state | `~/.claude/session-notes/state` | `~/.codex/session-notes/state` |
+| reflect lock and state | `paths.state_dir` (see below) | `~/.codex/session-notes/state` |
 | session id | `CLAUDE_CODE_SESSION_ID` | `CODEX_THREAD_ID` |
 | boot load | `@import` in CLAUDE.md | the SessionStart hook |
 | instruction files | CLAUDE.md | AGENTS.md |
@@ -26,6 +26,12 @@ which side it is on:
 In codex mode a resolved store under `paths.claude_home` is a config error, not
 a warning. `python3 bin/notes_config.py --stores` prints the stores for the
 current folder.
+
+The tmux-wide runtime state both agents share (bus mailbox, pane registry, nudge lock, last-check
+record) lives in `paths.state_dir`. Unset, it is `~/.claude/session-notes/state` when that directory
+already exists (an existing machine keeps what it has), otherwise
+`$XDG_STATE_HOME/session-notes/state` (`~/.local/state/session-notes/state`), so a Codex-only
+machine never gets a `~/.claude`. An explicit value always wins. It holds no memory.
 
 ## Install
 
@@ -70,12 +76,14 @@ It asks `[y/N]` before each step:
 
 A machine with Codex and no Claude Code needs nothing else: `install.sh --codex` is a complete
 install. It links the same commands the Claude install links (one shared step in `install.sh`),
-writes nothing under `~/.claude` and never creates it, and offers the nightly memory checks and
+writes nothing under `~/.claude` and never creates it (neither do the hooks, the bus or the nudge
+loop at runtime: their state is in `~/.local/state/session-notes/state`), and offers the nightly memory checks and
 the `bus_nudge` LaunchAgent on macOS. What it does not set up: the Claude-only pieces
 (`~/.claude/settings.json` hooks, the `CLAUDE.md` import, the `/find-session` skill) and the
 tmux itself, which the tmux commands need and you install yourself. `make selftest-watch ARGS="--codex-alone"`
 runs the live suite that way: a sandbox home with no Claude install, only
-`install.sh --codex`, and the Codex column only.
+`install.sh --codex`, and the Codex column only. In your own shell (outside a Codex session)
+`handoff_session` launches Codex when no `claude` binary resolves; `--cli codex` says so explicitly.
 
 Install from the main checkout, not from a linked git worktree: `install.sh --codex` (and
 `codex_hooks.py merge` and `launcher`) refuse a worktree up front, before any step or prompt,

@@ -260,7 +260,10 @@ def _trace(where):
     try:
         d = os.path.join(notes_config.load()["paths"]["state_dir"], "errors")
     except Exception:
-        d = os.path.expanduser("~/.claude/session-notes/state/errors")
+        d = os.path.expanduser("~/.claude/session-notes/state")
+        if not os.path.isdir(d):
+            d = os.path.expanduser("~/.local/state/session-notes/state")
+        d = os.path.join(d, "errors")
     try:
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "live_%s.txt" % where), "a") as fh:

@@ -75,8 +75,12 @@ DEFAULTS = {
         # Where Claude Code itself lives (transcripts under projects/).
         "claude_home": "~/.claude",
         # Where session-notes keeps its own runtime state: bus mailbox, locks,
-        # audit logs, the pane registry. Never memory content.
-        "state_dir": "~/.claude/session-notes/state",
+        # audit logs, the pane registry. Never memory content. Empty = derive it:
+        # ~/.claude/session-notes/state where that already exists (nothing moves on a
+        # machine that has it), else $XDG_STATE_HOME/session-notes/state (default
+        # ~/.local/state/session-notes/state), so a machine with no Claude Code never
+        # grows a ~/.claude. See default_state_dir().
+        "state_dir": "",
         # The global memory store. Empty means "derive it": the projects/
         # folder Claude Code uses for your home directory, plus /memory.
         "global_store": "",
@@ -295,6 +299,20 @@ def _merge(base, over, where=""):
             base[k] = v
 
 
+def default_state_dir(env=None):
+    """The runtime-state dir when paths.state_dir is not set: the legacy
+    ~/.claude/session-notes/state if it already exists, else the agent-neutral
+    $XDG_STATE_HOME/session-notes/state (~/.local/state/... when unset or relative)."""
+    env = os.environ if env is None else env
+    legacy = os.path.expanduser("~/.claude/session-notes/state")
+    if os.path.isdir(legacy):
+        return legacy
+    xdg = (env.get("XDG_STATE_HOME") or "").strip()
+    if not xdg or not os.path.isabs(xdg):
+        xdg = os.path.expanduser("~/.local/state")
+    return os.path.join(xdg, "session-notes", "state")
+
+
 def _abs(path, base):
     """~ expanded; a relative path is taken relative to the config file's
     directory, so a config can sit next to the store it describes."""
@@ -328,8 +346,11 @@ def _resolve(cfg, base=None, env=None):
     if a["codex_boot_bytes"] <= 0:
         raise ConfigError("agent.codex_boot_bytes must be positive, got %r" % a["codex_boot_bytes"])
     p = cfg["paths"]
-    for k in ("claude_home", "state_dir"):
-        p[k] = _abs(p[k], base)
+    if not isinstance(p["state_dir"], str):
+        raise ConfigError("paths.state_dir must be a path string, got %r" % (p["state_dir"],))
+    p["claude_home"] = _abs(p["claude_home"], base)
+    p["state_dir"] = (_abs(p["state_dir"], base) if p["state_dir"].strip()
+                      else default_state_dir(env))
     # Tmux-wide state that every agent on the machine must agree on (the bus
     # mailbox, bcast's log, pane state, the pane registry): the configured
     # state_dir, NOT moved by codex mode. It holds no memory, so the
@@ -706,6 +727,34 @@ store = "/tmp/beta-store"
             check("non-positive minutes refused", True)
         check("missing file = defaults",
               load(os.path.join(d, "nope.toml"))["scopes"] == [])
+        # state_dir default: agent-neutral unless the legacy Claude-home dir already exists.
+        with tempfile.TemporaryDirectory() as hd:
+            saved_env = {k: os.environ.get(k) for k in ("HOME", "XDG_STATE_HOME")}
+            try:
+                os.environ["HOME"] = hd
+                os.environ.pop("XDG_STATE_HOME", None)
+                nope = os.path.join(d, "nope.toml")
+                check("state_dir default with no Claude home: under ~/.local/state, nothing created",
+                      load(nope, env={})["paths"]["state_dir"] == os.path.join(hd, ".local", "state", "session-notes", "state")
+                      and not os.path.exists(os.path.join(hd, ".claude")))
+                check("state_dir default honors XDG_STATE_HOME",
+                      load(nope, env={"XDG_STATE_HOME": os.path.join(hd, "xs")})["paths"]["state_dir"]
+                      == os.path.join(hd, "xs", "session-notes", "state"))
+                os.makedirs(os.path.join(hd, ".claude", "session-notes", "state"))
+                check("state_dir default: an existing ~/.claude/session-notes/state keeps being used",
+                      load(nope, env={"XDG_STATE_HOME": os.path.join(hd, "xs")})["paths"]["state_dir"]
+                      == os.path.join(hd, ".claude", "session-notes", "state"))
+                ex = os.path.join(d, "explicit.toml")
+                with open(ex, "w") as fh:
+                    fh.write('[paths]\nstate_dir = "%s/mine"\n' % hd)
+                check("state_dir: an explicit config value always wins",
+                      load(ex, env={})["paths"]["state_dir"] == os.path.join(hd, "mine"))
+            finally:
+                for k, v in saved_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
         # Codex mode: every path under codex_home, Claude-side overrides ignored.
         with open(f, "w") as fh:
             fh.write('[paths]\nclaude_home = "%s/claude"\nglobal_store = "%s/claude/g"\n'
