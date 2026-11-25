@@ -711,7 +711,7 @@ selftest keys (never your own login). It needs both CLIs; `--scenario` requires 
    replies, and the reply arrives in Claude's next prompt.
 3. A poem, one line each: two rounds over the bus; each line must be in both transcripts.
 4. The guard says no: Claude is asked to add the poem to a tracked `poem.md` on main; the checkout guard
-   refuses; Claude runs `wt new poem` and writes it in the worktree. Main stays untouched.
+   refuses; Claude runs `wt new poem` and writes it in the worktree. Main stays untouched. The poem goes in as four consecutive lines under the title, each but the last ending in a backslash (a Markdown hard break).
 5. One builds, the other reviews: Claude commits and runs `wt pr` (stub `gh`); `wt merge` refuses with no review;
    Codex runs `$review 7` on gpt-6.2-sol at low effort; Claude ends on `merge #7?`; the harness types `yes` into
    that pane (the status line says `user types: yes` first, so the film never shows it as a model decision); the

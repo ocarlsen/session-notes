@@ -143,7 +143,7 @@ _FRONTMATTER_FORM = ("---\nname: descriptive-kebab-slug\ndescription: one line s
 def check_frontmatter(name, content):
     """Refuse (SaveError) a memory file whose `type:` sits at the top level of its frontmatter: the
     canary's format is `metadata:` with `type:` nested under it. Parsed by the canary's own parser."""
-    fm = memory_hygiene_canary.parse_frontmatter(content)
+    fm = memory_hygiene_canary.parse_frontmatter(content.lstrip("\ufeff"))  # a BOM must not hide the frontmatter
     if fm is not None and fm["top_type"] is not None:
         raise SaveError("%s: `type:` must be nested under `metadata:`, not at the top level of the frontmatter. "
                         "Re-stage the whole file in this form:\n%s" % (name, _FRONTMATTER_FORM))
@@ -376,6 +376,9 @@ def selftest():
                              "---\nname: t\ndescription: d\ntype: reference\n---\nbody\n")
             check("a top-level type: is refused with the correct form shown",
                   rc == 2 and "metadata:" in err and "  type:" in err, (rc, err))
+            rc, _, err = run(["stage", "--store", "global", "--file", "user_t.md"],
+                             "\ufeff---\nname: t\ndescription: d\ntype: reference\n---\nbody\n")
+            check("a top-level type: behind a BOM is refused too", rc == 2 and "metadata:" in err, (rc, err))
             rc, out, _ = run(["stage", "--store", "global", "--file", "user_t.md"],
                              "---\nname: t\ndescription: d\nmetadata:\n  type: reference\n---\nbody\n")
             check("the nested metadata type is accepted", rc == 0 and "staged file" in out, (rc, out))
