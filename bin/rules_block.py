@@ -29,7 +29,12 @@ applies only to project files." and, past the cap, "project doc exceeds remainin
 truncating". The "total" there is only an advisory warning: Codex warns at load when global, thread
 and project instructions together pass project_doc_max_bytes, and drops nothing for it. The budget
 that truncates is the project chain's alone, and the global file uses none of it. A global file over
-32768 bytes would trip that warning on its own, so it is refused.
+32768 bytes would trip that warning on its own, so it is refused. "32768" is the default: Codex
+compares against the CONFIGURED project_doc_max_bytes, which apply reads from the config.toml
+beside the AGENTS.md (bin/codex_config.py, the reader the memory canary also uses). A cap of 0 or
+below, or a malformed value, is refused naming key=value; a cap smaller than the session-notes
+block itself is refused as too small for the block. Size is measured on the stripped text, as
+Codex trims the file before measuring.
 """
 import argparse
 import difflib
@@ -39,11 +44,13 @@ import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+import codex_config  # noqa: E402  (one reader for project_doc_max_bytes)
 from environment_render import CODEX_END  # noqa: E402  (one source for the marker)
 
 BEGIN = "<!-- session-notes:begin (install.sh rewrites this block; edit outside it) -->"
@@ -52,8 +59,8 @@ ADDENDUM_HEADING = "## Local addendum (private rules)"
 CLAUDE_HEADING = "## Standing rules (session-notes)"
 BAK = ".bak-session-notes"   # prefix; the backup name adds a timestamp
 MAX_BYTES = 32768   # Codex project_doc_max_bytes default
-WARN_BYTES = 28000
-BLOCK_WARN_BYTES = 12000
+WARN_BYTES = 28000   # at the default cap; warn_bytes() scales it with the configured cap
+BLOCK_WARN_BYTES = 12000   # absolute: a block this large is heavy at any cap
 # Lines of the snippet in versions older than the current one: a legacy section is removed only
 # while its lines are known wording, so text the user wrote after it survives.
 OLD_WORDING = (
@@ -210,10 +217,10 @@ def diff_text(path, old, new):
 
 
 def backup_path(path):
-    """PATH.bak-session-notes-YYYYmmdd-HHMMSS (local time); on a same-second clash the next
+    """PATH.bak-session-notes-YYYYmmdd-HHMMSS (UTC, so names never misorder across a DST change); on a same-second clash the next
     number after every existing one (-1, -2, ...), so a pruned name is never reused out of
     order. Never a name that exists."""
-    base = "%s%s-%s" % (path, BAK, time.strftime("%Y%m%d-%H%M%S"))
+    base = "%s%s-%s" % (path, BAK, time.strftime("%Y%m%d-%H%M%S", time.gmtime()))
     d, name = os.path.split(base)
     top = -1
     for other in os.listdir(d or "."):
@@ -227,22 +234,42 @@ def backup_path(path):
 KEEP_BACKUPS = 3
 
 
-def prune_backups(path, keep, bak=BAK):
+FUTURE_SLACK = timedelta(days=1)
+
+
+def _stamp_rank(stamp, n, now):
+    """Sort key, higher = newer. A stamp more than a day ahead of `now` (a clock that was wrong,
+    or a hand-made name) or one that is not a real date ranks OLDEST, so it cannot hold a slot
+    forever. Names written before the UTC change carry local time, up to 14 hours off UTC,
+    which the one-day slack absorbs."""
+    try:
+        when = datetime.strptime(stamp, "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return (0, stamp, n)
+    if when - now > FUTURE_SLACK:
+        return (0, stamp, n)
+    return (1, stamp, n)
+
+
+def prune_backups(path, keep, bak=BAK, now=None):
     """Keep exactly KEEP_BACKUPS of this tool's own timestamped backups of PATH: `keep` (the one
     just written) plus the newest others. Newest is decided by the stamp in the NAME
     (YYYYmmdd-HHMMSS, then the -N suffix, which comes after the unsuffixed same-second name),
     never by file mtime: older releases copied with copy2, so a backup carries its source's
-    old mtime. Both name formats in use (this tool's and environment_render's) carry the stamp.
-    Only names of exactly that pattern are touched; install.sh's PATH.bak-session-notes never
-    is. `bak` is the backup-name prefix (environment_render passes its own)."""
+    old mtime. New names are UTC; a stamp more than a day in the future ranks oldest (see
+    _stamp_rank). `keep` is matched by basename, so a bare name or a doubled slash still
+    protects it. Only regular files of exactly that pattern are touched (a directory of that
+    name is skipped); install.sh's PATH.bak-session-notes never matches. `bak` is the
+    backup-name prefix (environment_render passes its own)."""
     d, base = os.path.split(path)
     d = d or "."
-    pat = re.compile(r"^%s%s-(\d{8}-\d{6})(?:-(\d+))?$" % (re.escape(base), re.escape(bak)))
+    now = now or datetime.now(timezone.utc)
+    pat = re.compile(r"%s%s-(\d{8}-\d{6})(?:-(\d+))?\Z" % (re.escape(base), re.escape(bak)))
     found = []
     for n in os.listdir(d):
         m = pat.match(n)
-        if m:
-            found.append(((m.group(1), int(m.group(2) or 0)), n))
+        if m and os.path.isfile(os.path.join(d, n)):
+            found.append((_stamp_rank(m.group(1), int(m.group(2) or 0), now), n))
     found.sort(reverse=True)
     keep_name = os.path.basename(keep)
     others = [n for _, n in found if n != keep_name]
@@ -294,25 +321,63 @@ def load_existing(path):
     return read_text(path) if os.path.exists(path) else None
 
 
+def configured_cap(path):
+    """The project_doc_max_bytes that applies to the global AGENTS.md at `path`: read from the
+    config.toml beside it, MAX_BYTES when the key is absent. Raises RulesError for a malformed
+    value (key=value and why) and for 0 or below: Codex treats 0 as "read no project docs" and
+    a negative number is not a size, and neither gives a cap this file can be sized against."""
+    cfg = os.path.join(os.path.dirname(os.path.abspath(path)), "config.toml")
+    try:
+        with open(cfg, "rb") as fh:
+            text = fh.read().decode("utf-8")
+    except FileNotFoundError:
+        return MAX_BYTES, None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RulesError("%s: cannot read it to find project_doc_max_bytes (%s); fix it or "
+                         "move it aside" % (tilde(cfg), exc))
+    cap, problem = codex_config.read_key(text, "project_doc_max_bytes", MAX_BYTES)
+    if problem:
+        raise RulesError("%s: project_doc_max_bytes is malformed: %s" % (tilde(cfg), problem))
+    if cap <= 0:
+        raise RulesError("%s: project_doc_max_bytes = %d; a cap of 0 or below leaves no size to "
+                         "keep this file under. Set it to a positive size or remove the key"
+                         % (tilde(cfg), cap))
+    return cap, cfg
+
+
+def warn_bytes(cap):
+    """The warn threshold for a cap: WARN_BYTES at the default cap, the same fraction otherwise."""
+    return cap * WARN_BYTES // MAX_BYTES
+
+
 def cmd_apply(path, dry, repo=REPO, local=None):
     old = load_existing(path)
     block = render(repo, local)
     new = compute(old, block, snippet_headings(repo), known_lines(repo))
-    size = len(new.encode("utf-8"))
-    if size > MAX_BYTES:
-        raise RulesError("%s would be %d bytes, over 32 KiB (%d bytes). Codex's "
+    cap, cfg = configured_cap(path)
+    # Codex trims the file before measuring (codex-rs instructions: contents.trim()).
+    size = len(new.strip().encode("utf-8"))
+    block_size = len(block.strip().encode("utf-8"))
+    if block_size > cap:
+        raise RulesError("the session-notes block alone is %d bytes, over the configured cap of "
+                         "%d (project_doc_max_bytes in %s): that cap is too small for the "
+                         "session-notes block. Raise it to at least %d, or remove the key for "
+                         "the 32 KiB default" % (block_size, cap, tilde(cfg), block_size))
+    if size > cap:
+        where = ("project_doc_max_bytes = %d from %s" % (cap, tilde(cfg)) if cfg
+                 else "32 KiB, Codex's default")
+        raise RulesError("%s would be %d bytes, over %d bytes (%s). Codex's "
                          "project_doc_max_bytes (32 KiB by default) limits project AGENTS.md "
                          "files, not this global one, but past that size Codex warns at every load "
                          "that its instructions exceed it, so session-notes keeps the global file "
-                         "at or under 32 KiB. Trim the file, or the addendum, and run again"
-                         % (tilde(path), size, MAX_BYTES))
-    if len(block.encode("utf-8")) > BLOCK_WARN_BYTES:
+                         "at or under that size. Trim the file, or the addendum, and run again"
+                         % (tilde(path), size, cap, where))
+    if block_size > BLOCK_WARN_BYTES:
         print("warning: the session-notes block alone is %d bytes (over %d); it uses much of the "
-              "%d bytes this file may hold" % (len(block.encode("utf-8")), BLOCK_WARN_BYTES,
-                                              MAX_BYTES), file=sys.stderr)
-    if size > WARN_BYTES:
+              "%d bytes this file may hold" % (block_size, BLOCK_WARN_BYTES, cap), file=sys.stderr)
+    if size > warn_bytes(cap):
         print("warning: %s is %d bytes, close to the %d this file may hold" % (
-            tilde(path), size, MAX_BYTES), file=sys.stderr)
+            tilde(path), size, cap), file=sys.stderr)
     return finish(path, old, new, dry, "wrote")
 
 
@@ -932,6 +997,149 @@ def selftest():
         prune_backups(os.path.join(pd, "g.json"), os.path.join(pd, env_names[0]), ".bak-environment")
         check("prune by name: environment_render's name format, same rule",
               sorted(n for n in os.listdir(pd) if n.startswith("g.json")) == sorted(env_names[:3]))
+
+        # --- #97: the global AGENTS.md is sized against the configured project_doc_max_bytes ---
+        cd = os.path.join(tmp, "capdir")
+        os.makedirs(cd)
+        cap_agents = os.path.join(cd, "AGENTS.md")
+        cap_cfg = os.path.join(cd, "config.toml")
+
+        def cap_apply(cfg_text, body):
+            if cfg_text is None:
+                if os.path.exists(cap_cfg):
+                    os.unlink(cap_cfg)
+            else:
+                open(cap_cfg, "w").write(cfg_text)
+            open(cap_agents, "w").write(body)
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    cmd_apply(cap_agents, False, repo, local)
+                return None, err.getvalue()
+            except RulesError as exc:
+                return str(exc), err.getvalue()
+
+        fat = "x" * (MAX_BYTES + 500) + "\n"
+        refused, _ = cap_apply("project_doc_max_bytes = 65536\n", fat)
+        check("cap: a raised configured cap accepts a file between 32768 and it",
+              refused is None and os.path.getsize(cap_agents) > MAX_BYTES)
+        refused, _ = cap_apply('model = "x"\n', fat)
+        check("cap: an absent key keeps 32768", refused is not None and "32 KiB" in refused)
+        refused, _ = cap_apply(None, fat)
+        check("cap: no config.toml keeps 32768", refused is not None)
+        refused, _ = cap_apply("project_doc_max_bytes = 40000\n", "x" * 41000 + "\n")
+        check("cap: a file over the raised cap is refused naming that cap",
+              refused is not None and "40000" in refused)
+        for bad, shown in (('"big"', "big"), ("true", "true"), ("-5", "-5"), ("0", "0")):
+            refused, _ = cap_apply("project_doc_max_bytes = %s\n" % bad, "small\n")
+            check("cap: project_doc_max_bytes = %s refuses naming key and value" % bad,
+                  refused is not None and "project_doc_max_bytes" in refused and shown in refused.lower()
+                  and open(cap_agents).read() == "small\n")
+        refused, _ = cap_apply("project_doc_max_bytes = 100\n", "small\n")
+        check("cap: a cap below the session-notes block says it is too small for the block",
+              refused is not None and "too small for the session-notes block" in refused
+              and open(cap_agents).read() == "small\n")
+        refused, _ = cap_apply(None, "")
+        applied = open(cap_agents).read()
+        refused, _ = cap_apply(None, applied + "\n" * (MAX_BYTES + 50 - len(applied.encode())))
+        check("cap: a file whose only overage is trailing whitespace is accepted",
+              refused is None and len(open(cap_agents).read().encode()) > MAX_BYTES)
+        refused, err = cap_apply("project_doc_max_bytes = 65536\n", "y" * 40000 + "\n")
+        check("cap: the warning scales with the cap (40000 of 65536 is quiet)",
+              refused is None and "close to" not in err and warn_bytes(MAX_BYTES) == WARN_BYTES)
+        refused, err = cap_apply("project_doc_max_bytes = 65536\n", "y" * 60000 + "\n")
+        check("cap: 60000 of 65536 warns, naming 65536",
+              refused is None and "close to the 65536" in err)
+        import memory_hygiene_canary as mhc
+        for tl in (mhc._tomllib, None):
+            open(cap_cfg, "w").write('project_doc_max_bytes = "big"\n')
+            try:
+                got_cap, _fb, prob = mhc._codex_doc_settings(cd)
+            except Exception as exc:
+                got_cap, prob = None, "RAISED %r" % exc
+            if tl is None:
+                saved_t, mhc._tomllib = mhc._tomllib, None
+                try:
+                    got_cap, _fb, prob = mhc._codex_doc_settings(cd)
+                finally:
+                    mhc._tomllib = saved_t
+            check("cap: the canary reports a malformed value and never raises (%s)"
+                  % ("scanner" if tl is None else "default parser"),
+                  got_cap == MAX_BYTES and prob is not None and "project_doc_max_bytes" in prob
+                  and "big" in prob)
+
+        # --- #50.2 / #73.6: prune_backups ---
+        pd2 = os.path.join(tmp, "prune2")
+        os.makedirs(pd2)
+        pf2 = os.path.join(pd2, "f.toml")
+        open(pf2, "w").write("x")
+        future = time.time() + 10 ** 7
+        n2 = ["f.toml.bak-session-notes-20260101-00000%d" % i for i in (1, 2, 3, 4)]
+        for n in n2:
+            open(os.path.join(pd2, n), "w").write(n)
+            os.utime(os.path.join(pd2, n), (future, future))   # future mtimes: mtime must not matter
+        for spelling in (pd2 + "//" + n2[0], n2[0]):
+            prune_backups(pf2, spelling)
+            left = sorted(n for n in os.listdir(pd2) if ".bak-" in n)
+            check("prune: the backup just written survives however its path is spelled (%s)"
+                  % ("bare" if spelling == n2[0] else "double slash"),
+                  n2[0] in left and len(left) == 3 and n2[3] in left and n2[2] in left)
+            open(os.path.join(pd2, n2[1]), "w").write("x")
+            os.utime(os.path.join(pd2, n2[1]), (future, future))
+        for n in os.listdir(pd2):
+            if ".bak-" in n:
+                os.unlink(os.path.join(pd2, n))
+        # a directory that matches the pattern is skipped, never unlinked
+        dname = "f.toml.bak-session-notes-20200101-000000"
+        os.mkdir(os.path.join(pd2, dname))
+        for n in n2:
+            open(os.path.join(pd2, n), "w").write(n)
+        try:
+            prune_backups(pf2, os.path.join(pd2, n2[3]))
+            raised = False
+        except OSError:
+            raised = True
+        check("prune: a directory matching the pattern is skipped, not raised on",
+              not raised and os.path.isdir(os.path.join(pd2, dname))
+              and sorted(n for n in os.listdir(pd2) if n.endswith(tuple("1234"))
+                         and os.path.isfile(os.path.join(pd2, n)))[-3:] == n2[1:])
+        os.rmdir(os.path.join(pd2, dname))
+        # the pattern ends at \Z: a name with a trailing newline is not ours
+        nl = n2[0] + "\n"
+        open(os.path.join(pd2, nl), "w").write("x")
+        prune_backups(pf2, os.path.join(pd2, n2[3]))
+        check("prune: a name with a trailing newline is not a backup and is left alone",
+              os.path.exists(os.path.join(pd2, nl)))
+        if os.path.exists(os.path.join(pd2, nl)):
+            os.unlink(os.path.join(pd2, nl))
+        # a future-stamped name does not hold a slot: it ranks oldest
+        for n in os.listdir(pd2):
+            if ".bak-" in n:
+                os.unlink(os.path.join(pd2, n))
+        fut = "f.toml.bak-session-notes-29990101-000000"
+        for n in n2[:3] + [fut]:
+            open(os.path.join(pd2, n), "w").write(n)
+        prune_backups(pf2, os.path.join(pd2, n2[2]))
+        left = sorted(n for n in os.listdir(pd2) if ".bak-" in n)
+        check("prune: a stamp more than a day in the future ranks oldest and is pruned first",
+              left == sorted(n2[:3]))
+        # new backup names are UTC, so they cannot misorder across a DST change
+        import datetime as _dt
+        saved_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Tokyo"
+        time.tzset()
+        try:
+            utc_now = _dt.datetime.now(_dt.timezone.utc)
+            stamp = backup_path(pf2).rsplit("-", 2)[-2:]
+            got = _dt.datetime.strptime("-".join(stamp), "%Y%m%d-%H%M%S").replace(tzinfo=_dt.timezone.utc)
+        finally:
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
+        check("prune: backup_path stamps UTC, whatever the local zone",
+              abs((got - utc_now).total_seconds()) < 5)
 
         # B2: the scanner
         def defaults_of(text):
