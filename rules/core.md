@@ -31,8 +31,8 @@ file. A private addendum, if the user keeps one, loads after this file and wins 
 The full contract (Review contract, below in this block or imported next to this file) is the
 reference. In short: the reviewer gets fresh context and the
 test-edit check output first, tries to REFUTE the change, quotes code for every finding, and ends
-with APPROVE or CHANGES as a PR comment. At most 2 fix rounds. A user-ordered build merges on
-APPROVE.
+with APPROVE or CHANGES as a PR comment. At most 2 fix rounds. On APPROVE the session asks
+the user `merge #N?` (one PR per question) and merges only on their yes: `wt merge` refuses without it.
 
 ## Effort and models
 - Effort is medium by default, set once by setup (Claude: `CLAUDE_CODE_SUBAGENT_EFFORT`; Codex:

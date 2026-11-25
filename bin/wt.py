@@ -5,7 +5,7 @@ Works in any git repo (run it anywhere inside one, including inside a worktree).
 
     wt.py new <name>                 worktree + branch <name> off origin/<default>
     wt.py pr [--title T] [--body B] [--dry-run]    push this worktree's branch, open a PR
-    wt.py merge [name] [--dry-run]   verdict gate, squash-merge, remove worktree + branch
+    wt.py merge [name] [--dry-run]   verdict gate, CI gate, user consent, squash-merge, remove worktree + branch
     wt.py list                       this repo's worktrees: dirty, ahead, PR state
     wt.py rm <name> [--force]        remove a worktree and its branch
     wt.py gc [--yes]                 list (and on a yes, remove) merged/closed stragglers
@@ -27,13 +27,25 @@ Only comments written by the token's own GitHub login count (a stranger commenti
 public repo cannot approve). The newest such comment must be APPROVE and its sha must equal
 the PR's current head, so any push after the approval voids it. Anything else is refused.
 
+THE CI GATE: any failing or pending check run or commit status on the head sha refuses (exit 8),
+naming the checks; no checks at all proceeds. A check that is also red on the base branch still
+blocks, so the red gets fixed instead of normalized.
+
+THE CONSENT GATE: an APPROVE verdict is something any session can post, so it is not enough. The
+session asks the user `merge #N?` and the user answers yes (or types `merge #N`); the
+UserPromptSubmit hook hooks/merge_consent.py records that human prompt as a grant, and `merge`
+refuses (exit 7) without an unexpired, unused grant for this PR. It posts the user's words on the
+PR, marks the grant used (bound to the head sha), then merges. There is no flag or environment
+variable that skips it.
+
 GitHub access: every gh call goes through one function, with the token from
 `[wt].token_command` exported as GH_TOKEN. The executable is $WT_GH (default `gh`).
 `gc` removes worktrees, so it asks first and is meant to be run by a person, never from a
 scheduled job.
 
 Exit codes: 0 ok; 1 usage or fatal; 2 not in a worktree; 3 token command failed; 4 dirty
-or unpushed; 5 the branch already has a MERGED PR; 6 verdict gate refused.
+or unpushed; 5 the branch already has a MERGED PR; 6 verdict gate refused; 7 no user consent
+for the merge; 8 CI gate refused.
 """
 import argparse
 import json
@@ -46,6 +58,8 @@ import sys
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 import notes_config  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "hooks"))
+import merge_consent  # noqa: E402  (the grant file format has one definition)
 
 VERDICT_PREFIX = "Review verdict: "
 APPROVE = "APPROVE"
@@ -114,6 +128,51 @@ def check_gate(comments, login, head):
     if sha != head:
         return False, "approved sha %s but the PR head is %s" % (sha, head)
     return True, "newest verdict by %s is %s at the current head" % (login, APPROVE)
+
+
+_CI_BAD = {"failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"}
+_CI_OK = {"success", "neutral", "skipped"}
+
+
+def check_ci(runs, statuses):
+    """(ok, message) for the CI gate. runs: check-run dicts; statuses: commit-status dicts.
+    No checks at all is ok; a failing or still-running one refuses, naming it."""
+    failing, pending = [], []
+    for r in runs:
+        name = r.get("name") or "?"
+        if r.get("status") != "completed":
+            pending.append(name)
+        elif r.get("conclusion") in _CI_OK:
+            continue
+        else:
+            failing.append("%s (%s)" % (name, r.get("conclusion") or "no conclusion"))
+    for st in statuses:
+        name = st.get("context") or "?"
+        if st.get("state") == "success":
+            continue
+        (pending if st.get("state") == "pending" else failing).append(
+            name if st.get("state") == "pending" else "%s (%s)" % (name, st.get("state")))
+    if failing:
+        return False, "failing checks: %s%s" % (", ".join(failing),
+                                                "; still running: " + ", ".join(pending) if pending else "")
+    if pending:
+        return False, "checks still running: %s; rerun `wt merge` when CI finishes" % ", ".join(pending)
+    return True, "%d check(s), all passing" % (len(runs) + len(statuses)) if runs or statuses else "no checks configured"
+
+
+def _pages(obj, key):
+    pages = obj if isinstance(obj, list) else [obj]
+    out = []
+    for p in pages:
+        if isinstance(p, dict) and isinstance(p.get(key), list):
+            out.extend(x for x in p[key] if isinstance(x, dict))
+    return out
+
+
+def consent_refusal(number):
+    return ("no user consent for PR #%s: ask the user `merge #%s?` and wait for their yes (or for "
+            "them to type `merge #%s`). A yes counts for 30 minutes, for that one PR, once. Do not "
+            "run `wt merge` again until they answer." % (number, number, number))
 
 
 # ------------------------------------------------------------------ git / gh
@@ -529,6 +588,27 @@ def cmd_merge(args, cfg):
     if not ok:
         raise Die(6, "verdict gate refused PR #%s: %s" % (view["number"], msg))
     print("verdict gate passed: %s" % msg)
+    try:
+        runs = _pages(gh.json(["api", "--paginate", "repos/%s/%s/commits/%s/check-runs?per_page=100"
+                               % (owner, repo, head)], main), "check_runs")
+        statuses = _pages(gh.json(["api", "repos/%s/%s/commits/%s/status?per_page=100"
+                                   % (owner, repo, head)], main), "statuses")
+    except GhError as exc:
+        raise Die(8, "CI gate: could not read the checks for %s (%s); refusing" % (head[:10], exc))
+    ok, msg = check_ci(runs, statuses)
+    if not ok:
+        raise Die(8, "CI gate refused PR #%s: %s" % (view["number"], msg))
+    print("CI gate passed: %s" % msg)
+    orp = "%s/%s" % (owner, repo)
+    grant = merge_consent.find_grant(orp, view["number"])
+    if not grant:
+        if merge_consent.find_null_repo_grant(view["number"]):
+            raise Die(7, "the user's yes for #%s names no repository (the session was not inside a "
+                         "git checkout and the question did not name one), so it is not accepted for %s. "
+                         "Ask the user again from inside the repo, or name the repo in the question: "
+                         "`merge #%s?` for %s." % (view["number"], orp, view["number"], orp))
+        raise Die(7, consent_refusal(view["number"]))
+    print("user consent found: %r" % grant.get("prompt"))
     merge = ["gh", "pr", "merge", str(view["number"]), "--squash", "--delete-branch",
              "--match-head-commit", head, "-R", "%s/%s" % (owner, repo)]
     if args.dry_run:
@@ -538,10 +618,25 @@ def cmd_merge(args, cfg):
         print("  git branch -D %s" % shlex.quote(branch))
         print("  fast-forward the main checkout to origin/%s if it is on %s and clean" % (default, default))
         return 0
+    import tempfile
+    note = 'Merge authorized by the user: "%s" (%s)\n' % (
+        " ".join(str(grant.get("prompt")).split()), merge_consent.stamp(float(grant["ts"]), cfg))
+    fd, tmp = tempfile.mkstemp(prefix="consent-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(note)
+        gh.run(["pr", "comment", str(view["number"]), "-R", orp, "--body-file", tmp], main)
+    except GhError as exc:
+        raise Die(1, "could not post the authorization comment (%s); not merging" % exc)
+    finally:
+        os.unlink(tmp)
+    if not merge_consent.consume_grant(orp, view["number"], head):
+        raise Die(7, consent_refusal(view["number"]))
     try:
         gh.run(merge[1:], main)
     except GhError as exc:
-        raise Die(1, "gh pr merge failed: %s" % exc)
+        raise Die(1, "gh pr merge failed (the user's yes is spent; ask `merge #%s?` again after "
+                     "fixing it): %s" % (view["number"], exc))
     now = git(path, "rev-parse", "HEAD", check=False).stdout.strip()
     if now != head or is_dirty(path):
         print("merged PR #%s, but %s was NOT removed: it has new work since the gated head "
@@ -784,6 +879,12 @@ if a[:2] == ["api", "user"]:
     sys.exit(canned("login"))
 if a[0] == "api" and a[-1].endswith("/comments"):
     sys.exit(canned("comments.json"))
+if a[0] == "api" and any("/check-runs" in x for x in a):
+    sys.exit(canned("check_runs.json")) if os.path.exists(os.path.join(d, "check_runs.json")) else sys.exit(print('{"total_count": 0, "check_runs": []}') or 0)
+if a[0] == "api" and any("/status" in x for x in a):
+    sys.exit(canned("status.json")) if os.path.exists(os.path.join(d, "status.json")) else sys.exit(print('{"state": "pending", "statuses": []}') or 0)
+if a[:2] == ["pr", "comment"]:
+    print("https://github.com/example/proj/pull/7#issuecomment-9"); sys.exit(0)
 if a[:2] == ["pr", "create"]:
     print("https://github.com/example/proj/pull/7"); sys.exit(0)
 if a[:2] == ["pr", "merge"]:
@@ -797,6 +898,7 @@ sys.stderr.write("stub: unhandled %s\n" % a); sys.exit(1)
 
 def selftest():
     import tempfile
+    import time
     fails = []
 
     def check(name, cond, detail=""):
@@ -902,6 +1004,8 @@ def selftest():
 
         # location rule (pure)
         cfg0 = notes_config.load(cfgfile)
+        cfg_for_grants = dict(cfg0, paths=dict(cfg0["paths"], shared_state_dir=os.path.join(
+            env["HOME"], ".claude", "session-notes", "state")))
         check("location: default nested", worktree_path(R, "x", cfg0) == os.path.join(R, ".worktrees", "x"))
         R2 = mkrepo("tracked", tracked_claude=True, with_origin=False)
         check("location: tracked CLAUDE.md -> hidden sibling",
@@ -972,11 +1076,26 @@ def selftest():
         view = {"number": 7, "headRefOid": head, "state": "OPEN",
                 "url": "https://github.com/example/proj/pull/7"}
 
-        def setup_gate(comments, login="me", v=view):
+        grants_file = os.path.join(env["HOME"], ".claude", "session-notes", "state",
+                                   "merge-consent", "grants.json")
+
+        def grant(pr, repo="example/proj", age=0, prompt="yes", used=False):
+            """Seed the user's yes in the grant file, as the merge_consent hook records it."""
+            os.makedirs(os.path.dirname(grants_file), exist_ok=True)
+            cur = merge_consent._read(grants_file)
+            cur.append({"repo": repo, "pr": pr, "ts": time.time() - age, "prompt": prompt,
+                        "session": "s", "used": used})
+            merge_consent._write(grants_file, cur)
+
+        def setup_gate(comments, login="me", v=view, consent=True):
             reset_stub()
             canned("pr_view.json", v)
             canned("login", login + "\n")
             canned("comments.json", comments)
+            if os.path.exists(grants_file):
+                os.remove(grants_file)
+            if consent:
+                grant(v["number"])
 
         def cm(login, body, ts, i):
             return {"id": i, "created_at": ts, "user": {"login": login}, "body": body}
@@ -1113,6 +1232,99 @@ def selftest():
               rc == 4 and "detached" in err and os.path.isdir(dw), (rc, out, err))
         rc, out, err = wt(R, "rm", "detwt", "--force")
         check("rm --force removes the detached worktree", rc == 0 and not os.path.exists(dw), (rc, err))
+
+
+        # the CI gate (#79) and the user-consent gate (#98)
+        check("check_ci: no checks proceeds", check_ci([], [])[0])
+        check("check_ci: green proceeds", check_ci(
+            [{"name": "a", "status": "completed", "conclusion": "success"},
+             {"name": "b", "status": "completed", "conclusion": "skipped"}],
+            [{"context": "s", "state": "success"}])[0])
+        okc, msgc = check_ci([{"name": "lint", "status": "completed", "conclusion": "failure"}], [])
+        check("check_ci: a failing run refuses, named", not okc and "lint (failure)" in msgc, msgc)
+        okc, msgc = check_ci([{"name": "tests", "status": "in_progress"}], [])
+        check("check_ci: a pending run refuses, named", not okc and "tests" in msgc and "still running" in msgc, msgc)
+        okc, msgc = check_ci([], [{"context": "ci/x", "state": "error"}])
+        check("check_ci: a failing commit status refuses, named", not okc and "ci/x" in msgc, msgc)
+        check("check_ci: an unknown conclusion refuses", not check_ci(
+            [{"name": "a", "status": "completed", "conclusion": "weird"}], [])[0])
+
+        cw, cw_sha = pushed_wt("consentwt")
+        cview = dict(view, number=12, headRefOid=cw_sha, url="https://github.com/example/proj/pull/12")
+        capprove = [cm("me", verdict_line(APPROVE, cw_sha), "2026-01-02T00:00:00Z", 2)]
+
+        def merges():
+            return [e["argv"] for e in log() if e["argv"][:2] == ["pr", "merge"]]
+
+        setup_gate(capprove, v=cview, consent=False)
+        rc, out, err = wt(cw, "merge")
+        check("consent: APPROVE but no grant is refused with the ask text (7), nothing merged",
+              rc == 7 and "ask the user `merge #12?` and wait for their yes" in err and not merges(), (rc, err))
+        grant(13)
+        rc, out, err = wt(cw, "merge")
+        check("consent: a grant for #13 does not authorize #12", rc == 7 and not merges(), (rc, err))
+        grant(12, age=31 * 60)
+        rc, out, err = wt(cw, "merge")
+        check("consent: a grant 31 minutes old is refused", rc == 7 and not merges(), (rc, err))
+        grant(12, repo="other/repo")
+        rc, out, err = wt(cw, "merge")
+        check("consent: a grant for another repo is refused", rc == 7 and not merges(), (rc, err))
+        grant(12, repo=None)
+        rc, out, err = wt(cw, "merge")
+        check("consent: a null-repo grant is refused, with the ask-inside-the-repo text",
+              rc == 7 and "names no repository" in err and not merges(), (rc, err))
+        grant(12, repo="example/other")
+        rc, out, err = wt(cw, "merge")
+        check("consent: repo A #12 does not authorize repo B #12", rc == 7 and not merges(), (rc, err))
+        grant(12, used=True)
+        rc, out, err = wt(cw, "merge")
+        check("consent: a used grant is refused", rc == 7 and not merges(), (rc, err))
+        check("consent: refusals posted no comment", not any(e["argv"][:2] == ["pr", "comment"] for e in log()))
+
+        grant(12, age=29 * 60, prompt="yes please\nmerge it")
+        canned("check_runs.json", {"total_count": 1, "check_runs": [
+            {"name": "tests", "status": "completed", "conclusion": "failure"}]})
+        rc, out, err = wt(cw, "merge")
+        check("CI: a failing check refuses (8), names it, spends no grant",
+              rc == 8 and "tests (failure)" in err and not merges()
+              and merge_consent.find_grant("example/proj", 12, cfg=cfg_for_grants) is not None, (rc, err))
+        canned("check_runs.json", {"total_count": 1, "check_runs": [{"name": "tests", "status": "queued"}]})
+        rc, out, err = wt(cw, "merge")
+        check("CI: a pending check refuses (8)", rc == 8 and "tests" in err and not merges(), (rc, err))
+        canned("check_runs.json", {"total_count": 0, "check_runs": []})
+        canned("status.json", {"state": "failure", "statuses": [{"context": "ci/legacy", "state": "failure"}]})
+        rc, out, err = wt(cw, "merge")
+        check("CI: a failing legacy commit status refuses (8)", rc == 8 and "ci/legacy" in err, (rc, err))
+        os.remove(os.path.join(stubdir, "status.json"))
+        canned("check_runs.json", {"total_count": 1, "check_runs": [
+            {"name": "tests", "status": "completed", "conclusion": "success"}]})
+        rc, out, err = wt(cw, "merge", "--dry-run")
+        check("consent: --dry-run says the grant is found and spends nothing",
+              rc == 0 and "user consent found" in out and not merges()
+              and merge_consent.find_grant("example/proj", 12, cfg=cfg_for_grants) is not None, (rc, out, err))
+        rc, out, err = wt(cw, "merge")
+        comments_posted = [e["argv"] for e in log() if e["argv"][:2] == ["pr", "comment"]]
+        check("CI green + a fresh grant: merges, pinned to the head",
+              rc == 0 and len(merges()) == 1 and cw_sha in merges()[0], (rc, out, err))
+        check("consent: the authorization comment was posted for PR 12 first",
+              len(comments_posted) == 1 and comments_posted[0][2] == "12", comments_posted)
+        used = [g_ for g_ in merge_consent._read(grants_file) if g_.get("used") and g_.get("head") == cw_sha]
+        check("consent: the grant is marked used and bound to the head sha", len(used) == 1, used)
+        check("consent: comment order: authorization before merge",
+              [e["argv"][:2] for e in log() if e["argv"][:2] in (["pr", "comment"], ["pr", "merge"])]
+              == [["pr", "comment"], ["pr", "merge"]])
+
+        cw2, cw2_sha = pushed_wt("consentwt2")
+        c2view = dict(cview, headRefOid=cw2_sha)
+        setup_gate([cm("me", verdict_line(APPROVE, cw2_sha), "2026-01-02T00:00:00Z", 2)], v=c2view,
+                   consent=False)
+        grant(12, used=True)
+        rc, out, err = wt(cw2, "merge")
+        check("consent: single use, the same yes cannot merge a second time", rc == 7 and not merges(), (rc, err))
+        canned("check_runs.json", {"total_count": 0, "check_runs": []})
+        grant(12)
+        rc, out, err = wt(cw2, "merge")
+        check("CI: no checks configured proceeds", rc == 0 and len(merges()) == 1, (rc, out, err))
 
         # N2: a hand-deleted worktree directory
         import shutil

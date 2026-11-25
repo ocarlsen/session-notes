@@ -883,6 +883,20 @@ def wt_row(wt_py, tmp):
         head = sh(["git", "rev-parse", "HEAD"], path, env).stdout.strip()
         view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7"}
 
+        grants = os.path.join(home, ".claude", "session-notes", "state", "merge-consent", "grants.json")
+
+        def grant(on):
+            """The user's yes to `merge #7` for o/r, as hooks/merge_consent.py records it."""
+            if os.path.exists(grants):
+                os.remove(grants)
+            if on:
+                os.makedirs(os.path.dirname(grants), exist_ok=True)
+                with open(grants, "w") as fh:
+                    json.dump({"grants": [{"repo": "o/r", "pr": 7, "ts": time.time(), "prompt": "yes",
+                                           "session": "s", "used": False}]}, fh)
+
+        grant(True)
+
         def scenario(comments):
             with open(os.path.join(stubdir, "scenario.json"), "w") as fh:
                 json.dump({"view": view, "login": "tester", "comments": comments}, fh)
@@ -901,6 +915,9 @@ def wt_row(wt_py, tmp):
         if r2.returncode != 6:
             return FAIL, "merge with a stale-sha verdict: rc=%d (want 6)" % r2.returncode
         scenario([comment("APPROVE", head)])
+        grant(False)
+        r3a = sh(wt + ["merge", "feat", "--dry-run"], path, env, check=False)
+        grant(True)
         r3 = sh(wt + ["merge", "feat", "--dry-run"], path, env, check=False)
         with open(os.path.join(stubdir, "gh-calls.jsonl")) as fh:
             calls = [json.loads(x) for x in fh.read().splitlines()]
@@ -912,11 +929,14 @@ def wt_row(wt_py, tmp):
         if r3.returncode != 0 or "verdict gate passed" not in r3.stdout:
             return FAIL, "positive control (APPROVE at head) did not pass the gate: rc=%d %s" % (
                 r3.returncode, (r3.stderr or r3.stdout)[-160:])
+        if r3a.returncode != 7 or "merge #7?" not in r3a.stderr:
+            return FAIL, "APPROVE at head with NO user grant was not refused with rc 7: rc=%d %s" % (
+                r3a.returncode, (r3a.stderr or r3a.stdout)[-160:])
         if merged:
             return FAIL, "gh pr merge was called during a refused or dry-run merge: %r" % merged
         if not any(c[:2] == ["pr", "create"] for c in calls):
             return FAIL, "wt pr never called gh pr create"
-        return PASS, "no verdict rc6, stale sha rc6, APPROVE at head passes the gate, no pr merge call"
+        return PASS, "no verdict rc6, stale sha rc6, APPROVE without a grant rc7, APPROVE with a grant passes the gate, no pr merge call"
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         return FAIL, "wt row error: %s" % exc
 
@@ -1195,6 +1215,7 @@ def selftest():
             fh.write(src.replace(sentinel, "    return True, 'mutated'\n" + sentinel, 1))
         sys.path_importer_cache.clear()
         shutil.copytree(os.path.join(SRC_REPO, "bin"), os.path.join(d, "binc"))
+        shutil.copytree(os.path.join(SRC_REPO, "hooks"), os.path.join(d, "hooks"))
         shutil.copy(broken, os.path.join(d, "binc", "wt.py"))
         r2 = os.path.join(d, "r2")
         os.makedirs(r2)

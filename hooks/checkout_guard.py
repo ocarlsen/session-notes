@@ -666,6 +666,10 @@ def _script_of(argv):
 
 
 def _config_msg(path):
+    if "merge-consent" in path.split(os.sep):
+        return ("checkout_guard: %s is the merge-consent grant store, written only by the user's "
+                "own prompt through the merge_consent hook. The user grants a merge by answering "
+                "`merge #N?` with a yes; the agent cannot edit this file: ask the user." % path)
     return ("checkout_guard: %s is the session-notes config, which holds this guard's own "
             "exemptions. It is edited by the user, not the agent: ask the user to change it."
             % path)
@@ -676,7 +680,14 @@ def protected_paths():
     even when the file fails to parse. Empty only if notes_config could not be imported."""
     if notes_config is None:
         return set()
-    return {os.path.realpath(os.path.abspath(notes_config.config_path()))}
+    out = {os.path.realpath(os.path.abspath(notes_config.config_path()))}
+    # The merge-consent grant store (hooks/merge_consent.py): the directory and so every file in it.
+    try:
+        out.add(os.path.realpath(os.path.dirname(
+            notes_config.shared_state_path("merge-consent", "grants.json"))) + os.sep)
+    except notes_config.ConfigError:
+        pass  # a broken config: the config file itself is still protected
+    return out
 
 
 def is_protected(path, cwd, protected):
@@ -684,7 +695,9 @@ def is_protected(path, cwd, protected):
         return False
     p = os.path.expanduser(path)
     p = p if os.path.isabs(p) else os.path.join(cwd, p)
-    return os.path.realpath(p) in protected
+    real = os.path.realpath(p)
+    return real in protected or any(
+        d.endswith(os.sep) and (real + os.sep).startswith(d) for d in protected)
 
 
 _GLOB_CHARS = re.compile(r"[*?\[]")
@@ -1463,6 +1476,29 @@ def selftest():
                     "less " + cfgp, "sed -n 1p " + cfgp, "echo hi > " + os.path.join(tmp, "other.txt"),
                     "tee " + os.path.join(tmp, "other.txt"), "cat " + cfgp + " > " + os.path.join(tmp, "o2.txt")):
             check("config protected (control, reads pass): " + cmd, passed(bash(cmd, tmp)))
+
+        # The merge-consent grant store is protected like the config (hooks/merge_consent.py)
+        gdir = os.path.join(home, ".claude", "session-notes", "state", "merge-consent")
+        gfile = os.path.join(gdir, "grants.json")
+        for label, payload in (
+                ("Edit", {"tool_name": "Edit", "tool_input": {"file_path": gfile}, "cwd": tmp}),
+                ("Write", {"tool_name": "Write", "tool_input": {"file_path": gfile}, "cwd": tmp}),
+                ("Write, a new file in the dir", {"tool_name": "Write", "tool_input": {
+                    "file_path": os.path.join(gdir, "other.json")}, "cwd": tmp}),
+                ("Write via ..", {"tool_name": "Write", "tool_input": {
+                    "file_path": os.path.join(gdir, "..", "merge-consent", "grants.json")}, "cwd": tmp})):
+            r = run(payload)
+            check("grants protected (Arm A): " + label, refused(r) and "grant store" in r.stderr, r.stderr)
+        for cmd in ("echo '{}' > " + gfile, "echo x >> " + gfile, "tee " + gfile, "cp /tmp/x " + gfile,
+                    "mv /tmp/x " + gfile, "rm " + gfile, "rm -rf " + gdir, "mv " + gdir + " /tmp/gone",
+                    "sed -i '' s/a/b/ " + gfile, "truncate -s 0 " + gfile,
+                    "bash -c 'echo x > " + gfile + "'", "true; echo x > " + gfile):
+            r = bash(cmd, tmp)
+            check("grants protected (shell): " + cmd, refused(r) and "grant store" in r.stderr, r.stderr)
+        for cmd in ("cat " + gfile, "grep x " + gfile, "cp " + gfile + " /tmp/copy-of-grants"):
+            check("grants protected (control, reads pass): " + cmd, passed(bash(cmd, tmp)))
+        r = run_env(eenv, {"tool_name": "Edit", "tool_input": {"file_path": gfile}, "cwd": cfgrepo})
+        check("grants protected: refused even when the config exempts the repo", refused(r), r.stderr)
 
         # No override
         for cmd in ("CHECKOUT_GUARD=off gh pr merge 1", "gh pr merge 1 # checkout_guard: allow",

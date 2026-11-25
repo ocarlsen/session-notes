@@ -384,6 +384,7 @@ fi
 
 PR="python3 $SHOWN/hooks/session_pane_registry.py"
 BUS="python3 $SHOWN/hooks/session_bus_hook.py"
+CONSENT="python3 $SHOWN/hooks/merge_consent.py"
 LIVE="python3 $SHOWN/bin/live.py hook"
 hook() { printf '    {"hooks": [{"type": "command", "command": "%s"}]}' "$1"; }
 if [ "$ALL" = 1 ]; then
@@ -405,7 +406,8 @@ $(hook "$LIVE")
   ],
   "UserPromptSubmit": [
 $(hook "$PR"),
-$(hook "$BUS")$EXTRA_PROMPT
+$(hook "$BUS"),
+$(hook "$CONSENT")$EXTRA_PROMPT
   ],
   "Stop": [
 $(hook "$PR"),
