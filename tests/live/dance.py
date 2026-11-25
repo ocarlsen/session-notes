@@ -24,6 +24,21 @@ import time
 
 import selftest_live as sl
 
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+if os.path.join(REPO, "bin") not in sys.path:
+    sys.path.append(os.path.join(REPO, "bin"))
+import notes_config  # noqa: E402  (the module the tools resolve their state paths with)
+
+
+def load_hook():
+    """The consent hook module, loaded from this checkout (its own last_assistant_text and asked_pr
+    decide what counts as the ask)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("consent_hook_mod", os.path.join(REPO, "hooks", "merge_consent.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
 PASS, FAIL = sl.PASS, sl.FAIL
 
 # Per-scene step tables (feature id, table title, scope). The ids are scene names; `realdirs`
@@ -54,7 +69,8 @@ PANE_ROWS = ()
 
 # The launchers the sandbox swaps in so the REAL hook and the REAL `wt` keep their grants in the
 # sandbox. merge_consent.grants_path() is the passwd home of the running user, never $HOME, so
-# without this a sandbox session's "yes" would be written under the real ~/.claude. Both use the
+# without this a sandbox session's "yes" (and its seen/ marker) would be written under the real
+# home, at the hook's GRANTS_REL. Both use the
 # module-constant override the selftests use (sl.WT_TEST_LAUNCH); no variable can move it.
 HOOK_LAUNCH = """#!/usr/bin/env python3
 import importlib.util, sys
@@ -83,8 +99,12 @@ def write_launcher(path, template, **kw):
     os.chmod(path, 0o755)
 
 
+CODEX_FORM = re.compile(r"\S+ hook merge_consent\b")
+
+
 def patch_consent_hook(settings_path, launcher):
-    """Point every merge_consent hook command in a Claude settings file at `launcher`. -> how many."""
+    """Point every merge_consent hook command in a Claude settings.json (`python3 .../merge_consent.py`)
+    or a Codex hooks.json (`<launcher> hook merge_consent`) at `launcher`. -> how many."""
     with open(settings_path) as fh:
         doc = json.load(fh)
     n = [0]
@@ -94,6 +114,9 @@ def patch_consent_hook(settings_path, launcher):
             for k, v in o.items():
                 if k == "command" and isinstance(v, str) and "hooks/merge_consent.py" in v:
                     o[k] = re.sub(r"\S*hooks/merge_consent\.py", launcher, v)
+                    n[0] += 1
+                elif k == "command" and isinstance(v, str) and CODEX_FORM.search(v):
+                    o[k] = CODEX_FORM.sub("python3 " + launcher, v)
                     n[0] += 1
                 else:
                     walk(v)
@@ -146,15 +169,60 @@ class Dance(sl.Live):
         """The session_bus.py command prefix as the environment's allow rule spells it."""
         return "python3 %s" % shlex.quote(os.path.join(os.path.realpath(self.repo), "bin", "session_bus.py"))
 
+    def state_paths(self):
+        """(bus.jsonl, last-check.json) where the tools put them under THIS run's environment, asked of
+        notes_config as session_bus.py and nightly_check.py ask it (they sit in a dot directory: no glob)."""
+        env = self.env()
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = env["HOME"]  # notes_config expands `~` from the process HOME, as the tools' own HOME does
+        try:
+            paths = notes_config.load(env=env)["paths"]
+        finally:
+            if old is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old
+        return os.path.join(paths["shared_state_dir"], "session-bus", "bus.jsonl"), paths["last_check"]
+
     def bus_msgs(self):
         out = []
-        for f in glob.glob(os.path.join(self.home, "**", "session-bus", "bus.jsonl"), recursive=True):
-            try:
-                with open(f, encoding="utf-8") as fh:
-                    out += [json.loads(x) for x in fh.read().splitlines() if x.strip()]
-            except (OSError, ValueError):
-                pass
+        try:
+            with open(self.state_paths()[0], encoding="utf-8") as fh:
+                out = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        except (OSError, ValueError):
+            pass
         return sorted(out, key=lambda m: m.get("ts", 0))
+
+    def read_last_check(self):
+        try:
+            with open(self.state_paths()[1]) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def asked_merge(self, rid, n=7):
+        """True when the newest assistant reply of the Claude session whose prompt carried `rid` ends on
+        the ask `merge #n?`, read by the consent hook's own last_assistant_text and asked_pr."""
+        hook = load_hook()
+        d = self.scoped("claude", rid)
+        try:
+            for f in glob.glob(os.path.join(d, "*.jsonl")):
+                text = hook.last_assistant_text(f)
+                if text and hook.asked_pr(text) == n:
+                    return True
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return False
+
+    @staticmethod
+    def store_has(store, tok):
+        for f in glob.glob(os.path.join(store, "**", "*"), recursive=True):
+            try:
+                if os.path.isfile(f) and tok in open(f, encoding="utf-8", errors="replace").read():
+                    return True
+            except OSError:
+                pass
+        return False
 
     def bus_find(self, frm, to, needle):
         for m in self.bus_msgs():
@@ -210,9 +278,10 @@ class Dance(sl.Live):
         # the real hook and the real wt, with their grants kept in the sandbox
         hook = os.path.join(self.root, "consent_hook.py")
         write_launcher(hook, HOOK_LAUNCH, hook=os.path.join(self.repo, "hooks", "merge_consent.py"), grants=self.grants)
-        n = patch_consent_hook(os.path.join(self.claude_dir, "settings.json"), hook)
-        if not n:
+        if not patch_consent_hook(os.path.join(self.claude_dir, "settings.json"), hook):
             raise sl.Abort("the sandbox Claude settings carry no merge_consent hook to point at the sandbox grants")
+        if not patch_consent_hook(os.path.join(self.codex_dir, "hooks.json"), hook):
+            raise sl.Abort("the sandbox Codex hooks.json carries no merge_consent hook to point at the sandbox grants")
         wt = os.path.join(self.bin, "wt")
         if os.path.lexists(wt):
             os.remove(wt)
@@ -329,6 +398,8 @@ class Dance(sl.Live):
     # -- scene 4 --------------------------------------------------------------------------------
     def scene_guard(self):
         c, t = self.CLAUDE_PANE, self.tok
+        if not self.poem:
+            return FAIL, "no poem to add: the poem scene did not produce its four lines", None
         rid = "GUARD" + t
         refusal = re.compile(r"checkout_guard: \S*poem\.md is tracked on")
         main_poem = os.path.join(self.proj, "poem.md")
@@ -419,8 +490,7 @@ class Dance(sl.Live):
         self.send(c, "Run exactly this shell command: wt merge poem  If it is refused, do what its message says. When the "
                      "user later answers yes, run `wt merge poem` once more. End the reply in which you ask for the yes "
                      "with exactly this last line: merge #7?  (run id %s)" % rid2)
-        asked = lambda: re.search(r"merge #7\?\s*$", self.pane_reply("claude", rid2).strip())
-        if not self.wait_for(asked, 240):
+        if not self.wait_for(lambda: self.asked_merge(rid2), 240):
             return FAIL, "Claude never ended a reply on `merge #7?`", None
         self.wait_idle(c, 90)
         if any(x[:2] == ["pr", "merge"] for x in self.gh_calls()):
@@ -469,14 +539,16 @@ class Dance(sl.Live):
                 evidence = ev
         if bad:
             return FAIL, "; ".join(bad), evidence
+        ctok, xtok = ["REFLECT%s%s" % (self.tok, c[:2].upper()) for c in ("claude", "codex")]
+        gc, gx = self.store_dirs()
+        for tok, store, what in ((ctok, gx, "Claude's fact is in the Codex store"), (xtok, gc, "Codex's fact is in the Claude store")):
+            if self.store_has(store, tok):
+                return FAIL, "the memories are not separate: " + what, None
         out = os.path.join(self.logs, "nightly.txt")
         self.show_command("claude", "nightly", "python3 %s > %s 2>&1; echo \"nightly_check exit code: $?\"" % (
             shlex.quote(os.path.join(self.repo, "bin", "nightly_check.py")), shlex.quote(out)))
-        recs = glob.glob(os.path.join(self.home, "**", "last-check.json"), recursive=True)
-        try:
-            with open(recs[0]) as fh:
-                doc = json.load(fh)
-        except (IndexError, OSError, ValueError):
+        doc = self.read_last_check()
+        if doc is None:
             return FAIL, "nightly_check wrote no readable last-check.json", "nightly.txt"
         checks = doc.get("checks", [])
         agents = {c.get("agent") for c in checks}
@@ -543,6 +615,40 @@ def offline_checks(check):
               str(done.get("table")))
         d.results.clear()
         d.panes_of = {}
+        # B1: the bus log and the nightly record are read where the tools write them (dot directories)
+        bus_path, lc_path = d.state_paths()
+        if not (bus_path.startswith(d.home + os.sep) and lc_path.startswith(d.home + os.sep)):
+            check("dance: the state paths sit under the sandbox home", False, "%s %s" % (bus_path, lc_path))
+            raise SystemExit("refusing to write outside the sandbox: %s %s" % (bus_path, lc_path))
+        for pth in (bus_path, lc_path):
+            os.makedirs(os.path.dirname(pth), exist_ok=True)
+        with open(bus_path, "w") as fh:
+            fh.write(json.dumps({"id": "a", "ts": 1.0, "from": "cA", "to": "xA", "body": "MAIL" + d.tok}) + "\n")
+        with open(lc_path, "w") as fh:
+            json.dump({"rc": 0, "checks": [{"agent": "claude", "check": "x", "status": "clean"}]}, fh)
+        check("dance: the bus log written at the notes_config path is read back by bus_msgs and bus_find",
+              len(d.bus_msgs()) == 1 and d.bus_find("cA", "xA", "MAIL" + d.tok) is not None, bus_path)
+        check("dance: the nightly record at the notes_config path is read back (scene 7's lookup)",
+              (d.read_last_check() or {}).get("rc") == 0, lc_path)
+        check("dance: the state paths sit under the sandbox home", True)
+        check("dance: negative control, a message not on the bus is not found", d.bus_find("xA", "cA", "MAIL" + d.tok) is None)
+        # B2: the ask is read from the newest assistant reply, in the real Claude key order (reply text NOT last)
+        def transcript(rid, reply):
+            tdir = os.path.join(d.claude_dir, "projects", "p" + rid)
+            os.makedirs(tdir, exist_ok=True)
+            with open(os.path.join(tdir, "s.jsonl"), "w") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "go (run id %s)" % rid}}) + "\n")
+                fh.write(json.dumps({"parentUuid": "p1", "isSidechain": False,
+                                     "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+                                     "requestId": "r", "type": "assistant", "uuid": "u1", "timestamp": "2026-11-24T10:00:00Z",
+                                     "userType": "external", "cwd": "/w", "sessionId": "s1", "version": "2", "gitBranch": "main"}) + "\n")
+        transcript("RIDA", "The merge is refused: no yes yet.\n\nmerge #7?")
+        transcript("RIDB", "Done. Nothing to ask.")
+        transcript("RIDC", "Ready.\n\nmerge #8?")
+        check("dance: a reply ending on `merge #7?` is read as the ask though the line's last string is metadata",
+              d.asked_merge("RIDA"))
+        check("dance: negative control, a reply with no ask is not", not d.asked_merge("RIDB"))
+        check("dance: negative control, an ask for another PR is not", not d.asked_merge("RIDC"))
         # the "user types: yes" note is on the status BEFORE the keystroke, and cleared after
         d.plan = plan
         d.panes.add("cA")
@@ -560,18 +666,34 @@ def offline_checks(check):
               "Enter: next step" in sl.render_status({"phase": "running", "note": ""})[2])
     finally:
         shutil.rmtree(d.root, ignore_errors=True)
-    # --scenario argument validation: the real entry point refuses before anything is built
-    def rc_of(*args):
-        r = subprocess.run([sys.executable, main_py] + list(args), capture_output=True, text=True, timeout=60)
-        return r.returncode, r.stderr
-    rc, err = rc_of("--scenario", "dance")
+    # --scenario argument validation, in-process: main() runs with a stub in place of every constructor,
+    # so a refusal that regressed would raise instead of starting a live run
+    import io
+    def main_rc(*args):
+        class Boom(Exception):
+            pass
+        def boom(*a, **k):
+            raise Boom("main() went on to build a run")
+        old = (sys.argv, sys.stderr, sl.Live, sl.load_scenario)
+        sys.argv, sys.stderr, sl.Live, sl.load_scenario = ["selftest_live.py"] + list(args), io.StringIO(), boom, boom
+        try:
+            return sl.main(), sys.stderr.getvalue()
+        except Boom as exc:
+            return "built", str(exc)
+        except SystemExit as exc:
+            return exc.code, sys.stderr.getvalue()
+        finally:
+            sys.argv, sys.stderr, sl.Live, sl.load_scenario = old
+    rc, err = main_rc("--scenario", "dance")
     check("dance: --scenario without --watch is refused (exit 2)", rc == 2 and "--watch" in err, "%s %s" % (rc, err))
     for flag in (["--feature", "boot"], ["--only", "claude"], ["--codex-alone"]):
-        rc, err = rc_of("--watch", "--scenario", "dance", *flag)
+        rc, err = main_rc("--watch", "--scenario", "dance", *flag)
         check("dance: --scenario dance with %s is refused (exit 2)" % flag[0], rc == 2 and flag[0] in err, "%s %s" % (rc, err))
-    rc, _err = rc_of("--watch", "--scenario", "nope")
+    rc, _err = main_rc("--watch", "--scenario", "nope")
     check("dance: an unknown scenario is refused (exit 2)", rc == 2)
-    check("dance: negative control, --watch --scenario dance alone raises no problem",
+    rc, _err = main_rc("--watch", "--scenario", "dance")
+    check("dance: negative control, a valid --watch --scenario dance goes on to build the run", rc == "built", str(rc))
+    check("dance: negative control, scenario_problem allows --watch --scenario dance alone",
           sl.scenario_problem(argparse.Namespace(scenario="dance", watch=True, feature=None, only=None, codex_alone=False)) is None)
     # the settings patch and the launchers
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
@@ -584,6 +706,15 @@ def offline_checks(check):
         txt = open(sp).read()
         check("dance: the settings patch repoints the consent hook and nothing else",
               n == 1 and "python3 /sb/consent_hook.py" in txt and "session_bus_hook.py" in txt and "merge_consent" not in txt, txt)
+        with open(sp, "w") as fh:
+            json.dump({"UserPromptSubmit": [{"hooks": [
+                {"type": "command", "command": "SESSION_NOTES_AGENT=codex '/h/.local/bin/session-notes' hook time_sense"},
+                {"type": "command", "command": "SESSION_NOTES_AGENT=codex '/h/.local/bin/session-notes' hook merge_consent"}]}]}, fh)
+        n = patch_consent_hook(sp, "/sb/consent_hook.py")
+        txt = open(sp).read()
+        check("dance: the Codex hooks.json consent hook is repointed too, and no other hook",
+              n == 1 and "SESSION_NOTES_AGENT=codex python3 /sb/consent_hook.py" in txt and "hook time_sense" in txt
+              and "hook merge_consent" not in txt, txt)
         with open(sp, "w") as fh:
             json.dump({"hooks": {}}, fh)
         check("dance: negative control, no consent hook patches nothing", patch_consent_hook(sp, "/sb/c.py") == 0)
@@ -602,8 +733,14 @@ def offline_checks(check):
         repo = os.path.dirname(os.path.dirname(here))
         write_launcher(launcher, HOOK_LAUNCH, hook=os.path.join(repo, "hooks", "merge_consent.py"), grants=grants)
         import pwd
-        real = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, *(".claude", "session-notes", "state", "merge-consent", "grants.json"))
-        before = os.stat(real).st_mtime_ns if os.path.exists(real) else None
+        hook_mod = load_hook()
+        check("dance: negative control, the loaded hook's override is unset", hook_mod.GRANTS_PATH_OVERRIDE is None)
+        real = hook_mod.grants_path()  # the real one: the passwd home plus the hook's own GRANTS_REL
+        check("dance: the real grants path is the passwd home plus the hook's GRANTS_REL",
+              real == os.path.join(pwd.getpwuid(os.getuid()).pw_dir, *hook_mod.GRANTS_REL), real)
+        real_seen = os.path.join(os.path.dirname(real), "seen", "dance")
+        stat = lambda p: os.stat(p).st_mtime_ns if os.path.exists(p) else None
+        before = (stat(real), stat(real_seen))
         for _ in (1, 2):  # the first prompt of a session never grants
             subprocess.run([sys.executable, launcher], input=json.dumps({"prompt": "merge #7", "session_id": "dance",
                                                                          "cwd": proj}), env=env, capture_output=True, text=True, timeout=60)
@@ -613,8 +750,10 @@ def offline_checks(check):
             gr = []
         check("dance: the real consent hook, through the launcher, records the grant in the sandbox with repo o/r",
               len(gr) == 1 and gr[0].get("pr") == 7 and gr[0].get("repo") == "o/r" and gr[0].get("prompt") == "merge #7", str(gr))
-        after = os.stat(real).st_mtime_ns if os.path.exists(real) else None
-        check("dance: the real grants file under the user's home was not touched", before == after, "%s -> %s" % (before, after))
+        after = (stat(real), stat(real_seen))
+        check("dance: the real grants file and its seen/dance marker were not touched", before == after, "%s -> %s" % (before, after))
+        check("dance: the sandbox got its own seen/dance marker beside the sandbox grants",
+              os.path.exists(os.path.join(os.path.dirname(grants), "seen", "dance")))
         wt = os.path.join(tmp, "wt")
         write_launcher(wt, WT_LAUNCH, wt=os.path.join(repo, "bin", "wt.py"), grants=grants)
         r = subprocess.run([sys.executable, wt, "--help"], env=env, capture_output=True, text=True, timeout=60)

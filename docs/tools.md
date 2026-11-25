@@ -720,11 +720,12 @@ selftest keys (never your own login). It needs both CLIs; `--scenario` requires 
 7. Separate memories: `/reflect` and `$reflect` each write their own store; `bin/nightly_check.py` reports both clean.
 8. The whole story, replayed: the bus log as a timeline; then the normal teardown (`--keep` keeps the sandbox).
 
-The consent hook and `wt` keep their grants in the sandbox (the grants file is normally under the user's real
-home, so the sandbox swaps in two small launchers that set the same test override the selftests use). The
+The consent hook (the Claude `settings.json` and the Codex `hooks.json` entries) and `wt` keep their grants and
+`seen/` markers in the sandbox (they are normally under the user's real home, so the sandbox swaps in two small
+launchers that set the same test override the selftests use). The
 `origin` of the scratch project ends in `o/r.git`, so the hook reads the repo as `o/r`, as the stub PR url says.
 `python3 tests/live/selftest_live.py --selftest` covers the scenes' offline parts (titles, plan, argument checks,
-the status note, the launchers); the live scenes need your own `--watch` run.
+the status note, the state paths and the merge ask read from real transcript shapes, the launchers); the live scenes need your own `--watch` run.
 
 #### Status file
 
@@ -740,8 +741,10 @@ atomically at each transition, so a storyboard can time chapter cards off it:
 `phase` is `title` (the chapter title is up, before the step runs), `running`, `result` (the step
 finished; `result` is PASS, FAIL or SKIP), `done` (the final table, in `table`, is up until `q`) or
 `aborted` (screen guard, `q`, Ctrl-C or any other abort; `note` says why; once written the file is
-final). `id` is the feature id and `cli` is `claude`,
+final). A scenario can also set `note` on a running step: a line for the viewer, shown on the status
+pane's last row (the dance writes `user types: yes` before it types the human's yes, and clears it after).
+`id` is the feature id and `cli` is `claude`,
 `codex` or `both`; `claude` and `codex` are `idle`, `working`, `pass`, `fail` or `skip`; `step` is 0
 during setup and `total` counts every step including the last one (`realdirs`). Chapter titles
-have no dashes, at most 8 words and no internal jargon; the table in `CHAPTERS` in
-`tests/live/selftest_live.py` is the list.
+have no dashes, at most 8 words and no internal jargon; the `CHAPTERS` table of the running class is the
+list: `tests/live/selftest_live.py` for the proof suite, `tests/live/dance.py` for the dance.
