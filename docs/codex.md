@@ -30,13 +30,17 @@ current folder.
 ## Install
 
 ```sh
-sh install.sh --codex --dry-run   # see what it would do
-sh install.sh --codex
+sh install.sh --codex --dry-run --bin-dir ~/.local/bin   # see what it would do
+sh install.sh --codex --bin-dir ~/.local/bin
 ```
 
 It asks `[y/N]` before each step:
 
 1. Link the four Codex skills (`$reflect`, `$refresh`, `$rnr`, `$review`) into `~/.codex/skills/`.
+   Then link the commands the rules and `AGENTS.md` tell Codex to run (`wt`, `handoff_session`,
+   `session_peers`, `bcast`, `session_bus`, `bus_nudge`, and the memory tools) into `--bin-dir`,
+   which must be on the `PATH` your Codex shell sees (the desktop app's `PATH` lacks `~/.local/bin`
+   unless your shell profile adds it). Without `--bin-dir` no command is linked and the install says so.
 2. Write the hook launcher, `~/.local/bin/session-notes`: a small generated script with
    this checkout's path baked in (see Hooks below). It refuses to overwrite a file at that
    path that is not a session-notes launcher.
@@ -61,6 +65,17 @@ It asks `[y/N]` before each step:
 6. Add two lines to `~/.codex/rules/default.rules` that approve exactly one
    command, `python3 <repo>/bin/codex_save.py commit`, so the desktop app saves
    memory without asking (see Saving memory below).
+
+### Codex only
+
+A machine with Codex and no Claude Code needs nothing else: `install.sh --codex` is a complete
+install. It links the same commands the Claude install links (one shared step in `install.sh`),
+writes nothing under `~/.claude` and never creates it, and offers the nightly memory checks and
+the `bus_nudge` LaunchAgent on macOS. What it does not set up: the Claude-only pieces
+(`~/.claude/settings.json` hooks, the `CLAUDE.md` import, the `/find-session` skill) and the
+tmux itself, which the tmux commands need and you install yourself. `make selftest-watch ARGS="--codex-alone"`
+runs the live suite that way: a sandbox home with no Claude install, only
+`install.sh --codex`, and the Codex column only.
 
 Install from the main checkout, not from a linked git worktree: `install.sh --codex` (and
 `codex_hooks.py merge` and `launcher`) refuse a worktree up front, before any step or prompt,

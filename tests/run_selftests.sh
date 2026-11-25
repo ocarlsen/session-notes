@@ -42,6 +42,11 @@ if out=$(python3 "$ROOT/tests/test_hooks.py" 2>&1); then
 else
   echo "FAIL tests/test_hooks.py"; echo "$out" | grep -v '^ok' | sed 's/^/    /'; fail=1
 fi
+if out=$(python3 "$ROOT/tests/test_install_codex.py" 2>&1); then
+  echo "PASS tests/test_install_codex.py"
+else
+  echo "FAIL tests/test_install_codex.py"; echo "$out" | grep -v '^ok' | sed 's/^/    /'; fail=1
+fi
 
 # No test may write into the real home. session-notes' default state lives
 # under ~/.claude/session-notes and its config under ~/.config/session-notes,
