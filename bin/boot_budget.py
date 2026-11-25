@@ -37,6 +37,22 @@ CLI:
   boot_budget.py check-file <path> [--as <real-path>]
                                          -- exit 0 (ok/no budget) or 1 (over, message on stdout)
   boot_budget.py --selftest             -- hermetic selftest, never touches real files
+  boot_budget.py --agent codex report|check
+                                         -- the Codex boot load per scope (also the default
+                                            when SESSION_NOTES_AGENT=codex / agent.kind = codex)
+
+Codex mode measures what a Codex session loads at start, per configured scope:
+  - the AGENTS.md chain (global, then the project files from the git root down to the scope
+    root) against `project_doc_max_bytes` from <codex_home>/config.toml (32 KiB default).
+    That cap counts BYTES. Codex stops adding project files at the cap: the file that
+    crosses it is truncated, later ones are dropped. The readers are the canary's (one
+    TOML reader, imported in `_canary()`).
+  - what hooks/codex_session_start.py prints, against `agent.codex_boot_bytes`. That cap is
+    compared with `len(text)`, i.e. CHARS (the hook's pointer line says "bytes" and counts
+    bytes, but the packing test counts chars). The packing is the hook's own `plan_context`.
+`check` exits 1 with one FILE/SCOPE line per dropped or truncated file or scope over a cap.
+`codex_boot_report()` is the importable form: per scope, `entries` is a list of
+(file, bytes, "loaded"|"dropped"|"truncated", reason).
 
 Character counting: `len()` of the file decoded as UTF-8 (errors="replace") -- the same
 method used to measure the budget values, so a budget and a live count are always
@@ -60,6 +76,11 @@ from pathlib import Path
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 import notes_config  # noqa: E402
+
+# Run as a script this file is `__main__`; the canary and others `import boot_budget` and would get
+# a SECOND copy, with its own blind-read record, so BLIND findings vanish. One module, one record.
+if __name__ == "__main__":
+    sys.modules.setdefault("boot_budget", sys.modules["__main__"])
 
 # --- Test-overridable "constants" --------------------------------------------
 # These are read via helper functions (never inlined as frozen constants) so --selftest
@@ -631,6 +652,174 @@ def check_file(path, as_path=None):
     return True, None
 
 
+# --- Codex mode ----------------------------------------------------------------------
+def _canary():
+    """The ONE place boot_budget reaches the canary's Codex config readers (_codex_doc_settings
+    with its _CODEX_KEYS reader, _codex_doc_in_dir). When they move to a shared module, change
+    this import."""
+    import memory_hygiene_canary
+    return memory_hygiene_canary
+
+
+def _codex_hook():
+    """hooks/codex_session_start.py, imported by path (it lives beside bin/, not in it)."""
+    hooks = os.path.join(os.path.dirname(BIN), "hooks")
+    if hooks not in sys.path:
+        sys.path.insert(0, hooks)
+    # The hook forces SESSION_NOTES_AGENT=codex at import (it is Codex-only). Importing it must not
+    # change this process's agent, so put the caller's value back.
+    had = "SESSION_NOTES_AGENT" in os.environ
+    saved = os.environ.get("SESSION_NOTES_AGENT")
+    try:
+        import codex_session_start
+    finally:
+        if had:
+            os.environ["SESSION_NOTES_AGENT"] = saved
+        else:
+            os.environ.pop("SESSION_NOTES_AGENT", None)
+    return codex_session_start
+
+
+def _codex_cfg():
+    """The config as Codex sees it, whatever agent this process runs as."""
+    env = dict(os.environ)
+    env["SESSION_NOTES_AGENT"] = "codex"
+    return notes_config.load(env=env)
+
+
+def codex_agents_chain(root, cfg):
+    """(cap, entries, used, problem) for the AGENTS.md files Codex reads for a session at
+    root. entries are (path, bytes, status, reason) in load order: the global file first (not
+    counted against the cap), then the project chain from the git root down to root. Codex
+    adds project files until project_doc_max_bytes: the file crossing the cap is "truncated",
+    later ones "dropped". used = project bytes Codex keeps. A cap of 0 is Codex's off switch:
+    no project entries."""
+    cn = _canary()
+    codex_home = os.path.expanduser(cfg["agent"]["codex_home"])
+    cap, fallbacks, problem = cn._codex_doc_settings(codex_home)
+    entries = []
+    g = cn._codex_doc_in_dir(codex_home, [])
+    if g:
+        entries.append((g[0], g[1], "loaded", ""))
+    if cap == 0:
+        return cap, entries, 0, problem
+    root = os.path.realpath(root)
+    top = notes_config._git_root(root)
+    top = os.path.realpath(top) if top else root
+    if not (root == top or root.startswith(top + os.sep)):
+        top = root
+    dirs, cur = [root], root
+    while cur != top:
+        cur = os.path.dirname(cur)
+        dirs.append(cur)
+    used = 0
+    for d in reversed(dirs):
+        hit = cn._codex_doc_in_dir(d, fallbacks)
+        if not hit:
+            continue
+        path, size = hit
+        if used >= cap:
+            entries.append((path, size, "dropped", "project chain already at the %d-byte cap" % cap))
+        elif used + size > cap:
+            entries.append((path, size, "truncated",
+                            "only %d of %d bytes fit under the %d-byte cap" % (cap - used, size, cap)))
+            used = cap
+        else:
+            entries.append((path, size, "loaded", ""))
+            used += size
+    return cap, entries, used, problem
+
+
+def codex_boot_report(cfg=None, scopes=None):
+    """Per configured scope (or the named ones), what a Codex session started at the scope
+    root loads. A list of dicts: name, root, entries (every file as (file, bytes,
+    "loaded"|"dropped"|"truncated", reason): the AGENTS.md chain first, then the hook's
+    files in its own order), agents_cap + agents_used (bytes), boot_cap + boot_total (chars:
+    the hook compares len(text)), problem (an unreadable Codex config, or None)."""
+    cfg = cfg or _codex_cfg()
+    hook = _codex_hook()
+    out = []
+    targets = list(cfg.get("scopes", []))
+    if not targets:
+        # No [[scopes]]: a session still loads the global store and the git-root fallback store
+        # (notes_config.stores_for), so measure a session started in the current directory.
+        targets = [{"name": "(cwd)", "root": os.getcwd()}]
+    for s in targets:
+        if scopes is not None and s["name"] not in scopes:
+            continue
+        if not os.path.isdir(s["root"]):
+            continue
+        cap, chain, used, problem = codex_agents_chain(s["root"], cfg)
+        text, hook_entries = hook.plan_context(s["root"], cfg)
+        entries = list(chain) + [(e["path"], e["bytes"], e["status"], e["reason"])
+                                 for e in hook_entries]
+        out.append({"name": s["name"], "root": s["root"], "entries": entries,
+                    "agents_cap": cap, "agents_used": used,
+                    "boot_cap": cfg["agent"]["codex_boot_bytes"], "boot_total": len(text),
+                    "boot_bytes": len(text.encode("utf-8")),
+                    # the live block only uses what the files leave, by design: shown, never a finding
+                    "soft": {e["path"] for e in hook_entries if e["label"] == "live"},
+                    "problem": problem})
+    return out
+
+
+def codex_violations(reports):
+    """One FILE line per dropped or truncated file, one SCOPE line per scope over a cap."""
+    out = []
+    problems = []
+    for rep in reports:
+        if rep["problem"] and rep["problem"] not in problems:
+            problems.append(rep["problem"])
+            out.append(f"FILE {rep['problem']}")
+        for path, size, status, reason in rep["entries"]:
+            if status != "loaded" and path not in rep["soft"]:
+                out.append(f"FILE {_display(path)}: {status.upper()} for scope {rep['name']} "
+                           f"({size:,} bytes): {reason}")
+        if rep["boot_total"] > rep["boot_cap"]:
+            out.append(f"SCOPE {rep['name']}: SessionStart output {rep['boot_total']:,} chars "
+                       f"> agent.codex_boot_bytes {rep['boot_cap']:,}")
+        if rep["agents_cap"] and rep["agents_used"] >= rep["agents_cap"] and any(
+                st != "loaded" and r.startswith(("only ", "project chain")) for (_p, _s, st, r) in rep["entries"]):
+            out.append(f"SCOPE {rep['name']}: AGENTS.md project chain over "
+                       f"project_doc_max_bytes {rep['agents_cap']:,} bytes")
+    return out
+
+
+def codex_report_mode():
+    reports = codex_boot_report()
+    if not reports:
+        print("No scope roots found on disk.")
+        return 0
+    for rep in reports:
+        print(f"== scope: {rep['name']} ({_display(_tilde(rep['root']))}) ==")
+        for path, size, status, reason in rep["entries"]:
+            flag = "ok" if status == "loaded" else status.upper()
+            print(f"  {_display(path):<70} {size:>7,} bytes  {flag}  {reason}".rstrip())
+        a = "OVER" if any(st != "loaded" and r.startswith(("only ", "project chain"))
+                          for (_p, _s, st, r) in rep["entries"]) else "ok"
+        print(f"  AGENTS.md project chain: {rep['agents_used']:,} / project_doc_max_bytes "
+              f"{rep['agents_cap']:,} bytes  {a}")
+        b = "OVER" if rep["boot_total"] > rep["boot_cap"] else "ok"
+        print(f"  SessionStart output: {rep['boot_total']:,} / agent.codex_boot_bytes "
+              f"{rep['boot_cap']:,} chars ({rep['boot_bytes']:,} bytes; the cap compares len(text), and "
+              f"Codex's own spill limit is in tokens)  {b}")
+        if rep["problem"]:
+            print(f"  {rep['problem']}")
+        print()
+    return 0
+
+
+def codex_check_mode():
+    blind_reset()
+    violations = codex_violations(codex_boot_report())
+    violations.extend(blind_lines())
+    if not violations:
+        return 0  # silent when clean
+    for v in violations:
+        print(v)
+    return 1
+
+
 # --- CLI modes ---------------------------------------------------------------------
 def report_mode():
     reports = all_scope_reports()
@@ -696,6 +885,183 @@ def check_file_mode(path, as_path=None):
 def _write(p, text):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
+
+
+def selftest_codex(check):
+    """Codex mode, through the real CLI in a subprocess on a throwaway config and tree."""
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+        codex_home = os.path.join(d, "codex")
+        os.makedirs(codex_home)
+        repo = os.path.join(d, "repo")
+        sub = os.path.join(repo, "sub")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        cfgf = os.path.join(d, "c.toml")
+
+        def write_cfg(boot_bytes=2000):
+            _write(Path(cfgf), '[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
+                   '[live]\npath = "%s/live.md"\n'
+                   '[agent]\ncodex_home = "%s"\ncodex_boot_bytes = %d\n'
+                   '[[scopes]]\nname = "demo"\nroot = "%s"\nlive = "none"\n'
+                   % (d, d, d, codex_home, boot_bytes, sub))
+        write_cfg()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SESSION_NOTES_")}
+        env.update(HOME=home, SESSION_NOTES_CONFIG=cfgf)
+
+        def run(*args, agent_env=None):
+            e = dict(env)
+            if agent_env:
+                e["SESSION_NOTES_AGENT"] = agent_env
+            r = subprocess.run([sys.executable, os.path.join(BIN, "boot_budget.py")] + list(args),
+                               capture_output=True, text=True, env=e)
+            return r.returncode, r.stdout + r.stderr
+
+        cfg = notes_config.load(cfgf, env={"SESSION_NOTES_AGENT": "codex"})
+        gstore = cfg["paths"]["global_store"]
+        pstore = notes_config.codex_project_store(sub, codex_home)
+        _write(Path(gstore) / "MEMORY.md", "# Memory Index\n\n- [x](x.md) - x\n")
+        _write(Path(pstore) / "RESUME.md", "# RESUME\n\n- shipped\n")
+
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 0 and out == "", "codex: everything fits -> silent, exit 0")
+        rc, out = run("--agent", "codex", "report")
+        check(rc == 0 and "session-notes/global/MEMORY.md" in out and "ok" in out
+              and "agent.codex_boot_bytes 2,000 chars" in out
+              and "project_doc_max_bytes 32,768 bytes" in out,
+              "codex report names both caps with their units (chars for the hook, bytes for AGENTS.md)")
+        rc, out = run("check", agent_env="codex")
+        check(rc == 0 and out == "", "codex via $SESSION_NOTES_AGENT (no flag): same mode")
+        rc, out = run("check")
+        check(rc == 0, "claude mode (no flag, claude config) still runs the Claude check, not Codex")
+
+        # a session-start file over codex_boot_bytes: dropped by name, exit 1; later files still load
+        _write(Path(gstore) / "RESUME.md", "z" * 3000)
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "RESUME.md: DROPPED for scope demo" in out and "global/RESUME.md" in out
+              and "project/RESUME.md" not in out and "of the 2000 cap" in out,
+              "codex: oversized global RESUME.md is reported dropped by name, exit 1")
+        rc, out = run("--agent", "codex", "report")
+        check(rc == 0 and "DROPPED" in out and "z" * 20 not in out, "codex report flags the dropped file")
+        ents = {os.path.basename(os.path.dirname(e[0])) + "/" + os.path.basename(e[0]): e[2]
+                for e in codex_boot_report(cfg)[0]["entries"]}
+        check(ents.get("global/RESUME.md") == "dropped" and ents.get("global/MEMORY.md") == "loaded"
+              and any(k.endswith("/RESUME.md") and v == "loaded" for k, v in ents.items()
+                      if not k.startswith("global/")),
+              "codex_boot_report(): entries are (file, bytes, status, reason), in the hook's order")
+        _write(Path(gstore) / "RESUME.md", "ok\n")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 0 and out == "", "codex: shrinking the file clears the finding")
+
+        # AGENTS.md chain: root file + scope file; default cap vs a raised cap
+        _write(Path(repo) / "AGENTS.md", "r" * 20000)
+        _write(Path(sub) / "AGENTS.md", "s" * 20000)
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "AGENTS.md: TRUNCATED for scope demo" in out and "sub/AGENTS.md" in out
+              and "12768 of 20000" in out and "project_doc_max_bytes 32,768" in out,
+              "AGENTS.md chain over the DEFAULT cap: scope file truncated, root file loaded, exit 1")
+        _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 50000\n")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 0 and out == "", "same chain under a RAISED project_doc_max_bytes: clean, exit 0")
+        _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 25000\n")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "5000 of 20000" in out, "lowered cap truncates at the right byte count")
+        _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 100\n")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "AGENTS.md: DROPPED" not in out.split("sub/AGENTS.md")[0]
+              and "repo/AGENTS.md: TRUNCATED" in out and "sub/AGENTS.md: DROPPED" in out,
+              "cap crossed by the first file: it is truncated, the next is dropped")
+        _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 0\n")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 0, "project_doc_max_bytes = 0 is Codex's off switch: no finding")
+        _write(Path(codex_home) / "config.toml", 'project_doc_max_bytes = "lots"\n')
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "project_doc_max_bytes" in out, "an unreadable cap is one loud finding")
+        _write(Path(codex_home) / "config.toml", "")
+
+        # B2: run as a script, an unreadable file is a BLIND finding (one module, one blind record)
+        if os.geteuid() == 0:  # root reads a chmod 000 file, so the case cannot be built (CI runs as root)
+            print("  [SKIP] BLIND checks need a non-root user")
+        else:
+            _write(Path(sub) / "AGENTS.md", "tiny\n")
+            _write(Path(repo) / "AGENTS.md", "tiny\n")
+            os.chmod(os.path.join(sub, "AGENTS.md"), 0)
+            rc, out = run("--agent", "codex", "check")
+            os.chmod(os.path.join(sub, "AGENTS.md"), 0o644)
+            check(rc == 1 and "BLIND" in out and "AGENTS.md" in out,
+                  "chmod 000 AGENTS.md: a BLIND line and exit 1 through the CLI")
+            _write(Path(codex_home) / "config.toml", "project_doc_max_bytes = 50000\n")
+            os.chmod(os.path.join(codex_home, "config.toml"), 0)
+            rc, out = run("--agent", "codex", "check")
+            os.chmod(os.path.join(codex_home, "config.toml"), 0o644)
+            check(rc == 1 and "BLIND" in out and "config.toml" in out,
+                  "unreadable config.toml: a BLIND line and exit 1 through the CLI")
+            _write(Path(codex_home) / "config.toml", "")
+        for f in (os.path.join(repo, "AGENTS.md"), os.path.join(sub, "AGENTS.md")):
+            if os.path.exists(f):
+                os.remove(f)
+
+        # B3: building the report must not change this process's agent
+        saved_agent = os.environ.pop("SESSION_NOTES_AGENT", None)
+        saved_cfg = os.environ.get("SESSION_NOTES_CONFIG")
+        os.environ["SESSION_NOTES_CONFIG"] = cfgf
+        try:
+            sys.modules.pop("codex_session_start", None)
+            before = (os.environ.get("SESSION_NOTES_AGENT"), notes_config.load()["agent"]["kind"])
+            codex_boot_report(cfg)
+            after = (os.environ.get("SESSION_NOTES_AGENT"), notes_config.load()["agent"]["kind"])
+        finally:
+            if saved_agent is not None:
+                os.environ["SESSION_NOTES_AGENT"] = saved_agent
+            if saved_cfg is None:
+                os.environ.pop("SESSION_NOTES_CONFIG", None)
+            else:
+                os.environ["SESSION_NOTES_CONFIG"] = saved_cfg
+        check(before == after == (None, "claude"),
+              "codex_boot_report leaves SESSION_NOTES_AGENT and the loaded agent kind unchanged")
+
+        # N2: a store file the hook cannot decode is reported, not omitted
+        with open(os.path.join(gstore, "RESUME.md"), "wb") as fh:
+            fh.write(b"\xff\xfe bad")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "global/RESUME.md: DROPPED" in out and "cannot be read or decoded" in out,
+              "undecodable store file: a FILE finding naming it, exit 1")
+        _write(Path(gstore) / "RESUME.md", "ok\n")
+
+        # N3: live truncation shows in report but is never a check finding
+        write_cfg(boot_bytes=1500)
+        _write(Path(cfgf), Path(cfgf).read_text().replace('live = "none"\n', ""))
+        import live
+        lcfg = notes_config.load(cfgf, env={"SESSION_NOTES_AGENT": "codex"})
+        for i in range(30):
+            live.add(sub, "event %d with padding text to take room" % i, lcfg)
+        rc, out = run("--agent", "codex", "check")
+        rc2, out2 = run("--agent", "codex", "report")
+        check(rc == 0 and out == "" and "live.md" in out2 and "TRUNCATED" in out2,
+              "live-context truncation: shown in report, not a check finding"
+              + ("" if rc == 0 and out == "" else " [rc=%s out=%r report=%r]" % (rc, out[-300:], out2[-900:])))
+        write_cfg()
+
+        # N1: no [[scopes]] at all still measures the session's own cwd
+        _write(Path(cfgf), '[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
+               '[agent]\ncodex_home = "%s"\ncodex_boot_bytes = 50\n' % (d, d, codex_home))
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "DROPPED" in out, "no scopes: the global store is still measured and can fail")
+        rc, out = run("--agent", "codex", "report")
+        check("(cwd)" in out, "no scopes: report names the cwd pseudo-scope")
+        write_cfg()
+
+        # claude mode: output unchanged by the flag and by the new code paths
+        rc1, out1 = run("report")
+        rc2, out2 = run("--agent", "claude", "report")
+        check(rc1 == 0 and out1 == out2 and "== scope: ~ ==" in out1 and "TOTAL:" in out1,
+              "claude report is identical with and without --agent claude")
+        rc, out = run("check-file", os.path.join(d, "none.md"), agent_env="codex")
+        check(rc == 0 and "skipped in codex mode" in out, "check-file is still a planned skip in codex mode")
 
 
 def selftest():
@@ -1301,6 +1667,7 @@ def selftest():
             os.environ["SESSION_NOTES_CONFIG"] = orig_env_config
         reload_config()
 
+    selftest_codex(check)
     print("\nSELFTEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -1308,6 +1675,9 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true", help="run the built-in hermetic selftest")
+    ap.add_argument("--agent", choices=("claude", "codex"), default=None,
+                    help="which agent's boot load to measure (default: this process's agent, "
+                         "$SESSION_NOTES_AGENT or agent.kind)")
     sub = ap.add_subparsers(dest="cmd")
 
     sub.add_parser("report", help="table per scope: file, chars, budget, flag")
@@ -1322,8 +1692,21 @@ def main(argv=None):
 
     if args.selftest:
         return selftest()
-    if notes_config.skip_in_codex("boot_budget", "it measures Claude Code's boot prefix; the Codex "
-                                  "SessionStart hook caps its own output at agent.codex_boot_bytes"):
+    if args.agent:
+        os.environ["SESSION_NOTES_AGENT"] = args.agent
+        reload_config()
+    try:
+        codex = _cfg()["agent"]["kind"] == "codex"
+    except notes_config.ConfigError:
+        codex = False  # the mode's own config load reports it
+    if codex and args.cmd in ("report", "check"):
+        try:
+            return codex_report_mode() if args.cmd == "report" else codex_check_mode()
+        except Exception as e:  # noqa: BLE001 -- same exit-2 contract as below
+            print(f"boot_budget: internal error ({type(e).__name__}): {e}", file=sys.stderr)
+            return 2
+    if notes_config.skip_in_codex("boot_budget", "check-file measures Claude Code's boot prefix; use "
+                                  "`--agent codex report|check` for the Codex boot load"):
         return 0
 
     # A crash here must NEVER look like exit 1 ("over budget") to a caller (e.g. a

@@ -4,8 +4,8 @@
 One run covers both agents when both are installed. For each one it runs
 memory_hygiene_canary.py with SESSION_NOTES_AGENT set to that agent, so each
 check sees only that agent's own stores (the two memories never mix). For
-Claude it also runs `boot_budget.py check`, which measures Claude Code's boot
-prefix. Codex has no boot-budget check yet; its AGENTS.md has its own cap.
+each it also runs `boot_budget.py check`, which measures that agent's boot
+load: Claude Code's CLAUDE.md prefix, or Codex's AGENTS.md chain and SessionStart output.
 
 An agent counts as installed when its home directory exists: paths.claude_home
 for Claude, agent.codex_home for Codex.
@@ -69,10 +69,9 @@ def installed_kinds(cfg_for):
 def checks_for(kind):
     """[(name, argv)] to run for one agent kind."""
     py = sys.executable or "python3"
-    out = [("memory_hygiene_canary", [py, os.path.join(BIN, "memory_hygiene_canary.py")])]
-    if kind == "claude":
-        out.append(("boot_budget", [py, os.path.join(BIN, "boot_budget.py"), "check"]))
-    return out
+    # boot_budget picks the agent's own mode from SESSION_NOTES_AGENT, which run_all sets per kind.
+    return [("memory_hygiene_canary", [py, os.path.join(BIN, "memory_hygiene_canary.py")]),
+            ("boot_budget", [py, os.path.join(BIN, "boot_budget.py"), "check"])]
 
 
 def count_findings(name, text):
@@ -330,9 +329,9 @@ def selftest():
         run, calls = fake({("codex", "memory_hygiene_canary.py"): R(3, "## Store: global\n- x")})
         buf = _Buf()
         rc = run_all(env, run, buf)
-        check("both agents: each agent's canary runs with its own kind; no Codex boot_budget",
+        check("both agents: each agent's canary and boot_budget run with its own kind",
               calls == [("claude", "memory_hygiene_canary.py"), ("claude", "boot_budget.py"),
-                        ("codex", "memory_hygiene_canary.py")])
+                        ("codex", "memory_hygiene_canary.py"), ("codex", "boot_budget.py")])
         check("a finding exits 3 and names the agent", rc == 3 and "== codex: memory_hygiene_canary"
               " (findings)" in buf.text)
 
@@ -388,7 +387,8 @@ def selftest():
               doc["version"] == 1 and doc["timestamp"] == "2026-01-10T12:00:00+00:00")
         check("record: per-check outcome and finding counts",
               {(c["agent"], c["check"]): (c["status"], c["findings"]) for c in doc["checks"]}
-              == {("codex", "memory_hygiene_canary"): ("clean", 0),("claude", "memory_hygiene_canary"): ("findings", 2),
+              == {("codex", "memory_hygiene_canary"): ("clean", 0), ("codex", "boot_budget"): ("clean", 0),
+                  ("claude", "memory_hygiene_canary"): ("findings", 2),
                   ("claude", "boot_budget"): ("findings", 3)})
         check("record: report is the stdout text", doc["report"] == buf.text)
         run, _ = fake({("claude", "memory_hygiene_canary.py"): R(1, "Traceback x")})
@@ -512,7 +512,7 @@ def selftest():
                   % type(exc).__name__,
                   rc == 1 and "CRASHED %s" % type(exc).__name__ in buf.text
                   and doc["rc"] == 1 and doc["checks"][0]["status"] == "crashed"
-                  and "boot_budget.py" in seen and len(doc["checks"]) == 3)
+                  and "boot_budget.py" in seen and len(doc["checks"]) == 4)
 
         def rec2(doc_over, name="rec2.json"):
             base = {"version": 1, "timestamp": t0.isoformat(), "rc": 0, "checks": clean, "report": ""}
