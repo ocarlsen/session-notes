@@ -93,6 +93,20 @@ MARKER_MD = ("---\nname: Marker\ndescription: the selftest marker word\nmetadata
              "The selftest marker word is in the index line.\n")
 
 
+def fix_prompt(path, finding, tok):
+    """The fix beat's prompt: Claude fixes, commits AND pushes (`wt merge` refuses an unpushed head)."""
+    return ("The reviewer asked for changes on the poem PR. Fix exactly what it found, in poem.md inside %s "
+            "(Edit or Write tool on that path), then run: cd %s && git add poem.md && git commit -q -m "
+            "'Address review' && git push -q origin poem . Do not run wt merge. Then reply DONE. The finding: %s (run id FIX%s)"
+            % (path, shlex.quote(path), " ".join(finding.split())[:1200], tok))
+
+
+def remote_head(git, path, branch):
+    """What the remote (not the local tracking ref) holds for `branch`, or None."""
+    out = git(path, "ls-remote", "origin", "refs/heads/" + branch).stdout.split()
+    return out[0] if out else None
+
+
 def write_launcher(path, template, **kw):
     with open(path, "w") as fh:
         fh.write(template % kw)
@@ -437,7 +451,7 @@ class Dance(sl.Live):
             return FAIL, "the worktree's poem.md lacks %d of the 4 lines (first: %r)" % (len(missing), missing[0][:60]), None
         return PASS, "the edit on main was refused with the guard's own text, main untouched; the poem is in the `poem` worktree", None
 
-    def stub_pr(self, path, head, diff, reset=False):
+    def stub_pr(self, head, diff, reset=False):
         """Point the stub gh at the PR as it stands now (head and diff); reset also forgets posted comments."""
         view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7",
                 "title": "Add the poem", "body": "Adds a four line poem to poem.md, one verse line per line. A small, correct change."}
@@ -488,7 +502,7 @@ class Dance(sl.Live):
         if self.git(path, "log", "--oneline", "origin/main..HEAD").stdout.strip() == "":
             return FAIL, "the worktree has no commit ahead of origin/main", None
         diff = self.git(path, "diff", "origin/main...HEAD").stdout
-        self.stub_pr(path, head, diff, reset=True)
+        self.stub_pr(head, diff, reset=True)
         # b) wt merge refuses: nobody has approved yet
         rid1 = "MERGEA" + t
         self.send(c, "Run exactly this shell command once and tell me what it printed; do not retry it and do not fix "
@@ -505,25 +519,25 @@ class Dance(sl.Live):
         for rnd in (1, 2):
             err, verdict, body = self.review_round(path, head, rules, rnd)
             if err:
-                return FAIL, err, "dance-review.txt"
+                return FAIL, err, "dance-review.txt" if rnd == 1 else "dance-review-2.txt"
             if verdict == "APPROVE":
                 break
             if rnd == 2:
-                return FAIL, "the reviewer returned CHANGES twice (once more after one fix round): %s" % " ".join(body.split())[:140], "dance-review.txt"
+                return FAIL, "the reviewer returned CHANGES twice (once more after one fix round): %s" % " ".join(body.split())[:140], "dance-review-2.txt"
             # one reasonable CHANGES: exactly one fix beat by Claude, then one re-review at the new head
-            rid_fix = "FIX" + t
             old_head = head
             self.wait_idle(c)
-            self.send(c, "The reviewer asked for changes on the poem PR. Fix exactly what it found, in poem.md inside %s "
-                         "(Edit or Write tool on that path), then run: cd %s && git add poem.md && git commit -q -m "
-                         "'Address review' . Do not run wt merge and do not push. Then reply DONE. The finding: %s (run id %s)"
-                         % (path, shlex.quote(path), " ".join(body.split())[:1200], rid_fix))
+            self.send(c, fix_prompt(path, body, t))
             if not self.wait_for(lambda: self.git(path, "rev-parse", "HEAD").stdout.strip() != old_head, 240):
                 return FAIL, "after the first CHANGES, Claude made no fix commit in the `poem` worktree within 240 s", "dance-review.txt"
+            new_head = self.git(path, "rev-parse", "HEAD").stdout.strip()
+            if not self.wait_for(lambda: remote_head(self.git, path, "poem") == new_head, 120):
+                return FAIL, ("the fix commit %s was never pushed: origin/poem is %s (`wt merge` would stop at 'push first')"
+                              % (new_head[:10], (remote_head(self.git, path, "poem") or "absent")[:10])), "dance-review.txt"
             self.wait_idle(c, 90)
             head = self.git(path, "rev-parse", "HEAD").stdout.strip()
             diff = self.git(path, "diff", "origin/main...HEAD").stdout
-            self.stub_pr(path, head, diff)
+            self.stub_pr(head, diff)
             fixed = True
         if any(x[:2] == ["pr", "merge"] for x in self.gh_calls()):
             return FAIL, "a merge happened before the user's yes", "dance-review.txt"
@@ -802,6 +816,33 @@ def offline_checks(check):
         write_launcher(wt, WT_LAUNCH, wt=os.path.join(repo, "bin", "wt.py"), grants=grants)
         r = subprocess.run([sys.executable, wt, "--help"], env=env, capture_output=True, text=True, timeout=60)
         check("dance: the wt launcher runs wt", r.returncode == 0 and "merge" in r.stdout, "%s %s" % (r.returncode, r.stderr[-120:]))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = os.path.realpath(tmp)
+        genv = sl.git_env(tmp)
+        gg = lambda cwd, *a: sl.sh(["git"] + list(a), cwd, genv, check=False)
+        bare, clone = os.path.join(tmp, "o", "r.git"), os.path.join(tmp, "clone")
+        os.makedirs(os.path.dirname(bare))
+        gg(tmp, "init", "-q", "--bare", "-b", "main", bare)
+        gg(tmp, "clone", "-q", bare, clone)
+        with open(os.path.join(clone, "poem.md"), "w") as fh:
+            fh.write("one\n")
+        gg(clone, "add", "poem.md")
+        gg(clone, "commit", "-q", "-m", "first")
+        gg(clone, "push", "-q", "origin", "HEAD:poem")
+        h1 = gg(clone, "rev-parse", "HEAD").stdout.strip()
+        check("dance: remote_head reads the bare remote's branch", remote_head(gg, clone, "poem") == h1, str(remote_head(gg, clone, "poem")))
+        with open(os.path.join(clone, "poem.md"), "a") as fh:
+            fh.write("two\n")
+        gg(clone, "commit", "-q", "-am", "fix")
+        h2 = gg(clone, "rev-parse", "HEAD").stdout.strip()
+        check("dance: an unpushed fix commit is not the remote head (wt merge would say push first)",
+              h2 != h1 and remote_head(gg, clone, "poem") != h2)
+        fp = fix_prompt(clone, "needs a line", "X1")
+        check("dance: the fix-beat prompt commits and pushes origin poem, and no longer forbids pushing",
+              "git push -q origin poem" in fp and "do not push" not in fp.lower() and fp.index("git commit") < fp.index("git push"), fp)
+        gg(clone, "push", "-q", "origin", "HEAD:poem")
+        check("dance: after the push the remote head equals the new local HEAD", remote_head(gg, clone, "poem") == h2)
+        check("dance: every path the check wrote sits under the temp dir", all(os.path.realpath(x).startswith(tmp) for x in (bare, clone)))
     lines = timeline_lines([{"ts": 2, "from": "xA", "to": "cA", "body": "b " * 80}, {"ts": 1, "from": "cA", "to": "xA", "body": "a"}])
     check("dance: the timeline is in time order, one short line per message",
           len(lines) == 2 and "cA -> xA: a" in lines[0] and all(len(x) <= 86 for x in lines), str(lines))
