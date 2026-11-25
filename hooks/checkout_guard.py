@@ -432,13 +432,16 @@ def _is_write_redirect(op, word, amp):
     return op == ">&" and not re.fullmatch(r"\d+-?|-", word)
 
 
-def split_segments(cmd):
+def split_segments(cmd, stdin=None):
     """Split on unquoted ; & | newline ( ) and backtick; drop unquoted comments. Redirections
     (`>`, `>>`, `<`, `<<<`, `&>`, `N>`, `2>&1`, `>|`, attached or detached) are removed from the
     text and their write targets returned: a list of (text, write targets, sub) per segment.
     `sub` is True when the segment may run in a subshell, so a `cd` in it need not move the shell:
-    inside ( ) or backticks, or on either side of a single `|`, or before a single `&`."""
+    inside ( ) or backticks, or on either side of a single `|`, or before a single `&`.
+    When `stdin` is a list, it gets one list per returned segment of that segment's `<<` and
+    `<<<` operators as (op, word)."""
     segs, buf, writes, q, i, n = [], [], [], None, 0, len(cmd)
+    ins = []
     st = {"depth": 0, "bt": False, "prev": ""}
 
     def flush(sep=""):
@@ -449,6 +452,9 @@ def split_segments(cmd):
         sub = st["depth"] > 0 or st["bt"] or sep in ("|", "&") or st["prev"] == "|"
         if s or w:
             segs.append((s, w, sub))
+            if stdin is not None:
+                stdin.append(list(ins))
+        del ins[:]
         st["prev"] = sep if (s or w or sep) else st["prev"]
     while i < n:
         c = cmd[i]
@@ -483,6 +489,8 @@ def split_segments(cmd):
             if m and not amp:  # an fd number in front: `2>x`
                 del buf[len(pre) - len(m.group(1)):]
             op, word, i = _redirect(cmd, i + 1 if amp else i)
+            if op in ("<<", "<<<"):
+                ins.append((op, word))
             if _is_write_redirect(op, word, amp) and word:
                 writes.append(word)
             continue
@@ -790,7 +798,7 @@ def _write_targets(argv, writes, cwd):
             srcs, dest = ops[:-1], ops[-1]
             if name == "mv":
                 cands += [(t, True, True) for t in srcs]  # moving a root is allowed
-            d = os.path.expanduser(dest)
+            d = os.path.expandvars(os.path.expanduser(dest))
             if d.endswith("/") or os.path.basename(d) in (".", "..") or \
                     os.path.isdir(d if os.path.isabs(d) else os.path.join(cwd, d)):
                 # expand a glob source and a glob destination directory, then join the names
@@ -891,10 +899,11 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
     wt = wt_command()
     base_cwd = base_cwd or cwd  # the directory the tool call started in (the payload cwd)
     oldpwd, saved = None, None  # the previous directory (for `cd -`); state outside a subshell
-    prior_texts = []  # earlier segments of this command (text + redirect targets)
-    for seg, writes, sub in split_segments(strip_heredocs(cmd)):
-        cur_prior = list(prior_texts)
-        prior_texts.append(seg + " " + " ".join(writes))
+    hd_seen = 0  # heredoc operators in the segments before this one
+    all_ins = []
+    segments = split_segments(strip_heredocs(cmd), stdin=all_ins)
+    for (seg, writes, sub), ins in zip(segments, all_ins):
+        hd_start, hd_seen = hd_seen, hd_seen + sum(1 for op, _ in ins if op == "<<")
         if saved and not sub:  # a subshell's cd does not outlive the subshell
             cwd, reliable, oldpwd = saved
             saved = None
@@ -957,7 +966,11 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
                 if r:
                     return r
             continue
-        if _runs_consent_hook(argv, cmd, seg, cur_prior):
+        try:
+            runs_hook = _runs_consent_hook(argv, cmd, ins, hd_start)
+        except Exception:  # a defect in this one check must not turn the other arms off
+            runs_hook = False
+        if runs_hook:
             return _consent_exec_msg()
         if cfg is None:
             continue
@@ -984,22 +997,30 @@ _HERESTRING = re.compile(r"<<<\s*(?:'[^']*'|\"[^\"]*\"|\S+)")
 MARK = "merge_consent"
 
 
-def _stdin_text(cmd, seg):
-    """The text a stdin-reading interpreter in this segment is given by a heredoc or herestring."""
-    return " ".join([m.group(3) for m in _HEREDOC.finditer(cmd)] + _HERESTRING.findall(seg)
-                    + _HERESTRING.findall(cmd))
+def _stdin_text(cmd, ins, hd_start=0):
+    """The text a stdin-reading interpreter in this segment is given by ITS heredocs (the ones
+    after the `hd_start` earlier `<<` operators in the command) or herestrings. `ins` is the
+    segment's (op, word) list from split_segments."""
+    bodies = [m.group(3) for m in _HEREDOC.finditer(cmd)]
+    n = sum(1 for op, _ in ins if op == "<<")
+    return " ".join(bodies[hd_start:hd_start + n] + [w for op, w in ins if op == "<<<"])
 
 
-def _runs_consent_hook(argv, cmd, seg_text, prior):
+_PY_VALUE_FLAGS = ("-X", "-W")  # python flags that take a value (`-X dev`, `-W ignore`)
+_MODULE_RUNNERS = ("runpy", "pdb", "trace", "cProfile", "profile")
+
+
+def _runs_consent_hook(argv, cmd, ins, hd_start=0):
     """True when THIS segment runs or imports hooks/merge_consent.py: its script operand is the
-    hook, its `-m` value is the module, its `-c`/`-e` text mentions it, or it reads stdin (`-`
-    or no script) given text that mentions it (a heredoc, a herestring, an earlier segment's
-    output); or it is the installed launcher spelling `<...>/session-notes hook merge_consent`.
-    A segment that merely NAMES the file (git add, grep, a leak scan, `wt pr --title`) is fine,
-    and so is the hook's own `--selftest`. The hook forges a grant from a fabricated payload, so
-    a session may not run it."""
+    hook, its `-m` value is the module (or a runner like runpy/pdb given the hook), its `-c`/`-e`
+    text mentions it, or it reads stdin (`-` or no script) given a heredoc or herestring that
+    mentions it; or it is the installed launcher spelling `<...>/session-notes hook merge_consent`.
+    Only this segment's own operands and text count, never an earlier segment's. A segment that
+    merely NAMES the file (git add, grep, a leak scan, `wt pr --title`) is fine, and so is the
+    hook's own `--selftest`. The hook forges a grant from a fabricated payload, so a session may
+    not run it. Wrapped or indirect spellings are a documented limit (docs/tools.md)."""
     name = os.path.basename(argv[0])
-    if name == "session-notes" and argv[1:3] and argv[1] == "hook" and argv[2] in (MARK, MARK + ".py"):
+    if name == "session-notes" and len(argv) > 2 and argv[1] == "hook" and argv[2] in (MARK, MARK + ".py"):
         return True
     if MARK in name:
         return True
@@ -1008,10 +1029,21 @@ def _runs_consent_hook(argv, cmd, seg_text, prior):
     script, rest, i = None, [], 1
     while i < len(argv):
         t = argv[i]
+        if t in _PY_VALUE_FLAGS or t == "--check-hash-based-pycs":
+            i += 2  # the flag's value is not the script
+            continue
         if t == "-m" or (t.startswith("-") and not t.startswith("--") and t.endswith("m") and len(t) > 2):
             val = argv[i + 1] if i + 1 < len(argv) else ""
-            return val == MARK or val.startswith(MARK + ".")
-        if t.startswith("-") and not t.startswith("--") and t[-1] in "ceEr" and (t == "-c" or len(t) >= 2):
+            if val == MARK or val.startswith(MARK + ".") or val.endswith("." + MARK):
+                return True
+            if val in _MODULE_RUNNERS:  # `-m runpy hooks/merge_consent.py`
+                tail = argv[i + 2:]
+                return any(MARK in os.path.basename(x) for x in tail) and "--selftest" not in tail
+            return False
+        if t.startswith("-") and not t.startswith("--") and len(t) > 2 and t[1] in "cer":
+            return MARK in t[2:]  # attached code: -c'import merge_consent'
+        codeflags = "cer" + ("E" if name.startswith("perl") else "")
+        if t.startswith("-") and not t.startswith("--") and t[-1] in codeflags:
             text = argv[i + 1] if i + 1 < len(argv) else ""
             return MARK in text
         if t.startswith("-") and t != "-":
@@ -1020,16 +1052,9 @@ def _runs_consent_hook(argv, cmd, seg_text, prior):
         script, rest = t, argv[i + 1:]
         break
     if script is not None and script != "-":
-        if MARK in os.path.basename(script):
-            return "--selftest" not in rest
-        # a file an earlier segment of this command wrote or copied from the hook, then ran
-        return any(script in p and MARK in p for p in prior)
+        return MARK in os.path.basename(script) and "--selftest" not in rest
     # reads stdin
-    if MARK in _stdin_text(cmd, seg_text):
-        return True
-    piped = [p for p in prior if MARK in p]
-    return bool(piped) and not ("--selftest" in argv and all(
-        p.split()[:1] and os.path.basename(p.split()[0]) in ("git", "cat") for p in piped))
+    return MARK in _stdin_text(cmd, ins, hd_start)
 
 
 def _consent_exec_msg():
@@ -1695,14 +1720,19 @@ def selftest():
                     "PYTHONPATH=hooks python3 -c \"import merge_consent\"", "env python3 " + hookpy,
                     "python3 - <<'EOF'\nimport merge_consent\nEOF", "bash -c 'python3 " + hookpy + "'",
                     "python3 - <<< 'import merge_consent'", "python3 <<EOF\nimport merge_consent\nEOF",
-                    "echo 'import merge_consent' | python3", "cat " + hookpy + " | python3",
                     "~/.local/bin/session-notes hook merge_consent",
                     "printf %s " + fake + " | SESSION_NOTES_AGENT=codex ~/.local/bin/session-notes hook merge_consent",
                     "cat /tmp/p.json | /opt/x/session-notes hook merge_consent",
-                    "echo x > /tmp/f.py; echo 'import merge_consent' > /tmp/f.py; python3 /tmp/f.py",
-                    "cp " + hookpy + " /tmp/mc.py && python3 /tmp/mc.py < /tmp/p.json",
                     "python3 -c 'import merge_consent' && python3 tests/leak_scan.py",
-                    "node -e \"require('child_process').execSync('python3 " + hookpy + "')\""):
+                    "node -e \"require('child_process').execSync('python3 " + hookpy + "')\"",
+                    # NB3: flags that take a value, -m forms, attached -c
+                    "python3 -X dev " + hookpy + " < /tmp/p.json", "python3 -W ignore " + hookpy,
+                    "python3 -W ignore -c 'import merge_consent as m; m.main()'",
+                    "python3 -m hooks.merge_consent", "python3 -m runpy " + hookpy,
+                    "python3 -m pdb " + hookpy, "python3 -m trace --count " + hookpy,
+                    "python3 -m cProfile " + hookpy, "python3 -E -c 'import merge_consent as m; m.main()'",
+                    "python3 -c'import merge_consent as m; m.main()'",
+                    ):
             r = bash(cmd, tmp)
             check("B1 consent hook not runnable: " + cmd.replace("\n", "\\n")[:70],
                   refused(r) and "merge_consent" in r.stderr, r.stderr)
@@ -1727,6 +1757,41 @@ def selftest():
             "git log --oneline -5 -- hooks/merge_consent.py", "wt merge merge-consent")
         for cmd in r1_controls:
             check("R1 control passes: " + cmd[:70], passed(bash(cmd, tmp)))
+        # NB2: an earlier segment that names the hook never refuses a later interpreter segment
+        nb2_controls = (
+            "grep -n merge_consent bin/wt.py && python3 bin/wt.py --selftest | tail -2",
+            "git add hooks/merge_consent.py hooks/checkout_guard.py && python3 hooks/checkout_guard.py --selftest",
+            "python3 -m py_compile hooks/merge_consent.py hooks/checkout_guard.py && python3 hooks/checkout_guard.py --selftest",
+            "git diff --stat -- hooks/merge_consent.py bin/wt.py; python3 bin/wt.py list",
+            "ls hooks/merge_consent.py tests/leak_scan.py && python3 tests/leak_scan.py",
+            "git diff --stat -- hooks/merge_consent.py && python3 - <<'EOF'\nprint(1)\nEOF",
+            "cat > /tmp/note.md <<'EOF'\nsee merge_consent\nEOF\npython3 - <<'EOF'\nprint(1)\nEOF",
+            "grep -c grant hooks/merge_consent.py; echo 'print(1)' | python3")
+        for cmd in nb2_controls:
+            check("NB2 control passes: " + cmd.replace("\n", "\\n")[:70], passed(bash(cmd, tmp)))
+        # NB1: the bare launcher form does not raise, and no other arm is switched off by it
+        for cmd in ("session-notes hook; gh pr merge 100 --squash",
+                    "session-notes hook; echo x > " + gfile):
+            r = bash(cmd, tmp)
+            check("NB1 bare launcher does not fail the guard open: " + cmd[:60],
+                  refused(r) and "IndexError" not in r.stderr, r.stderr)
+        # NB1: an exception inside the consent-hook check leaves the other arms deciding
+        _orig, _saved_env = _runs_consent_hook, os.environ.get("SESSION_NOTES_CONFIG")
+        os.environ["SESSION_NOTES_CONFIG"] = cfgp
+        try:
+            globals()["_runs_consent_hook"] = lambda *a, **k: 1 / 0
+            r = decide({"tool_name": "Bash", "tool_input": {"command": "gh pr merge 100 --squash"}, "cwd": nongit})
+        finally:
+            globals()["_runs_consent_hook"] = _orig
+            if _saved_env is None:
+                os.environ.pop("SESSION_NOTES_CONFIG", None)
+            else:
+                os.environ["SESSION_NOTES_CONFIG"] = _saved_env
+        check("NB1: a raising consent check still lets raw gh pr merge be refused",
+              bool(r) and "gh pr merge" in r, r)
+        # NB4: $HOME destinations that are directories land inside them
+        for cmd in ("cp report.html $HOME", 'mv build.log "$HOME"', "cp x.sh ${HOME}", "cp x.sh $HOME/.claude"):
+            check("NB4 control passes: " + cmd, passed(bash_p(cmd, tmp)))
         for cmd in ("python3 " + hookpy + " --selftest", "cat " + hookpy, "grep -n grant " + hookpy,
                     "git add hooks/merge_consent.py", "git diff -- " + hookpy, "sed -n 1,5p " + hookpy):
             check("B1 control passes: " + cmd, passed(bash(cmd, tmp)))

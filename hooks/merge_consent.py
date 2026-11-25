@@ -302,8 +302,9 @@ def parse_ask(text):
     q = final_question(text)
     if not q:
         return None
-    # code and bold marks go anywhere; an underscore (emphasis) only at the ends, so my_repo survives
-    q = re.sub(r"[`*]", "", q).strip().strip("_\"'()[] ").strip()
+    # code and bold marks go anywhere; an underscore (emphasis) only at a word edge, so my_repo survives
+    q = re.sub(r"[`*]", "", q)
+    q = re.sub(r"(?<!\w)_+|_+(?!\w)", "", q).strip().strip("_\"'()[] ").strip()
     m = _ASK.match(q)
     if not m or len(re.findall(r"#\d+", q)) != 1:
         return None
@@ -671,6 +672,11 @@ def selftest():
         transcript("_Ready: merge #12 in my-org/my_repo?_")
         check("N1: emphasis at the ends is stripped, the repo is unchanged",
               (at(plain, "", "n1b") or {}).get("repo") == "my-org/my_repo")
+        transcript("Ready: _merge #12?_")
+        check("NB6: underscore emphasis after a lead-in still grants", (at(plain, "", "nb6a") or {}).get("pr") == 12)
+        transcript("Ready: _merge #12 in my-org/my_repo?_")
+        check("NB6: emphasis around a repo ask strips, my_repo survives",
+              (at(plain, "", "nb6b") or {}).get("repo") == "my-org/my_repo")
         transcript("**Ready: `merge #12 in my-org/my_repo?`**")
         check("N1: bold and code marks are stripped", (at(plain, "", "n1c") or {}).get("repo") == "my-org/my_repo")
 
