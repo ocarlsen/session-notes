@@ -45,8 +45,8 @@ Codex mode measures what a Codex session loads at start, per configured scope:
   - the AGENTS.md chain (global, then the project files from the git root down to the scope
     root) against `project_doc_max_bytes` from <codex_home>/config.toml (32 KiB default).
     That cap counts BYTES. Codex stops adding project files at the cap: the file that
-    crosses it is truncated, later ones are dropped. The readers are the canary's (one
-    TOML reader, imported in `_canary()`).
+    crosses it is truncated, later ones are dropped. The path-level readers are the canary's
+    (imported in `_canary()`); the TOML reader under them is bin/codex_config.py.
   - what hooks/codex_session_start.py prints, against `agent.codex_boot_bytes`. That cap is
     compared with `len(text)`, i.e. CHARS (the hook's pointer line says "bytes" and counts
     bytes, but the packing test counts chars). The packing is the hook's own `plan_context`.
@@ -654,9 +654,9 @@ def check_file(path, as_path=None):
 
 # --- Codex mode ----------------------------------------------------------------------
 def _canary():
-    """The ONE place boot_budget reaches the canary's Codex config readers (_codex_doc_settings
-    with its _CODEX_KEYS reader, _codex_doc_in_dir). When they move to a shared module, change
-    this import."""
+    """The ONE place boot_budget reaches the canary's path-level Codex readers
+    (_codex_doc_settings, _codex_doc_in_dir). The TOML reader beneath them lives in
+    bin/codex_config.py. When the path-level readers move to a shared module, change this import."""
     import memory_hygiene_canary
     return memory_hygiene_canary
 
@@ -913,12 +913,12 @@ def selftest_codex(check):
         env = {k: v for k, v in os.environ.items() if not k.startswith("SESSION_NOTES_")}
         env.update(HOME=home, SESSION_NOTES_CONFIG=cfgf)
 
-        def run(*args, agent_env=None):
+        def run(*args, agent_env=None, cwd=None):
             e = dict(env)
             if agent_env:
                 e["SESSION_NOTES_AGENT"] = agent_env
             r = subprocess.run([sys.executable, os.path.join(BIN, "boot_budget.py")] + list(args),
-                               capture_output=True, text=True, env=e)
+                               capture_output=True, text=True, env=e, cwd=cwd)
             return r.returncode, r.stdout + r.stderr
 
         cfg = notes_config.load(cfgf, env={"SESSION_NOTES_AGENT": "codex"})
@@ -982,6 +982,16 @@ def selftest_codex(check):
         rc, out = run("--agent", "codex", "check")
         check(rc == 1 and "project_doc_max_bytes" in out, "an unreadable cap is one loud finding")
         _write(Path(codex_home) / "config.toml", "")
+
+        # B2, root-independent: a config.toml that is a directory raises IsADirectoryError for any user
+        cfg_toml = Path(codex_home) / "config.toml"
+        cfg_toml.unlink()
+        cfg_toml.mkdir()
+        rc, out = run("--agent", "codex", "check")
+        cfg_toml.rmdir()
+        check(rc == 1 and "BLIND" in out and "config.toml" in out and "IsADirectoryError" in out,
+              "config.toml a directory: a BLIND line and exit 1 through the CLI, as root too")
+        _write(cfg_toml, "")
 
         # B2: run as a script, an unreadable file is a BLIND finding (one module, one blind record)
         if os.geteuid() == 0:  # root reads a chmod 000 file, so the case cannot be built (CI runs as root)
@@ -1049,9 +1059,9 @@ def selftest_codex(check):
         # N1: no [[scopes]] at all still measures the session's own cwd
         _write(Path(cfgf), '[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
                '[agent]\ncodex_home = "%s"\ncodex_boot_bytes = 50\n' % (d, d, codex_home))
-        rc, out = run("--agent", "codex", "check")
+        rc, out = run("--agent", "codex", "check", cwd=d)
         check(rc == 1 and "DROPPED" in out, "no scopes: the global store is still measured and can fail")
-        rc, out = run("--agent", "codex", "report")
+        rc, out = run("--agent", "codex", "report", cwd=d)
         check("(cwd)" in out, "no scopes: report names the cwd pseudo-scope")
         write_cfg()
 

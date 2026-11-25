@@ -364,6 +364,69 @@ def selftest():
                         diffs += 1
     check("plan_context prints exactly what the pre-refactor packing printed (%d generated cases)"
           % cases, diffs == 0 and cases == 108)
+    # Boundary cases: size the LAST store file, then the live entry, so the output lands exactly on
+    # the cap and one and two chars either side; each must still equal the pre-refactor packing.
+    bdiffs, bcases, bedges = 0, 0, 0
+    for cap in (1500, 2000):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            cf = os.path.join(d, "c.toml")
+            with open(cf, "w") as fh:
+                fh.write('[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
+                         '[live]\npath = "%s/live/b.md"\n'
+                         '[agent]\ncodex_home = "%s/codex"\ncodex_boot_bytes = %d\n' % (d, d, d, d, cap))
+            bcfg = notes_config.load(cf)
+            brepo = os.path.join(d, "repo")
+            os.makedirs(brepo)
+            subprocess.run(["git", "init", "-q", brepo], check=True)
+            bg = bcfg["paths"]["global_store"]
+            bp = notes_config.codex_project_store(brepo, bcfg["agent"]["codex_home"])
+            os.makedirs(bg)
+            os.makedirs(bp)
+            with open(os.path.join(bg, "MEMORY.md"), "w") as fh:
+                fh.write("# Memory Index\n\n- [x](x.md) - x\n")
+            last = os.path.join(bp, "RESUME.md")
+            livef = live_path(brepo, bcfg)
+
+            def edge(setter, mark, hi):
+                """Largest n for which the legacy output still holds mark*n; then n-2..n+2 vs legacy."""
+                lo = 0
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    setter(mid)
+                    if mark * mid in _legacy_build_context(brepo, bcfg):
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                got = []
+                for n in range(max(lo - 2, 1), lo + 3):
+                    setter(n)
+                    got.append(build_context(brepo, bcfg) == _legacy_build_context(brepo, bcfg))
+                return lo, got
+
+            def set_last(n):
+                with open(last, "w") as fh:
+                    fh.write("y" * n)
+
+            n0, got = edge(set_last, "y", cap)
+            bcases += len(got)
+            bdiffs += got.count(False)
+            bedges += 1 if 0 < n0 < cap else 0
+            set_last(max(n0 - 330, 1))  # leave room for the live header plus an entry (entries cap at 240)
+            check("boundary: the last store file fits at some size under cap %d" % cap, 0 < n0 < cap)
+
+            def set_live(n):
+                if os.path.exists(livef):
+                    os.remove(livef)
+                live.add(brepo, "z" * n, bcfg)
+
+            m0, got = edge(set_live, "z", 240)
+            bcases += len(got)
+            bdiffs += got.count(False)
+            bedges += 1 if 0 < m0 < 240 else 0
+            check("boundary: the live entry fits at some size under cap %d" % cap, 0 < m0 < 240)
+    check("plan_context matches the pre-refactor packing at, and 1 and 2 chars either side of, "
+          "the cap (%d boundary cases)" % bcases, bdiffs == 0 and bcases == 20 and bedges == 4)
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(d)
         cf = os.path.join(d, "c.toml")

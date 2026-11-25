@@ -31,8 +31,8 @@ and project instructions together pass project_doc_max_bytes, and drops nothing 
 that truncates is the project chain's alone, and the global file uses none of it. A global file over
 32768 bytes would trip that warning on its own, so it is refused. "32768" is the default: Codex
 compares against the CONFIGURED project_doc_max_bytes, which apply reads from the config.toml
-beside the AGENTS.md (bin/codex_config.py, the reader the memory canary also uses). A cap of 0 or
-below, or a malformed value, is refused naming key=value; a cap smaller than the session-notes
+beside the AGENTS.md (bin/codex_config.py, the reader the memory canary also uses). A negative or
+malformed value is refused naming key=value; a cap of 0 is valid and sized as the default; a cap smaller than the session-notes
 block itself is refused as too small for the block. Size is measured on the stripped text, as
 Codex trims the file before measuring.
 """
@@ -333,7 +333,7 @@ def configured_cap(path):
     cfg = os.path.join(os.path.dirname(os.path.abspath(path)), "config.toml")
     try:
         with open(cfg, "rb") as fh:
-            text = fh.read().decode("utf-8-sig")   # Codex's TOML parser skips a BOM
+            text = fh.read().decode("utf-8")   # read_settings skips a leading BOM
     except FileNotFoundError:
         return MAX_BYTES, None
     except (OSError, UnicodeDecodeError) as exc:
@@ -1043,7 +1043,7 @@ def selftest():
         check("cap: no config.toml keeps 32768", refused is not None)
         refused, _ = cap_apply("project_doc_max_bytes = 40000\n", "x" * 41000 + "\n")
         check("cap: a file over the raised cap is refused naming that cap",
-              refused is not None and "40000" in refused)
+              refused is not None and "40000" in refused and "config.toml" in refused)
         for bad, shown in (('"big"', "big"), ("true", "true"), ("-5", "-5")):
             refused, _ = cap_apply("project_doc_max_bytes = %s\n" % bad, "small\n")
             check("cap: project_doc_max_bytes = %s refuses naming key and value" % bad,
@@ -1057,6 +1057,13 @@ def selftest():
               refused is not None and "32 KiB, Codex's default" in refused and "config.toml" not in refused)
         refused, _ = cap_apply("project_doc_max_bytes = 0x10000\n", fat)
         check("cap: a hex integer is read on every Python", refused is None)
+        for tl in (None, codex_config._tomllib):
+            check("cap: read_settings reads hex 0x10000 as 65536 (scanner and tomllib)",
+                  codex_config.read_settings("project_doc_max_bytes = 0x10000\n", tl)
+                  == ({"project_doc_max_bytes": 65536}, []))
+        check("cap: read_settings skips a BOM",
+              codex_config.read_settings("\ufeffproject_doc_max_bytes = 7\n")[0]
+              == {"project_doc_max_bytes": 7})
         for lit in ("0o200000", "0b10000000000000000", "0x1_0000"):
             refused, _ = cap_apply("project_doc_max_bytes = %s\n" % lit, fat)
             check("cap: integer form %s is read" % lit, refused is None)
