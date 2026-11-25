@@ -269,7 +269,14 @@ protected.
 **Known limits.** Arm A judges only the listed commands, invoked directly or through
 `bash -c`, `eval` or the listed wrappers. It does not see a program that writes on its own
 (`python3 script.py`, `python -c`, `make`), nor `xargs`, a heredoc fed to a shell, `$'...'`
-quoting, `gsed`, `ruby -i`, `curl -o`, `rsync`, `patch` or `git apply`.
+quoting, `gsed`, `ruby -i`, `curl -o`, `rsync`, `patch` or `git apply`. Also not seen: brace
+expansion (`mv README.md{,.bak}`), BSD `sed -I`, `awk -i inplace`, and a `cd` that never runs or
+only runs in a subshell or condition (`false && cd x; rm README.md`, `(cd x); rm README.md`): the
+guard follows the first literal `cd` it reads. Removing or moving a checkout's top-level
+directory (an `rm` operand or an `mv` source, as in `rm -rf <clone>`) is allowed; as any other
+write target (`cp -R <dir>/. .`) it is judged as before; naming or globbing files inside it is still judged. A
+refusal for a relative path that was judged from the payload directory because a `cd` could not
+be followed says so; give an absolute path or run the `cd` as its own tool call.
 
 **Codex.** `install.sh --codex` registers the hook on PreToolUse for the tool names `Bash` and
 `apply_patch`, the names and payload shapes recorded from Codex 0.171
