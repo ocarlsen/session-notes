@@ -240,8 +240,10 @@ FUTURE_SLACK = timedelta(days=1)
 def _stamp_rank(stamp, n, now):
     """Sort key, higher = newer. A stamp more than a day ahead of `now` (a clock that was wrong,
     or a hand-made name) or one that is not a real date ranks OLDEST, so it cannot hold a slot
-    forever. Names written before the UTC change carry local time, up to 14 hours off UTC,
-    which the one-day slack absorbs."""
+    forever. Names written before the UTC change carry local time, up to 14 hours off UTC. The
+    one-day slack only stops those ranking as "future"; east of UTC they still outrank newer UTC
+    names until the UTC clock passes them, so for the first hours after an upgrade each run can
+    prune the previous run's backup (the one just written always survives). Transient."""
     try:
         when = datetime.strptime(stamp, "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -322,26 +324,33 @@ def load_existing(path):
 
 
 def configured_cap(path):
-    """The project_doc_max_bytes that applies to the global AGENTS.md at `path`: read from the
-    config.toml beside it, MAX_BYTES when the key is absent. Raises RulesError for a malformed
-    value (key=value and why) and for 0 or below: Codex treats 0 as "read no project docs" and
-    a negative number is not a size, and neither gives a cap this file can be sized against."""
+    """(cap, source): the project_doc_max_bytes that applies to the global AGENTS.md at `path`.
+    The config.toml beside it is read; `source` is its path only when the KEY was read from it,
+    else None and the cap is MAX_BYTES (absent key, absent file). 0 is valid Codex config ("read
+    no project docs") and is sized against MAX_BYTES, source None. Raises RulesError for a
+    config that does not parse ("cannot parse") and for a malformed or negative value (key=value
+    and why)."""
     cfg = os.path.join(os.path.dirname(os.path.abspath(path)), "config.toml")
     try:
         with open(cfg, "rb") as fh:
-            text = fh.read().decode("utf-8")
+            text = fh.read().decode("utf-8-sig")   # Codex's TOML parser skips a BOM
     except FileNotFoundError:
         return MAX_BYTES, None
     except (OSError, UnicodeDecodeError) as exc:
         raise RulesError("%s: cannot read it to find project_doc_max_bytes (%s); fix it or "
                          "move it aside" % (tilde(cfg), exc))
-    cap, problem = codex_config.read_key(text, "project_doc_max_bytes", MAX_BYTES)
-    if problem:
-        raise RulesError("%s: project_doc_max_bytes is malformed: %s" % (tilde(cfg), problem))
-    if cap <= 0:
-        raise RulesError("%s: project_doc_max_bytes = %d; a cap of 0 or below leaves no size to "
-                         "keep this file under. Set it to a positive size or remove the key"
-                         % (tilde(cfg), cap))
+    values, problems = codex_config.read_settings(text)
+    for prob in problems:
+        if prob.startswith("config: "):
+            raise RulesError("cannot parse %s: %s" % (tilde(cfg), prob[len("config: "):]))
+    for prob in problems:
+        if prob.startswith("project_doc_max_bytes"):
+            raise RulesError("%s: project_doc_max_bytes is malformed: %s" % (tilde(cfg), prob))
+    if "project_doc_max_bytes" not in values:
+        return MAX_BYTES, None
+    cap = values["project_doc_max_bytes"]
+    if cap == 0:
+        return MAX_BYTES, None
     return cap, cfg
 
 
@@ -359,10 +368,13 @@ def cmd_apply(path, dry, repo=REPO, local=None):
     size = len(new.strip().encode("utf-8"))
     block_size = len(block.strip().encode("utf-8"))
     if block_size > cap:
-        raise RulesError("the session-notes block alone is %d bytes, over the configured cap of "
-                         "%d (project_doc_max_bytes in %s): that cap is too small for the "
-                         "session-notes block. Raise it to at least %d, or remove the key for "
-                         "the 32 KiB default" % (block_size, cap, tilde(cfg), block_size))
+        if cfg:
+            raise RulesError("the session-notes block alone is %d bytes, over the configured cap "
+                             "of %d (project_doc_max_bytes in %s): that cap is too small for the "
+                             "session-notes block. Raise it to at least %d, or remove the key for "
+                             "the 32 KiB default" % (block_size, cap, tilde(cfg), block_size))
+        raise RulesError("the session-notes block alone is %d bytes, over the 32 KiB default cap "
+                         "(%d): shorten the rules or the addendum" % (block_size, cap))
     if size > cap:
         where = ("project_doc_max_bytes = %d from %s" % (cap, tilde(cfg)) if cfg
                  else "32 KiB, Codex's default")
@@ -1024,17 +1036,52 @@ def selftest():
         check("cap: a raised configured cap accepts a file between 32768 and it",
               refused is None and os.path.getsize(cap_agents) > MAX_BYTES)
         refused, _ = cap_apply('model = "x"\n', fat)
-        check("cap: an absent key keeps 32768", refused is not None and "32 KiB" in refused)
+        check("cap: an absent key keeps 32768 and the label says default, not config.toml",
+              refused is not None and "32 KiB, Codex's default" in refused
+              and "config.toml" not in refused)
         refused, _ = cap_apply(None, fat)
         check("cap: no config.toml keeps 32768", refused is not None)
         refused, _ = cap_apply("project_doc_max_bytes = 40000\n", "x" * 41000 + "\n")
         check("cap: a file over the raised cap is refused naming that cap",
               refused is not None and "40000" in refused)
-        for bad, shown in (('"big"', "big"), ("true", "true"), ("-5", "-5"), ("0", "0")):
+        for bad, shown in (('"big"', "big"), ("true", "true"), ("-5", "-5")):
             refused, _ = cap_apply("project_doc_max_bytes = %s\n" % bad, "small\n")
             check("cap: project_doc_max_bytes = %s refuses naming key and value" % bad,
                   refused is not None and "project_doc_max_bytes" in refused and shown in refused.lower()
                   and open(cap_agents).read() == "small\n")
+        refused, _ = cap_apply("project_doc_max_bytes = 0\n", "small\n")
+        check("cap: project_doc_max_bytes = 0 is valid config and writes",
+              refused is None and "session-notes" in open(cap_agents).read())
+        refused, _ = cap_apply("project_doc_max_bytes = 0\n", fat)
+        check("cap: 0 is sized against 32768, labelled default",
+              refused is not None and "32 KiB, Codex's default" in refused and "config.toml" not in refused)
+        refused, _ = cap_apply("project_doc_max_bytes = 0x10000\n", fat)
+        check("cap: a hex integer is read on every Python", refused is None)
+        for lit in ("0o200000", "0b10000000000000000", "0x1_0000"):
+            refused, _ = cap_apply("project_doc_max_bytes = %s\n" % lit, fat)
+            check("cap: integer form %s is read" % lit, refused is None)
+        refused, _ = cap_apply("\ufeffproject_doc_max_bytes = 65536\n", fat)
+        check("cap: a UTF-8 BOM before the config is skipped", refused is None)
+        refused, _ = cap_apply('x = """\nunterminated\n', "small\n")
+        check("cap: an unparseable config says cannot parse, not a malformed key",
+              refused is not None and "cannot parse" in refused
+              and "project_doc_max_bytes is malformed" not in refused)
+        big_repo = os.path.join(tmp, "repo_big")
+        shutil.copytree(repo, big_repo)
+        with open(os.path.join(big_repo, "rules", "core.md"), "a") as fh:
+            fh.write("z" * (MAX_BYTES + 100) + "\n")
+        open(cap_agents, "w").write("")
+        os.unlink(cap_cfg)
+        try:
+            cmd_apply(cap_agents, False, big_repo, local)
+            refused = None
+        except RulesError as exc:
+            refused = str(exc)
+        except Exception as exc:
+            refused = "CRASH %r" % exc
+        check("cap: a block over the default with no config.toml is a clean refusal",
+              refused is not None and not refused.startswith("CRASH") and "config.toml" not in refused
+              and "32 KiB default" in refused)
         refused, _ = cap_apply("project_doc_max_bytes = 100\n", "small\n")
         check("cap: a cap below the session-notes block says it is too small for the block",
               refused is not None and "too small for the session-notes block" in refused

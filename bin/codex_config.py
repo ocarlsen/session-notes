@@ -130,6 +130,8 @@ def _toml_value(raw):
     raw = raw.strip()
     if re.fullmatch(r"[+-]?\d+(?:_\d+)*", raw):
         return int(raw.replace("_", ""))
+    if re.fullmatch(r"0x[0-9A-Fa-f]+(?:_[0-9A-Fa-f]+)*|0o[0-7]+(?:_[0-7]+)*|0b[01]+(?:_[01]+)*", raw):
+        return int(raw.replace("_", ""), 0)
     if raw in ("true", "false"):
         return raw == "true"
     if not raw:
