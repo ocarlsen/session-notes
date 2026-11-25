@@ -30,13 +30,19 @@ if os.path.join(REPO, "bin") not in sys.path:
 import notes_config  # noqa: E402  (the module the tools resolve their state paths with)
 
 
+_HOOK = []
+
+
 def load_hook():
     """The consent hook module, loaded from this checkout (its own last_assistant_text and asked_pr
-    decide what counts as the ask)."""
+    decide what counts as the ask). Executed once: the module puts its bin on sys.path when it loads."""
+    if _HOOK:
+        return _HOOK[0]
     import importlib.util
     spec = importlib.util.spec_from_file_location("consent_hook_mod", os.path.join(REPO, "hooks", "merge_consent.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    _HOOK.append(m)
     return m
 
 PASS, FAIL = sl.PASS, sl.FAIL
@@ -93,11 +99,24 @@ MARKER_MD = ("---\nname: Marker\ndescription: the selftest marker word\nmetadata
              "The selftest marker word is in the index line.\n")
 
 
+def test_marks(grants_path, seen_path, session="dance"):
+    """What this test could have written to a grants file: its own session's grant entries and its seen
+    marker's mtime. A grant another live session adds to the same file is not the test's write."""
+    try:
+        with open(grants_path) as fh:
+            mine = [g for g in json.load(fh).get("grants", []) if g.get("session") == session]
+    except (OSError, ValueError, AttributeError):
+        mine = []
+    seen = os.stat(seen_path).st_mtime_ns if os.path.exists(seen_path) else None
+    return json.dumps(mine, sort_keys=True), seen
+
+
 def fix_prompt(path, finding, tok):
     """The fix beat's prompt: Claude fixes, commits AND pushes (`wt merge` refuses an unpushed head)."""
     return ("The reviewer asked for changes on the poem PR. Fix exactly what it found, in poem.md inside %s "
             "(Edit or Write tool on that path), then run: cd %s && git add poem.md && git commit -q -m "
-            "'Address review' && git push -q origin poem . Do not run wt merge. Then reply DONE. The finding: %s (run id FIX%s)"
+            "'Address review' && git push -q origin poem  (nothing follows the push command). Do not run wt merge. Then reply "
+            "DONE. The finding: %s (run id FIX%s)"
             % (path, shlex.quote(path), " ".join(finding.split())[:1200], tok))
 
 
@@ -203,6 +222,8 @@ class Dance(sl.Live):
         try:
             with open(self.state_paths()[0], encoding="utf-8") as fh:
                 out = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        except notes_config.ConfigError:
+            raise  # a broken sandbox config is not "the message never reached the bus"
         except (OSError, ValueError):
             pass
         return sorted(out, key=lambda m: m.get("ts", 0))
@@ -211,6 +232,8 @@ class Dance(sl.Live):
         try:
             with open(self.state_paths()[1]) as fh:
                 return json.load(fh)
+        except notes_config.ConfigError:
+            raise
         except (OSError, ValueError):
             return None
 
@@ -425,8 +448,9 @@ class Dance(sl.Live):
         refusal = re.compile(r"checkout_guard: \S*poem\.md is tracked on")
         main_poem = os.path.join(self.proj, "poem.md")
         self.wait_idle(c)
-        self.send(c, "Add this poem to %s, one line each, below the title: %s. Put a blank line between consecutive "
-                     "lines so each renders as its own line. Use the Edit tool directly on that exact "
+        self.send(c, "Add this poem to %s, one line each, below the title: %s. Write them as four consecutive lines "
+                     "right under the title, no blank lines between them, each line except the last ending in a backslash (a "
+                     "Markdown hard break, so each renders as its own line and no editor can strip it). Use the Edit tool directly on that exact "
                      "path. If the edit is refused, follow what the refusal tells you: run `wt new poem` and write the "
                      "poem into poem.md in the worktree it creates (Edit or Write tool on that path), without committing. "
                      "Then reply DONE. (run id %s)" % (main_poem, " | ".join(self.poem), rid))
@@ -518,6 +542,7 @@ class Dance(sl.Live):
         fixed = False
         for rnd in (1, 2):
             err, verdict, body = self.review_round(path, head, rules, rnd)
+            self.kill_ephemeral()  # the round's Codex pane ends with its verdict: it must not touch poem.md in the fix beat
             if err:
                 return FAIL, err, "dance-review.txt" if rnd == 1 else "dance-review-2.txt"
             if verdict == "APPROVE":
@@ -535,7 +560,11 @@ class Dance(sl.Live):
                 return FAIL, ("the fix commit %s was never pushed: origin/poem is %s (`wt merge` would stop at 'push first')"
                               % (new_head[:10], (remote_head(self.git, path, "poem") or "absent")[:10])), "dance-review.txt"
             self.wait_idle(c, 90)
-            head = self.git(path, "rev-parse", "HEAD").stdout.strip()
+            now = self.git(path, "rev-parse", "HEAD").stdout.strip()
+            if now != new_head:
+                return FAIL, ("local HEAD %s moved past the pushed fix commit %s before the re-review (`wt merge` would stop at "
+                              "'push first')" % (now[:10], new_head[:10])), "dance-review.txt"
+            head = new_head
             diff = self.git(path, "diff", "origin/main...HEAD").stdout
             self.stub_pr(head, diff)
             fixed = True
@@ -635,7 +664,6 @@ def offline_checks(check):
     import subprocess
     import tempfile
     here = os.path.dirname(os.path.realpath(__file__))
-    main_py = os.path.join(here, "selftest_live.py")
     ids = [f for f, _t, _s in FEATURES]
     check("dance: every step has a chapter title and no other", set(CHAPTERS) == set(ids), str(set(CHAPTERS) ^ set(ids)))
     check("dance: chapter titles have no dash, at most 8 words, no jargon",
@@ -689,6 +717,23 @@ def offline_checks(check):
         check("dance: the nightly record at the notes_config path is read back (scene 7's lookup)",
               (d.read_last_check() or {}).get("rc") == 0, lc_path)
         check("dance: the state paths sit under the sandbox home", True)
+        child = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import session_bus; print(session_bus.bus_path())"
+                                % os.path.join(REPO, "bin")], env=d.env(), capture_output=True, text=True, timeout=60)
+        tool_bus = os.path.realpath(child.stdout.strip()) if child.returncode == 0 and child.stdout.strip() else None
+        check("dance: session_bus.bus_path() in a child under the run's environment is the path state_paths() reads",
+              tool_bus == os.path.realpath(bus_path), "%s vs %s (rc %s %s)" % (tool_bus, bus_path, child.returncode, child.stderr[-120:]))
+        real_state = d.state_paths
+        d.state_paths = lambda: (_ for _ in ()).throw(notes_config.ConfigError("line 1: bad string"))
+        for fn in (d.bus_msgs, d.read_last_check):
+            try:
+                fn()
+                raised = False
+            except notes_config.ConfigError:
+                raised = True
+            check("dance: a ConfigError is not swallowed by %s" % fn.__name__, raised)
+        d.state_paths = real_state
+        os.remove(bus_path)
+        check("dance: negative control, a missing bus file still reads as no messages", d.bus_msgs() == [])
         check("dance: negative control, a message not on the bus is not found", d.bus_find("xA", "cA", "MAIL" + d.tok) is None)
         # B2: the ask is read from the newest assistant reply, in the real Claude key order (reply text NOT last)
         def transcript(rid, reply):
@@ -792,13 +837,13 @@ def offline_checks(check):
         write_launcher(launcher, HOOK_LAUNCH, hook=os.path.join(repo, "hooks", "merge_consent.py"), grants=grants)
         import pwd
         hook_mod = load_hook()
+        check("dance: load_hook() executes the hook module once and hands back the same module", load_hook() is hook_mod)
         check("dance: negative control, the loaded hook's override is unset", hook_mod.GRANTS_PATH_OVERRIDE is None)
         real = hook_mod.grants_path()  # the real one: the passwd home plus the hook's own GRANTS_REL
         check("dance: the real grants path is the passwd home plus the hook's GRANTS_REL",
               real == os.path.join(pwd.getpwuid(os.getuid()).pw_dir, *hook_mod.GRANTS_REL), real)
         real_seen = os.path.join(os.path.dirname(real), "seen", "dance")
-        stat = lambda p: os.stat(p).st_mtime_ns if os.path.exists(p) else None
-        before = (stat(real), stat(real_seen))
+        before = test_marks(real, real_seen)
         for _ in (1, 2):  # the first prompt of a session never grants
             subprocess.run([sys.executable, launcher], input=json.dumps({"prompt": "merge #7", "session_id": "dance",
                                                                          "cwd": proj}), env=env, capture_output=True, text=True, timeout=60)
@@ -808,8 +853,21 @@ def offline_checks(check):
             gr = []
         check("dance: the real consent hook, through the launcher, records the grant in the sandbox with repo o/r",
               len(gr) == 1 and gr[0].get("pr") == 7 and gr[0].get("repo") == "o/r" and gr[0].get("prompt") == "merge #7", str(gr))
-        after = (stat(real), stat(real_seen))
+        after = test_marks(real, real_seen)
         check("dance: the real grants file and its seen/dance marker were not touched", before == after, "%s -> %s" % (before, after))
+        # positive controls on a temp copy: a sibling's grant is not the test's write, the test's own grant and marker are
+        cg, cs = os.path.join(tmp, "copy", "grants.json"), os.path.join(tmp, "copy", "seen", "dance")
+        os.makedirs(os.path.dirname(cs))
+        entry = lambda sid: {"repo": "o/r", "pr": 7, "ts": 1.0, "prompt": "yes", "session": sid, "used": False}
+        json.dump({"grants": [entry("other")]}, open(cg, "w"))
+        base = test_marks(cg, cs)
+        json.dump({"grants": [entry("other"), entry("someone-else")]}, open(cg, "w"))
+        check("dance: a grant from another live session does not trip the real-grants check", test_marks(cg, cs) == base)
+        json.dump({"grants": [entry("other"), entry("dance")]}, open(cg, "w"))
+        check("dance: positive control, a grant carrying the test's own session id is caught", test_marks(cg, cs) != base)
+        json.dump({"grants": [entry("other")]}, open(cg, "w"))
+        open(cs, "w").close()
+        check("dance: positive control, a seen/dance marker the test wrote is caught", test_marks(cg, cs) != base)
         check("dance: the sandbox got its own seen/dance marker beside the sandbox grants",
               os.path.exists(os.path.join(os.path.dirname(grants), "seen", "dance")))
         wt = os.path.join(tmp, "wt")
@@ -840,6 +898,9 @@ def offline_checks(check):
         fp = fix_prompt(clone, "needs a line", "X1")
         check("dance: the fix-beat prompt commits and pushes origin poem, and no longer forbids pushing",
               "git push -q origin poem" in fp and "do not push" not in fp.lower() and fp.index("git commit") < fp.index("git push"), fp)
+        tail = fp.split("git push -q origin poem", 1)[1]
+        check("dance: nothing but a parenthetical follows `origin poem` in the fix prompt (no stray ` .` refspec)",
+              not re.match(r"\s+\.", tail) and re.match(r"\s+\(", tail) is not None, tail[:40])
         gg(clone, "push", "-q", "origin", "HEAD:poem")
         check("dance: after the push the remote head equals the new local HEAD", remote_head(gg, clone, "poem") == h2)
         check("dance: every path the check wrote sits under the temp dir", all(os.path.realpath(x).startswith(tmp) for x in (bare, clone)))
