@@ -26,8 +26,10 @@ Codex's project_doc_max_bytes (32 KiB default) caps PROJECT AGENTS.md files: its
 skips empty files and stops adding files once the combined size reaches the limit". Verified in the
 installed codex-cli 0.171.0 binary: "The total includes global and thread instructions. The limit
 applies only to project files." and, past the cap, "project doc exceeds remaining budget;
-truncating". So the global file counts toward the total but the hard limit is on the project chain.
-A result over 32768 bytes is refused either way, the safe side.
+truncating". The "total" there is only an advisory warning: Codex warns at load when global, thread
+and project instructions together pass project_doc_max_bytes, and drops nothing for it. The budget
+that truncates is the project chain's alone, and the global file uses none of it. A global file over
+32768 bytes would trip that warning on its own, so it is refused.
 """
 import argparse
 import difflib
@@ -300,14 +302,16 @@ def cmd_apply(path, dry, repo=REPO, local=None):
     if size > MAX_BYTES:
         raise RulesError("%s would be %d bytes, over 32 KiB (%d bytes). Codex's "
                          "project_doc_max_bytes (32 KiB by default) limits project AGENTS.md "
-                         "files, not this global one; session-notes keeps the global file under "
-                         "the same size to stay safe. Trim the file, or the addendum, and run "
-                         "again" % (tilde(path), size, MAX_BYTES))
+                         "files, not this global one, but past that size Codex warns at every load "
+                         "that its instructions exceed it, so session-notes keeps the global file "
+                         "at or under 32 KiB. Trim the file, or the addendum, and run again"
+                         % (tilde(path), size, MAX_BYTES))
     if len(block.encode("utf-8")) > BLOCK_WARN_BYTES:
         print("warning: the session-notes block alone is %d bytes (over %d); it uses much of the "
-              "Codex budget" % (len(block.encode("utf-8")), BLOCK_WARN_BYTES), file=sys.stderr)
+              "%d bytes this file may hold" % (len(block.encode("utf-8")), BLOCK_WARN_BYTES,
+                                              MAX_BYTES), file=sys.stderr)
     if size > WARN_BYTES:
-        print("warning: %s is %d bytes, close to the %d Codex reads" % (
+        print("warning: %s is %d bytes, close to the %d this file may hold" % (
             tilde(path), size, MAX_BYTES), file=sys.stderr)
     return finish(path, old, new, dry, "wrote")
 
