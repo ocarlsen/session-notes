@@ -437,7 +437,8 @@ else claude), with the same naming, lineage, staged and auto-start modes and `--
 
 A staged Codex pane needs the session-notes hooks trusted (`/hooks`); the parked spec arrives
 on the first prompt typed in the pane. To have idle
-recipients of bus mail woken instead, keep `bin/bus_nudge.py` running: on macOS
+recipients of bus mail woken instead (plain bus mail only: a staged spec is never woken,
+only a typed prompt releases it), keep `bin/bus_nudge.py` running: on macOS
 `python3 bin/launch_agents.py install bus-nudge` starts it at login and restarts it
 if it exits; or run it in its own tmux session. Only one loop runs at a time. A session launched with `handoff_session.py` records its parent at
 startup (tmux `-e` env read by the pane-registry hook), which is what `--tree`
@@ -530,7 +531,7 @@ launching anything.
 Limits worth knowing: Codex runs with `--dangerously-bypass-hook-trust`, so hook trust is not
 covered; tmux is reached only through a sandbox `TMUX_TMPDIR` (asserted before any pane-listing
 tool runs); `launchctl` and `gh` are stubs; `em_dash_guard` is advisory, so its row checks that the
-flag reached the session, not that the file was refused. The `checkout` row checks both CLIs: the tracked file is unchanged and the guard's own text reached the session, and for Codex a new file in the same repo is still allowed (negative control).
+flag reached the session, not that the file was refused. The `checkout` row checks both CLIs in three turns' worth of refusals: an edit-tool write to a tracked file, a shell write (`printf >>`) to a second tracked file, and a raw `gh pr merge`, each refused with the guard's own text, the files unchanged and no `pr merge` call reaching the `gh` stub (the stub wins on a login shell's `PATH` too); for Codex a new file in the same repo is still allowed (negative control). The Codex `handoff` row also runs one `bus_nudge.py --once --only` pass over the staged pane and checks it prints HOLDING and types nothing; the Claude handoff row is auto-start only and carries no hold check.
 
 ### Watch mode: `make selftest-watch`
 

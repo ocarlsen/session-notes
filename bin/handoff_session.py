@@ -254,7 +254,18 @@ def spawn_note(no_build, cfg=None):
 
 
 def selftest():
-    """Deterministic checks over argv construction + mode selection. No spawning."""
+    """Deterministic checks over argv construction + mode selection. No spawning. The caller's
+    SESSION_NOTES_AGENT is removed for the whole run (and restored), so the checks never depend
+    on which harness launched them."""
+    saved = os.environ.pop("SESSION_NOTES_AGENT", None)
+    try:
+        return _selftest()
+    finally:
+        if saved is not None:
+            os.environ["SESSION_NOTES_AGENT"] = saved
+
+
+def _selftest():
     fails = []
     ran = [0]
 
@@ -479,6 +490,8 @@ def selftest():
     check("choose_cli: explicit wins over the environment",
           choose_cli("claude", {"SESSION_NOTES_AGENT": "codex"}) == "claude"
           and choose_cli("codex", {}) == "codex")
+    check("the selftest runs with SESSION_NOTES_AGENT removed (a Codex caller's env cannot leak in)",
+          "SESSION_NOTES_AGENT" not in os.environ)
     check("choose_cli: SESSION_NOTES_AGENT=codex selects codex, else claude",
           choose_cli(None, {"SESSION_NOTES_AGENT": "codex"}) == "codex"
           and choose_cli(None, {"SESSION_NOTES_AGENT": " Codex "}) == "codex"
@@ -798,8 +811,9 @@ def main(argv=None):
     print("NOTE: this only STAGED the session + spec; nothing has run. Your prompt in that pane authorizes.")
     if spec:
         print("NOTE: the spec is delivered by the bus hook on that first prompt, and expires "
-              "after 24h if it is not. A Codex pane: trust the hooks in /hooks before typing, "
-              "or the spec does not arrive.")
+              "after 24h if it is not." + (
+                  " A Codex pane: trust the hooks in /hooks before typing, or the spec does "
+                  "not arrive." if cli == "codex" else ""))
     return 0
 
 
