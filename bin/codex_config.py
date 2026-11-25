@@ -2,9 +2,8 @@
 project_doc_fallback_filenames. One reader for every caller (the memory canary and rules_block),
 so the TOML handling, the scanner fallback and the validity rules live in one place.
 
-read_settings(text) -> ({key: value}, [problem]); read_key(text, key, default) -> (value, problem).
-Neither raises on a malformed config: a problem comes back as text naming the key, the value and
-the reason, and the caller decides whether that is a finding (the canary) or a refusal (rules_block).
+read_settings(text) -> ({key: value}, [problem]). It does not raise on a malformed config: a problem comes back as
+text naming the key, the value and the reason, and the caller decides whether that is a finding (the canary) or a refusal (rules_block).
 tomllib/tomli is used when importable, else a small top-level scanner.
 """
 import re
@@ -204,7 +203,9 @@ def read_settings(text, tomllib=_tomllib):
     """({key: valid value}, [problem]) from Codex config text. Keys that are absent are absent
     from the dict. A problem reads "KEY: REASON" or "KEY = VALUE: must be ..."; a config that
     cannot be parsed at all is one problem keyed "config". `tomllib` lets a selftest force the
-    scanner (None)."""
+    scanner (None). A leading UTF-8 BOM is skipped, as Codex's TOML parser does."""
+    if text.startswith("\ufeff"):
+        text = text[1:]
     values, problems = {}, []
     for key, v in config_values(text, tomllib).items():
         name = key or "config"
@@ -218,12 +219,3 @@ def read_settings(text, tomllib=_tomllib):
             values[key] = v
     return values, problems
 
-
-def read_key(text, key, default, tomllib=_tomllib):
-    """(value, problem) for one key: (default, None) when absent, (value, None) when valid,
-    (default, problem) when the key or the whole config is unreadable or invalid."""
-    values, problems = read_settings(text, tomllib)
-    mine = [p for p in problems if p.startswith(key) or p.startswith("config")]
-    if mine:
-        return default, "; ".join(mine)
-    return values.get(key, default), None
