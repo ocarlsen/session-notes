@@ -158,24 +158,45 @@ that is also red on the base branch still blocks. A pending check is refused, no
 rerun when CI finishes.
 
 **The consent gate.** An APPROVE comment is something any session can post, so it does not
-authorize a merge. The session ends its reply with `merge #N?` naming exactly one PR; the user
-answers a bare yes (yes, y, yep, yeah, ok, go, do it, merge it) or types `merge #N`. The
-`hooks/merge_consent.py` UserPromptSubmit hook (Claude Code and Codex) records that human prompt
-in `<shared_state_dir>/merge-consent/grants.json`: repo, PR number, time, the prompt verbatim, the
-session. A yes counts only when the previous reply's last question names exactly one `merge #N`;
-the first prompt of a session, bus nudges and bcast lines grant nothing; the previous reply is read from
-the Claude transcript or the Codex rollout (`task_complete.last_agent_message`). The repo comes from
-the cwd's `origin`, else the one `owner/repo` or PR URL the reply names, else the one github
-checkout under a configured scope root; with none, `merge` refuses the grant and says to ask from
-inside the repo or name it. `merge` then requires an
-unexpired (30 minutes), unused grant for that repo and PR, posts `Merge authorized by the user: "<prompt>" (<time>)`
-on the PR, marks the grant used bound to the head sha, and merges; otherwise it exits 7 telling the session
-to ask the user. `checkout_guard` refuses agent writes to the grant directory. There is no flag
-or variable to skip it.
+authorize a merge. The session ends its reply with a final sentence that IS the ask:
+`merge #N?`, optionally after a short lead-in ending in `:` or followed by ` in owner/repo`, with
+no other `#N` and no negation in it. The user answers a bare yes (yes, y, yep, yeah, ok, go, do
+it, merge it) or types `merge #N`. The `hooks/merge_consent.py` UserPromptSubmit hook (Claude Code
+and Codex) records that human prompt in `~/.claude/session-notes/state/merge-consent/grants.json`
+(the passwd home of the user and a fixed path: `$HOME`, `SESSION_NOTES_CONFIG` and the configured
+state dir do not move it): repo, PR number, time, the prompt verbatim, the session. A yes counts
+only when the previous reply's final sentence is that ask and no human prompt came after the
+reply (a "no, rebase first" in between voids it); the previous reply is read from the Claude
+transcript or the Codex rollout. The first prompt of a session, bus nudges and bcast lines grant
+nothing. The repo comes from the cwd's `origin`, else the one `owner/repo` or PR URL the reply
+names, else the one github checkout under a configured scope root; a reply that names a repo
+other than the cwd's grants nothing; with none, `merge` refuses the grant and says to ask from
+inside the repo or name it (`merge #N in owner/repo?`).
 
-**What the gate does and does not protect.** It stops other GitHub accounts from approving. It
-does not stop you: one login can author the code and post the APPROVE, and `$WT_GH` and
-`token_command` are trusted local configuration, so anyone who can change them can bypass it.
+`merge` then requires an unexpired (30 minutes), unused grant for that repo and PR, and a newest
+APPROVE verdict whose GitHub `created_at` is EARLIER than the yes (a push after the yes needs a
+new review, then a new ask). It spends the grant (recording the head sha), posts
+`Merge authorized by the user: "<prompt>" (<time>)` on the PR, and merges; with no live grant it
+exits 7 telling the session to ask the user. `checkout_guard` refuses the ordinary ways an agent
+could write the grant directory (an edit, a redirect, `$HOME` spellings, moving a parent
+directory, a hard link) and refuses to run or import the hook or to call the merge API directly
+(`gh api` PUT `pulls/N/merge`, a `mergePullRequest` mutation).
+
+**What the gate does and does not protect.** The verdict gate stops other GitHub accounts from
+approving. It does not stop you: one login can author the code and post the APPROVE, and
+`$WT_GH` and `token_command` are trusted local configuration, so anyone who can change them can
+bypass it. The consent gate stops a session that FOLLOWS its refusals. It does not stop one that
+deliberately forges: any process running as the same user can write the grant file through an
+interpreter (`python3 -c`, `node -e`, `rsync`, a variable-built path) and `checkout_guard` is a
+command parser, not a sandbox. Known limits, left open on purpose:
+
+- A session can type into its own pane (`tmux send-keys`), set `CLAUDE_CODE_ENTRYPOINT` before a
+  headless run, or start `claude --resume <id> "merge #N"` or `codex exec resume <id> "merge #N"`;
+  each presents its text as a human prompt to the hook, which cannot tell it from the user's.
+- A grant is usable by any session on the machine, not only the one the user answered.
+- A yes is tied to the PR, the repo and the time, not to the code: the APPROVE-before-yes check
+  catches a push after the yes only when a new APPROVE is posted, and `--match-head-commit` pins
+  the merge to the head the gates saw.
 
 ## review: the reviewer's prompt, and the verdict comment
 
@@ -189,7 +210,8 @@ it reuses `wt.py`'s GitHub access (`[wt].token_command`, `$WT_GH`) and its verdi
 
 Exit codes: 1 fatal, a refusal or a selftest failure, 2 usage error (argparse), 3 token command failed, 4 the head moved since `prepare`. A PR diff that is not UTF-8 is a clear exit 1. `test_edit_check.py` decodes a non-UTF-8 diff (file or stdin) with replacement and a warning.
 The `/review` skill (and `$review` in Codex) is the procedure: checks and rebase, `prepare`, a
-reviewer sub-agent at high effort, `post`, then `wt merge`.
+reviewer sub-agent at high effort, `post`, then ask the user `merge #N?` (name `owner/repo`
+when not inside the checkout) and, on their yes, `wt merge`.
 
 `bin/test_edit_check.py` reads a unified diff on stdin (or `--diff-file`) and reports every
 removed or changed line in a test, fixture or guard file, every deleted test file, and every

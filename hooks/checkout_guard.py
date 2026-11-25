@@ -34,6 +34,13 @@ dirty, never clean.
 CONFIG PROTECTION: the config file itself (symlink and target alike) cannot be edited or written
 by the agent, in either arm, even when its parse is broken and whatever the exemptions say.
 
+MERGE-CONSENT PROTECTION: the grant directory of hooks/merge_consent.py (a fixed path under the
+passwd home) is protected like the config, with `$VAR` expanded and with a mv, rm or ln of any
+directory above it (or a link from it) counting too. A shell command that runs or imports
+hooks/merge_consent.py, and `gh api` straight at a PR merge (PUT pulls/N/merge, a mergePullRequest
+mutation), are refused like a raw `gh pr merge`. This is a command parser, not a sandbox: a
+deliberate forgery through an interpreter is not stopped (docs/tools.md).
+
 EXEMPTIONS come from the config only ([checkout_guard] exempt_repos / exempt_paths, plus every
 scope's memory store for edits). There is NO environment variable, flag or command-line comment
 that turns the guard off; the hook reads no environment variable except HOME and
@@ -63,6 +70,12 @@ try:
 except Exception as _exc:  # fail open, reported by main()
     notes_config = None
     _IMPORT_ERROR = str(_exc)
+sys.path.insert(0, os.path.join(ROOT, "hooks"))
+try:
+    import merge_consent  # noqa: E402  (the grant path has one definition)
+except Exception as _exc:
+    merge_consent = None
+    _CONSENT_IMPORT_ERROR = str(_exc)
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 PATCH_TOOLS = ("apply_patch",)
@@ -666,7 +679,7 @@ def _script_of(argv):
 
 
 def _config_msg(path):
-    if "merge-consent" in path.split(os.sep):
+    if "merge-consent" in path.split(os.sep) or path.rstrip(os.sep) in _consent_ancestors():
         return ("checkout_guard: %s is the merge-consent grant store, written only by the user's "
                 "own prompt through the merge_consent hook. The user grants a merge by answering "
                 "`merge #N?` with a yes; the agent cannot edit this file: ask the user." % path)
@@ -675,29 +688,49 @@ def _config_msg(path):
             % path)
 
 
+def _consent_ancestors():
+    try:
+        d = os.path.realpath(os.path.dirname(merge_consent.grants_path()))
+    except Exception:
+        return set()
+    out = set()
+    while d and d != os.path.dirname(d):
+        d = os.path.dirname(d)
+        out.add(d)
+    return out
+
+
 def protected_paths():
     """Real paths of the config file (a symlink and its target resolve to the same one). Known
     even when the file fails to parse. Empty only if notes_config could not be imported."""
     if notes_config is None:
         return set()
     out = {os.path.realpath(os.path.abspath(notes_config.config_path()))}
-    # The merge-consent grant store (hooks/merge_consent.py): the directory and so every file in it.
-    try:
-        out.add(os.path.realpath(os.path.dirname(
-            notes_config.shared_state_path("merge-consent", "grants.json"))) + os.sep)
-    except notes_config.ConfigError:
-        pass  # a broken config: the config file itself is still protected
+    # The merge-consent grant store: its directory, so every file in it. The path comes from the
+    # passwd home, not from the config or $HOME, so a changed environment cannot move it.
+    if merge_consent is None:
+        raise Fail("cannot import merge_consent: %s" % _CONSENT_IMPORT_ERROR)
+    out.add(os.path.realpath(os.path.dirname(merge_consent.grants_path())) + os.sep)
     return out
 
 
-def is_protected(path, cwd, protected):
+def _real(path, cwd):
+    p = os.path.expandvars(os.path.expanduser(path))  # `$HOME/...` is judged like `~/...`
+    p = p if os.path.isabs(p) else os.path.join(cwd, p)
+    return os.path.realpath(p)
+
+
+def is_protected(path, cwd, protected, ancestors=False):
+    """True when `path` is a protected file, inside a protected directory, or (ancestors=True,
+    for a move, remove or link) is the protected directory or any directory above it."""
     if not path or not protected:
         return False
-    p = os.path.expanduser(path)
-    p = p if os.path.isabs(p) else os.path.join(cwd, p)
-    real = os.path.realpath(p)
-    return real in protected or any(
-        d.endswith(os.sep) and (real + os.sep).startswith(d) for d in protected)
+    real = _real(path, cwd)
+    if real in protected or any(
+            d.endswith(os.sep) and (real + os.sep).startswith(d) for d in protected):
+        return True
+    return ancestors and any(d.endswith(os.sep) and d.startswith(real.rstrip(os.sep) + os.sep)
+                             for d in protected)
 
 
 _GLOB_CHARS = re.compile(r"[*?\[]")
@@ -770,10 +803,22 @@ def _write_targets(argv, writes, cwd):
 
 
 def _config_write(argv, writes, cwd, protected):
-    """The refusal when this segment writes to the config file."""
+    """The refusal when this segment writes to the config file or the grant store."""
     for c, _, _ in _write_targets(argv, writes, cwd):
         if is_protected(c, cwd, protected):
-            return _config_msg(os.path.realpath(os.path.expanduser(c)))
+            return _config_msg(_real(c, cwd))
+    if argv:
+        name = os.path.basename(argv[0])
+        ops = [t for t in argv[1:] if not t.startswith("-")]
+        # mv, rm and ln: any operand that is the grant directory or a directory above it (moving
+        # the parent away and back, or hard-linking the file, replaces the grants); ln judges its
+        # sources too. cp judges its destination only (a backup copy is harmless).
+        if name in ("mv", "rm", "ln"):
+            for t in ops:
+                if is_protected(t, cwd, protected, ancestors=True):
+                    return _config_msg(_real(t, cwd))
+        elif name == "cp" and ops and is_protected(ops[-1], cwd, protected, ancestors=True):
+            return _config_msg(_real(ops[-1], cwd))
     return None
 
 
@@ -903,10 +948,14 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
                 if r:
                     return r
             continue
+        if _runs_consent_hook(name, argv, cmd) :
+            return _consent_exec_msg()
         if cfg is None:
             continue
         if name == "gh":
             if is_gh_pr_merge(argv[1:]) and not _exempt_cwd(cfg, cwd):
+                return _merge_msg(wt)
+            if _is_raw_api_merge(argv[1:]) and not _exempt_cwd(cfg, cwd):
                 return _merge_msg(wt)
         elif name == "git":
             sub_cmd, args, tree = _git_target(argv, cwd)
@@ -917,6 +966,44 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
                     "uncommitted changes. Commit them first (a WIP commit is fine) or save a "
                     "copy, then retry." % (verb, tree))
     return None
+
+
+_INTERPRETERS = re.compile(r"^(python[\d.]*|pypy[\d.]*|node|nodejs|deno|bun|ruby|perl|php|lua|osascript|"
+                           r"sh|bash|zsh|dash|ksh|source|\.)$")
+
+
+def _runs_consent_hook(name, argv, raw_cmd):
+    """True when this segment executes or imports hooks/merge_consent.py: the script run directly
+    or by an interpreter, `-m merge_consent`, `-c "import merge_consent"`, or an interpreter
+    reading it from a heredoc. Its own selftest (`<interp> <path> --selftest`) is allowed. The
+    hook forges a grant from a fabricated payload, so a session may not run it."""
+    if "merge_consent" in name:
+        return True
+    if not _INTERPRETERS.match(name):
+        return False
+    if "merge_consent" not in raw_cmd and not any("merge_consent" in t for t in argv):
+        return False
+    selftest = (argv[-1] == "--selftest" and "-c" not in argv and "-m" not in argv
+                and len(argv) <= 3 and "merge_consent" in argv[-2])
+    return not selftest
+
+
+def _consent_exec_msg():
+    return ("checkout_guard: hooks/merge_consent.py records the USER's yes to a merge from the "
+            "user's own prompt; a session may not run or import it. Ask the user `merge #N?` and "
+            "wait for their answer.")
+
+
+def _is_raw_api_merge(args):
+    """`gh api` straight at a PR merge: PUT .../pulls/N/merge, or a GraphQL mergePullRequest."""
+    if not args or args[0] != "api":
+        return False
+    joined = " ".join(args[1:])
+    if "mergePullRequest" in joined:
+        return True
+    put = any(t.upper() in ("PUT",) for t in args[1:]) or bool(
+        re.search(r"(?:-X|--method)[ =]?PUT|-XPUT", joined, re.I))
+    return put and bool(re.search(r"pulls/\d+/merge", joined))
 
 
 def _exempt_cwd(cfg, d):
@@ -1477,9 +1564,16 @@ def selftest():
                     "tee " + os.path.join(tmp, "other.txt"), "cat " + cfgp + " > " + os.path.join(tmp, "o2.txt")):
             check("config protected (control, reads pass): " + cmd, passed(bash(cmd, tmp)))
 
-        # The merge-consent grant store is protected like the config (hooks/merge_consent.py)
-        gdir = os.path.join(home, ".claude", "session-notes", "state", "merge-consent")
-        gfile = os.path.join(gdir, "grants.json")
+        # The merge-consent grant store is protected like the config (hooks/merge_consent.py).
+        # Its path is the passwd home plus a fixed path, so the checks name that real path.
+        import pwd
+        pwhome = pwd.getpwuid(os.getuid()).pw_dir
+        gfile = merge_consent.grants_path()
+        gdir = os.path.dirname(gfile)
+        penv = dict(env, HOME=pwhome)
+
+        def bash_p(cmd, cwd):  # as bash(), with $HOME the real home
+            return run_env(penv, {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd})
         for label, payload in (
                 ("Edit", {"tool_name": "Edit", "tool_input": {"file_path": gfile}, "cwd": tmp}),
                 ("Write", {"tool_name": "Write", "tool_input": {"file_path": gfile}, "cwd": tmp}),
@@ -1493,12 +1587,48 @@ def selftest():
                     "mv /tmp/x " + gfile, "rm " + gfile, "rm -rf " + gdir, "mv " + gdir + " /tmp/gone",
                     "sed -i '' s/a/b/ " + gfile, "truncate -s 0 " + gfile,
                     "bash -c 'echo x > " + gfile + "'", "true; echo x > " + gfile):
-            r = bash(cmd, tmp)
+            r = bash_p(cmd, tmp)
             check("grants protected (shell): " + cmd, refused(r) and "grant store" in r.stderr, r.stderr)
         for cmd in ("cat " + gfile, "grep x " + gfile, "cp " + gfile + " /tmp/copy-of-grants"):
-            check("grants protected (control, reads pass): " + cmd, passed(bash(cmd, tmp)))
-        r = run_env(eenv, {"tool_name": "Edit", "tool_input": {"file_path": gfile}, "cwd": cfgrepo})
+            check("grants protected (control, reads pass): " + cmd, passed(bash_p(cmd, tmp)))
+        r = run_env(dict(eenv, HOME=pwhome), {"tool_name": "Edit", "tool_input": {"file_path": gfile}, "cwd": cfgrepo})
         check("grants protected: refused even when the config exempts the repo", refused(r), r.stderr)
+        # B3: the $HOME spelling, a parent directory, a hard link
+        rel = os.path.relpath(gfile, pwhome)
+        for cmd in ('echo x > "$HOME/%s"' % rel, "echo x > ${HOME}/%s" % rel, "tee $HOME/%s" % rel,
+                    "mv $HOME/.claude/session-notes/state $HOME/.claude/session-notes/state.x",
+                    "mv " + os.path.dirname(gdir) + " /tmp/gone", "rm -rf " + os.path.join(pwhome, ".claude"),
+                    "mv " + os.path.join(pwhome, ".claude") + " /tmp/gone2", "rm -rf ~/.claude/session-notes",
+                    "cp -r /tmp/forged " + os.path.dirname(gdir), "ln " + gfile + " /tmp/hl",
+                    "ln -f " + gfile + " /tmp/hl2", "ln -s " + gdir + " /tmp/sl", "ln /tmp/x " + gfile):
+            r = bash_p(cmd, tmp)
+            check("B3 grants protected: " + cmd, refused(r) and "grant store" in r.stderr, r.stderr)
+        for cmd in ("mv /tmp/a /tmp/b", "rm -f /tmp/zzz-not-protected", "ln -s /tmp/a /tmp/b",
+                    "cp -r " + os.path.join(pwhome, ".claude") + " /tmp/backup-claude"):
+            check("B3 control passes: " + cmd, passed(bash_p(cmd, tmp)))
+        # B1: nothing may run or import the consent hook
+        hookpy = os.path.join(os.path.dirname(os.path.realpath(__file__)), "merge_consent.py")
+        fake = "'{\"prompt\":\"merge #1\",\"session_id\":\"x\"}'"
+        for cmd in ("printf %s " % fake + "| python3 " + hookpy, "python3 " + hookpy, hookpy,
+                    "echo %s | " % fake + hookpy, "python3 -m merge_consent",
+                    "python3 -c 'import merge_consent; merge_consent.add_grant({}, 0)'",
+                    "PYTHONPATH=hooks python3 -c \"import merge_consent\"", "env python3 " + hookpy,
+                    "python3 - <<'EOF'\nimport merge_consent\nEOF", "bash -c 'python3 " + hookpy + "'",
+                    "python3 " + hookpy + " --selftest extra", "python3 -c 'x' " + hookpy + " --selftest",
+                    "node -e \"require('child_process').execSync('python3 " + hookpy + "')\""):
+            r = bash(cmd, tmp)
+            check("B1 consent hook not runnable: " + cmd.replace("\n", "\\n")[:70],
+                  refused(r) and "merge_consent" in r.stderr, r.stderr)
+        for cmd in ("python3 " + hookpy + " --selftest", "cat " + hookpy, "grep -n grant " + hookpy,
+                    "git add hooks/merge_consent.py", "git diff -- " + hookpy, "sed -n 1,5p " + hookpy):
+            check("B1 control passes: " + cmd, passed(bash(cmd, tmp)))
+        # N4: raw-API merges
+        for cmd in ("gh api -X PUT repos/o/r/pulls/7/merge", "gh api --method PUT repos/o/r/pulls/7/merge -f merge_method=squash",
+                    "gh api -XPUT repos/o/r/pulls/7/merge", "gh api repos/o/r/pulls/7/merge --method=PUT",
+                    "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'"):
+            check("N4 raw API merge refused: " + cmd[:60], refused(bash(cmd, nongit)))
+        for cmd in ("gh api repos/o/r/pulls/7", "gh api -X PUT repos/o/r/issues/7/labels", "gh api repos/o/r/pulls/7/merge"):
+            check("N4 control passes: " + cmd, passed(bash(cmd, nongit)))
 
         # No override
         for cmd in ("CHECKOUT_GUARD=off gh pr merge 1", "gh pr merge 1 # checkout_guard: allow",

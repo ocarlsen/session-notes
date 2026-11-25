@@ -77,7 +77,7 @@ desktop app's PATH lacks `~/.local/bin`):
 | Event | Hooks |
 |---|---|
 | SessionStart | `codex_session_start` (boot load), `session_pane_registry` |
-| UserPromptSubmit | `time_sense`, `session_bus_hook`, `merge_consent` (records the user's yes to a `merge #N?` question, read from the rollout) |
+| UserPromptSubmit | `time_sense`, `session_bus_hook`, `merge_consent` (records the user's yes to a `merge #N?` question, read from the rollout; see "What the gate does and does not protect" in docs/tools.md for what it cannot stop) |
 | Stop | `session_bus_hook` |
 | PreToolUse (`Bash`, `apply_patch`) | `checkout_guard`: refuses an edit of a tracked file on the default branch of a main checkout (the patch text is read for its target paths, and a shell write such as a redirect, `tee`, `sed -i`, `cp`/`mv`/`rm` is judged the same way), a raw `gh pr merge`, and destructive git on a dirty tree. A refusal blocks the tool call and the model is shown the reason |
 | PostToolUse (`apply_patch`) | `em_dash_guard`, which checks only the lines a patch adds |

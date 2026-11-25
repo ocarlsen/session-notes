@@ -74,6 +74,8 @@ fix: checks, rebase, push, then back to Step 2 (the new head needs a fresh verdi
 
 `wt merge` reads the verdict: it merges only when the newest verdict by the configured account is
 APPROVE at the PR's current head sha, no CI check is failing or pending, and the user said yes to
-this merge. End your reply with a question naming exactly one PR, `merge #N?`, then wait: the user
+this merge. End your reply with a final sentence that is the ask, naming exactly one PR, `merge #N?` (write
+`merge #N in owner/repo?` when the session is not inside the repo's checkout, or the yes is refused
+for naming no repository), then wait: the user
 answers yes (or types `merge #N`) and only then do you run `wt merge`. Never run it on the
 strength of the APPROVE alone, and never post or edit the grant yourself (the file is protected).

@@ -854,6 +854,15 @@ def make_origin_repo(parent, name, env):
     return main
 
 
+WT_TEST_LAUNCH = (
+    "import importlib.util, sys\n"
+    "p, g = sys.argv[1], sys.argv[2]\n"
+    "spec = importlib.util.spec_from_file_location('wt_under_test', p)\n"
+    "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+    "m.merge_consent.GRANTS_PATH_OVERRIDE = g\n"
+    "sys.exit(m.main(sys.argv[3:]))\n")
+
+
 def wt_row(wt_py, tmp):
     """wt new / pr / merge against a local bare origin with a stubbed gh. (status, detail)."""
     home = os.path.join(tmp, "wthome")
@@ -871,7 +880,10 @@ def wt_row(wt_py, tmp):
     env.update(SESSION_NOTES_CONFIG=cfg, WT_GH=gh)
     try:
         main = make_origin_repo(tmp, "proj", env)
-        wt = [sys.executable, wt_py]
+        # the grant file lives at a fixed path under the passwd home; the launcher points this
+        # run at a temp path by patching the module constant in-process (no env var can)
+        grants = os.path.join(tmp, "grants", "grants.json")
+        wt = [sys.executable, "-c", WT_TEST_LAUNCH, wt_py, grants]
         r = sh(wt + ["new", "feat"], main, env)
         path = r.stdout.strip().splitlines()[-1]
         with open(os.path.join(path, "tracked.txt"), "a") as fh:
@@ -883,7 +895,6 @@ def wt_row(wt_py, tmp):
         head = sh(["git", "rev-parse", "HEAD"], path, env).stdout.strip()
         view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7"}
 
-        grants = os.path.join(home, ".claude", "session-notes", "state", "merge-consent", "grants.json")
 
         def grant(on):
             """The user's yes to `merge #7` for o/r, as hooks/merge_consent.py records it."""
