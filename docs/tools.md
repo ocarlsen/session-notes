@@ -162,7 +162,7 @@ authorize a merge. The session ends its reply with a final sentence that IS the 
 `merge #N?`, optionally after a short lead-in ending in `:` or followed by ` in owner/repo`, with
 no other `#N` and no negation in it. The user answers a bare yes (yes, y, yep, yeah, ok, go, do
 it, merge it) or types `merge #N`. The `hooks/merge_consent.py` UserPromptSubmit hook (Claude Code
-and Codex) records that human prompt in `~/.local/state/session-notes/merge-consent/grants.json`
+and Codex) records that human prompt in `~/.local/state/session-notes-consent/grants.json`
 (the passwd home of the user and a fixed path: `$HOME`, `SESSION_NOTES_CONFIG` and the configured
 state dir do not move it): repo, PR number, time, the prompt verbatim, the session. A yes counts
 only when the previous reply's final sentence is that ask and no human prompt came after the
@@ -179,7 +179,7 @@ new review, then a new ask). It spends the grant (recording the head sha), posts
 `Merge authorized by the user: "<prompt>" (<time>)` on the PR, and merges; with no live grant it
 exits 7 telling the session to ask the user. `checkout_guard` refuses the ordinary ways an agent
 could write the grant directory (an edit, a redirect or `tee` naming the path, moving a parent
-directory, a hard link) and refuses the common spellings that run or import the hook (named, `-m`, `-c`/`-e`, stdin, the installed launcher; see the limits below) and a direct call of the merge API
+directory, a hard link) and refuses the common spellings that run or import the hook (named, `-m`, `-c`/`-e`, a heredoc or herestring, the installed launcher; see the limits below) and a direct call of the merge API
 (`gh api` PUT `pulls/N/merge`, a `mergePullRequest` mutation).
 
 **What the gate does and does not protect.** The verdict gate stops other GitHub accounts from
@@ -192,12 +192,12 @@ command parser, not a sandbox. Known limits, left open on purpose:
 
 - The hook-run check judges one command segment at a time and parses no wrapper. Not seen: copy
   the hook, then run the copy (`cp hooks/merge_consent.py /tmp/x.py && python3 /tmp/x.py`), a
-  hook piped in from an earlier segment, `sh <launcher> hook merge_consent`, and a launcher held
+  hook piped or redirected in (`python3 < hook`, `echo ... | python3`), `sh <launcher> hook merge_consent`, and a launcher held
   in a variable (`L=~/.local/bin/session-notes; $L hook merge_consent`).
 - `cp -R <tree>/ <state dir>` copies the CONTENTS of a source that ends in `/`, so a purpose-built
   tree plants files in the grant store (same class as `rsync`).
 - The guard judges the path a command names. It follows no variable or directory change reliably:
-  `cd "$HOME/.local/state/session-notes/merge-consent" && echo ... > grants.json`, and `mkdir -p`
+  `cd "$HOME/.local/state/session-notes-consent" && echo ... > grants.json`, and `mkdir -p`
   of that directory followed by a `cd` into it and a relative redirect, both write the file.
 - A session can type into its own pane (`tmux send-keys`), set `CLAUDE_CODE_ENTRYPOINT` before a
   headless run, or start `claude --resume <id> "merge #N"` or `codex exec resume <id> "merge #N"`;

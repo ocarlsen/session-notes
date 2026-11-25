@@ -441,7 +441,7 @@ def split_segments(cmd, stdin=None):
     When `stdin` is a list, it gets one list per returned segment of that segment's `<<` and
     `<<<` operators as (op, word)."""
     segs, buf, writes, q, i, n = [], [], [], None, 0, len(cmd)
-    ins = []
+    ins, carry = [], []
     st = {"depth": 0, "bt": False, "prev": ""}
 
     def flush(sep=""):
@@ -453,7 +453,10 @@ def split_segments(cmd, stdin=None):
         if s or w:
             segs.append((s, w, sub))
             if stdin is not None:
-                stdin.append(list(ins))
+                stdin.append(carry + list(ins))
+            del carry[:]
+        else:  # a dropped segment still used up heredoc bodies
+            carry.extend(("<<skip", w) for op, w in ins if op in ("<<", "<<skip"))
         del ins[:]
         st["prev"] = sep if (s or w or sep) else st["prev"]
     while i < n:
@@ -688,13 +691,23 @@ def _script_of(argv):
 
 
 def _config_msg(path):
-    if "merge-consent" in path.split(os.sep) or (path if path == os.sep else path.rstrip(os.sep)) in _consent_ancestors():
+    if _is_consent_path(path):
         return ("checkout_guard: %s is the merge-consent grant store, written only by the user's "
                 "own prompt through the merge_consent hook. The user grants a merge by answering "
                 "`merge #N?` with a yes; the agent cannot edit this file: ask the user." % path)
     return ("checkout_guard: %s is the session-notes config, which holds this guard's own "
             "exemptions. It is edited by the user, not the agent: ask the user to change it."
             % path)
+
+
+def _is_consent_path(path):
+    """True when `path` is the grant directory, inside it, or one of its ancestors."""
+    p = path if path == os.sep else path.rstrip(os.sep)
+    try:
+        g = os.path.realpath(os.path.dirname(merge_consent.grants_path()))
+    except Exception:
+        return False
+    return p == g or p.startswith(g + os.sep) or p in _consent_ancestors()
 
 
 def _consent_ancestors():
@@ -902,8 +915,10 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
     hd_seen = 0  # heredoc operators in the segments before this one
     all_ins = []
     segments = split_segments(strip_heredocs(cmd), stdin=all_ins)
+    hd_total = sum(1 for ins in all_ins for op, _ in ins if op in ("<<", "<<skip"))
     for (seg, writes, sub), ins in zip(segments, all_ins):
-        hd_start, hd_seen = hd_seen, hd_seen + sum(1 for op, _ in ins if op == "<<")
+        skipped = sum(1 for op, _ in ins if op == "<<skip")  # dropped segments' bodies come first
+        hd_start, hd_seen = hd_seen + skipped, hd_seen + sum(1 for op, _ in ins if op in ("<<", "<<skip"))
         if saved and not sub:  # a subshell's cd does not outlive the subshell
             cwd, reliable, oldpwd = saved
             saved = None
@@ -967,8 +982,10 @@ def check_command(cmd, cwd, cfg, protected, depth=0, base_cwd=None, reliable=Tru
                     return r
             continue
         try:
-            runs_hook = _runs_consent_hook(argv, cmd, ins, hd_start)
-        except Exception:  # a defect in this one check must not turn the other arms off
+            runs_hook = _runs_consent_hook(argv, cmd, ins, hd_start, hd_total)
+        except Exception as exc:  # a defect in this one check must not turn the other arms off
+            sys.stderr.write("checkout_guard: LOUD: the consent-hook check failed (%s: %s); it did "
+                             "NOT judge this segment\n" % (type(exc).__name__, exc))
             runs_hook = False
         if runs_hook:
             return _consent_exec_msg()
@@ -997,20 +1014,23 @@ _HERESTRING = re.compile(r"<<<\s*(?:'[^']*'|\"[^\"]*\"|\S+)")
 MARK = "merge_consent"
 
 
-def _stdin_text(cmd, ins, hd_start=0):
+def _stdin_text(cmd, ins, hd_start=0, total=None):
     """The text a stdin-reading interpreter in this segment is given by ITS heredocs (the ones
     after the `hd_start` earlier `<<` operators in the command) or herestrings. `ins` is the
     segment's (op, word) list from split_segments."""
     bodies = [m.group(3) for m in _HEREDOC.finditer(cmd)]
     n = sum(1 for op, _ in ins if op == "<<")
-    return " ".join(bodies[hd_start:hd_start + n] + [w for op, w in ins if op == "<<<"])
+    mine = bodies[hd_start:hd_start + n]
+    if total is not None and total != len(bodies):
+        mine = bodies  # the operator count and the body count disagree: judge every body
+    return " ".join(mine + [w for op, w in ins if op == "<<<"])
 
 
 _PY_VALUE_FLAGS = ("-X", "-W")  # python flags that take a value (`-X dev`, `-W ignore`)
 _MODULE_RUNNERS = ("runpy", "pdb", "trace", "cProfile", "profile")
 
 
-def _runs_consent_hook(argv, cmd, ins, hd_start=0):
+def _runs_consent_hook(argv, cmd, ins, hd_start=0, total=None):
     """True when THIS segment runs or imports hooks/merge_consent.py: its script operand is the
     hook, its `-m` value is the module (or a runner like runpy/pdb given the hook), its `-c`/`-e`
     text mentions it, or it reads stdin (`-` or no script) given a heredoc or herestring that
@@ -1032,6 +1052,12 @@ def _runs_consent_hook(argv, cmd, ins, hd_start=0):
         if t in _PY_VALUE_FLAGS or t == "--check-hash-based-pycs":
             i += 2  # the flag's value is not the script
             continue
+        if t[:2] in _PY_VALUE_FLAGS and not t.startswith("--"):
+            i += 1  # attached value (-Wignore, -Xdev)
+            continue
+        if t.startswith("-m") and len(t) > 2 and not t.startswith("--"):
+            val = t[2:]  # attached module name
+            return val == MARK or val.startswith(MARK + ".") or val.endswith("." + MARK)
         if t == "-m" or (t.startswith("-") and not t.startswith("--") and t.endswith("m") and len(t) > 2):
             val = argv[i + 1] if i + 1 < len(argv) else ""
             if val == MARK or val.startswith(MARK + ".") or val.endswith("." + MARK):
@@ -1054,7 +1080,7 @@ def _runs_consent_hook(argv, cmd, ins, hd_start=0):
     if script is not None and script != "-":
         return MARK in os.path.basename(script) and "--selftest" not in rest
     # reads stdin
-    return MARK in _stdin_text(cmd, ins, hd_start)
+    return MARK in _stdin_text(cmd, ins, hd_start, total)
 
 
 def _consent_exec_msg():
@@ -1649,7 +1675,7 @@ def selftest():
                 ("Write, a new file in the dir", {"tool_name": "Write", "tool_input": {
                     "file_path": os.path.join(gdir, "other.json")}, "cwd": tmp}),
                 ("Write via ..", {"tool_name": "Write", "tool_input": {
-                    "file_path": os.path.join(gdir, "..", "merge-consent", "grants.json")}, "cwd": tmp})):
+                    "file_path": os.path.join(gdir, "..", "session-notes-consent", "grants.json")}, "cwd": tmp})):
             r = run(payload)
             check("grants protected (Arm A): " + label, refused(r) and "grant store" in r.stderr, r.stderr)
         for cmd in ("echo '{}' > " + gfile, "echo x >> " + gfile, "tee " + gfile, "cp /tmp/x " + gfile,
@@ -1665,9 +1691,9 @@ def selftest():
         # B3: the $HOME spelling, a parent directory, a hard link
         rel = os.path.relpath(gfile, pwhome)
         for cmd in ('echo x > "$HOME/%s"' % rel, "echo x > ${HOME}/%s" % rel, "tee $HOME/%s" % rel,
-                    "mv $HOME/.local/state/session-notes $HOME/.local/state/session-notes.x",
+                    "mv $HOME/.local/state/session-notes-consent $HOME/.local/state/session-notes-consent.x",
                     "mv " + os.path.dirname(gdir) + " /tmp/gone", "rm -rf " + os.path.join(pwhome, ".local", "state"),
-                    "mv " + os.path.join(pwhome, ".local") + " /tmp/gone2", "rm -rf ~/.local/state/session-notes",
+                    "mv " + os.path.join(pwhome, ".local") + " /tmp/gone2", "rm -rf ~/.local/state/session-notes-consent",
                     "cp -r /tmp/forged " + gdir, "cp /tmp/forged " + gdir + "/", "ln " + gfile + " /tmp/hl",
                     "ln -f " + gfile + " /tmp/hl2", "ln -s " + gdir + " /tmp/sl", "ln /tmp/x " + gfile):
             r = bash_p(cmd, tmp)
@@ -1679,6 +1705,17 @@ def selftest():
         for cmd in ("rm -rf ~/.claude/session-notes", "mv ~/.claude /tmp/x"):
             r = bash_p(cmd, tmp)
             check("grant store is not under ~/.claude: " + cmd, "grant store" not in r.stderr, r.stderr)
+        # B1: the grant dir is inside neither directory install.sh makes a Codex writable root
+        live_default = os.path.join(pwhome, ".local", "state", "session-notes")
+        codex_root = os.path.join(pwhome, ".codex", "session-notes")
+        for root in (live_default, codex_root):
+            gd = os.path.realpath(gdir) + os.sep
+            rt = os.path.realpath(root) + os.sep
+            check("B1: grant dir is not inside the Codex writable root " + root,
+                  not gd.startswith(rt) and not rt.startswith(gd), gd)
+        for cmd in ("rm -rf ~/.local/state/session-notes", "echo x > ~/.local/state/session-notes/live-context.md"):
+            r = bash_p(cmd, tmp)
+            check("B1 control: the live-context dir is not the grant store: " + cmd, "grant store" not in r.stderr, r.stderr)
         # R2: a copy, move or link INTO a directory above the grant dir is judged by its computed target
         for cmd, where in (("cp report.html ~/", tmp), ("cp report.html ~", tmp), ("mv build.log ~", tmp),
                            ("ln -s /opt/tool/bin/tool ~/", tmp), ("mv Downloads/a.pdf .", pwhome),
@@ -1686,7 +1723,7 @@ def selftest():
                            ("cp x.txt /", tmp),
                            ("cp /tmp/x.json ~/.local/state/session-notes/", tmp)):
             check("R2 control passes: %s (cwd %s)" % (cmd, os.path.basename(where)), passed(bash_p(cmd, where)))
-        for cmd in ("mv /tmp/merge-consent ~/.local/state/session-notes/", "cp -r /tmp/merge-consent ~/.local/state/session-notes/", "rm -rf /", "rm -rf ~", "rm -rf ."):
+        for cmd in ("mv /tmp/session-notes-consent ~/.local/state/", "cp -r /tmp/session-notes-consent ~/.local/state/", "rm -rf /", "rm -rf ~", "rm -rf ."):
             r = bash_p(cmd, pwhome)
             check("R2 still refused: " + cmd, refused(r) and "grant store" in r.stderr, r.stderr)
         r = bash_p("rm -rf /", tmp)
@@ -1736,6 +1773,18 @@ def selftest():
                     "python3 -m pdb " + hookpy, "python3 -m trace --count " + hookpy,
                     "python3 -m cProfile " + hookpy, "python3 -E -c 'import merge_consent as m; m.main()'",
                     "python3 -c'import merge_consent as m; m.main()'",
+                    # N5: attached values
+                    "python3 -Wignore -c 'import merge_consent as m; m.main()'",
+                    "python3 -Werror -c 'import merge_consent as m; m.main()'",
+                    "python3 -Ximporttime -c 'import merge_consent as m; m.main()'",
+                    "python3 -Werror -m merge_consent", "python3 -mmerge_consent", "python3 -mhooks.merge_consent",
+                    "python3 -Wignore - <<'EOF'\nimport merge_consent as m; m.main()\nEOF",
+                    # N1: a heredoc whose body the scanner cannot pair up must not hide the next one
+                    "cat > /tmp/x <<'END-NOTE'\nnote\nEND-NOTE\npython3 - <<'PY'\nimport merge_consent as m; m.main()\nPY",
+                    "cat > /tmp/x <<\\EOF\nnote\nEOF\npython3 - <<'PY'\nimport merge_consent as m; m.main()\nPY",
+                    "cat > /tmp/empty <<EOF\nEOF\npython3 - <<'PY'\nimport merge_consent as m; m.main()\nPY",
+                    "<<A\nnote\nA\npython3 - <<'PY'\nimport merge_consent as m; m.main()\nPY",
+                    "bash -c 'cat <<EOF\nnote\nEOF'; python3 - <<'PY'\nimport merge_consent as m; m.main()\nPY",
                     ):
             r = bash(cmd, tmp)
             check("B1 consent hook not runnable: " + cmd.replace("\n", "\\n")[:70],
@@ -1779,8 +1828,21 @@ def selftest():
             r = bash(cmd, tmp)
             check("NB1 bare launcher does not fail the guard open: " + cmd[:60],
                   refused(r) and "IndexError" not in r.stderr, r.stderr)
+        # N6: the catch is loud
+        _runs_orig = _runs_consent_hook
+        globals()["_runs_consent_hook"] = lambda *a, **k: 1 / 0
+        try:
+            sys.stderr = io.StringIO()
+            try:
+                check_command("echo hi", nongit, None, set())
+            finally:
+                n6_err, sys.stderr = sys.stderr.getvalue(), sys.__stderr__
+        finally:
+            globals()["_runs_consent_hook"] = _runs_orig
+        check("N6: a failing consent check says LOUD and names the exception",
+              "LOUD" in n6_err and "ZeroDivisionError" in n6_err, n6_err)
         # NB1: an exception inside the consent-hook check leaves the other arms deciding
-        _orig, _saved_env = _runs_consent_hook, os.environ.get("SESSION_NOTES_CONFIG")
+        _orig, _saved_env = _runs_orig, os.environ.get("SESSION_NOTES_CONFIG")
         os.environ["SESSION_NOTES_CONFIG"] = cfgp
         try:
             globals()["_runs_consent_hook"] = lambda *a, **k: 1 / 0

@@ -52,7 +52,7 @@ fi
 # under ~/.claude/session-notes and its config under ~/.config/session-notes,
 # so anything created or changed there during this run is a leak out of the
 # sandbox. (The private leak-terms file is the user's own and is excluded.)
-for d in "$REAL_HOME/.claude/session-notes" "$REAL_HOME/.config/session-notes"; do
+for d in "$REAL_HOME/.claude/session-notes" "$REAL_HOME/.config/session-notes" "$REAL_HOME/.local/state/session-notes-consent"; do
   [ -e "$d" ] || continue
   stray=$(find "$d" -newer "$MARK" ! -name leak-terms.txt ! -path "$d" 2>/dev/null)
   if [ -n "$stray" ]; then

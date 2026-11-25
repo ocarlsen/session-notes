@@ -35,7 +35,7 @@ The grant records the repo, resolved in this order: owner/repo of the session cw
 one `owner/repo` or github PR URL the reply's final paragraph names; the one git checkout child of
 a configured scope root that the cwd is (its `origin` on github). When none resolves the repo is
 null and `wt merge` REFUSES that grant (it never matches by PR number alone). Also the PR number, the time, the user's
-prompt verbatim and the session id, in `~/.local/state/session-notes/merge-consent/grants.json` under the passwd home of the user
+prompt verbatim and the session id, in `~/.local/state/session-notes-consent/grants.json` under the passwd home of the user
 (never $HOME, never the config). checkout_guard refuses the ordinary ways an agent could write it. `wt.py` imports this module for the
 grant lookup, so the format has one definition.
 
@@ -73,7 +73,7 @@ def _cfg(cfg=None):
 # Test-only: a selftest patches this module constant in-process. It is never read from the
 # environment or the config, so no variable on a command line can move the grant store.
 GRANTS_PATH_OVERRIDE = None
-GRANTS_REL = (".local", "state", "session-notes", "merge-consent", "grants.json")
+GRANTS_REL = (".local", "state", "session-notes-consent", "grants.json")
 
 
 def grants_path():
@@ -304,7 +304,7 @@ def parse_ask(text):
         return None
     # code and bold marks go anywhere; an underscore (emphasis) only at a word edge, so my_repo survives
     q = re.sub(r"[`*]", "", q)
-    q = re.sub(r"(?<!\w)_+|_+(?!\w)", "", q).strip().strip("_\"'()[] ").strip()
+    q = re.sub(r"(?:^|(?<=\s))_+(?=\S)|(?<=\S)_+(?=\s|$)", "", q).strip().strip("_\"'()[] ").strip()
     m = _ASK.match(q)
     if not m or len(re.findall(r"#\d+", q)) != 1:
         return None
@@ -398,7 +398,7 @@ def _markers(cfg):
 
 def _first_prompt(session, now, cfg):
     """True when this session has no prompt on record; records this one either way."""
-    d = os.path.join(cfg["paths"]["shared_state_dir"], "merge-consent", "seen")
+    d = os.path.join(os.path.dirname(grants_path()), "seen")  # beside the grants, never the config state dir
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, session)
     first = not os.path.exists(p)
@@ -677,6 +677,14 @@ def selftest():
         transcript("Ready: _merge #12 in my-org/my_repo?_")
         check("NB6: emphasis around a repo ask strips, my_repo survives",
               (at(plain, "", "nb6b") or {}).get("repo") == "my-org/my_repo")
+        transcript("Ready: merge #12 in my-org/_dotfiles?")
+        check("N2: a repo name that starts with an underscore is read whole",
+              (at(plain, "", "n2a") or {}).get("repo") == "my-org/_dotfiles")
+        transcript("Ready: merge #12 in my-org/repo_?")
+        check("N2: a repo name that ends with an underscore is read whole",
+              (at(plain, "", "n2b") or {}).get("repo") == "my-org/repo_")
+        check("N3: the seen markers live beside the grants",
+              os.path.isdir(os.path.join(os.path.dirname(grants_path()), "seen")))
         transcript("**Ready: `merge #12 in my-org/my_repo?`**")
         check("N1: bold and code marks are stripped", (at(plain, "", "n1c") or {}).get("repo") == "my-org/my_repo")
 
@@ -701,8 +709,12 @@ def selftest():
         # main(): never prints, never fails, even on garbage
         env = dict(os.environ, SESSION_NOTES_CONFIG=cfgf)
         for inp in ("not json", "[]", json.dumps({"prompt": "yes"}), json.dumps({"prompt": 5})):
-            r = subprocess.run([sys.executable, os.path.realpath(__file__)], input=inp, env=env,
-                               capture_output=True, text=True)
+            # run main() with the grant store pointed into the sandbox: the real one is never written
+            r = subprocess.run([sys.executable, "-c",
+                                "import sys; sys.path.insert(0, %r); import merge_consent as m; "
+                                "m.GRANTS_PATH_OVERRIDE = %r; sys.exit(m.main() or 0)"
+                                % (os.path.dirname(os.path.realpath(__file__)), os.path.join(T, "grants-main.json"))],
+                               input=inp, env=env, capture_output=True, text=True)
             check("main on %r: rc 0, stdout empty" % inp[:12], r.returncode == 0 and r.stdout == "", (r.returncode, r.stdout))
     if fails:
         print("%d FAILED" % len(fails))
