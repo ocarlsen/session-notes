@@ -531,7 +531,7 @@ launching anything.
 Limits worth knowing: Codex runs with `--dangerously-bypass-hook-trust`, so hook trust is not
 covered; tmux is reached only through a sandbox `TMUX_TMPDIR` (asserted before any pane-listing
 tool runs); `launchctl` and `gh` are stubs; `em_dash_guard` is advisory, so its row checks that the
-flag reached the session, not that the file was refused. The `checkout` row checks both CLIs: the tracked file is unchanged and the guard's own text reached the session, and for Codex a new file in the same repo is still allowed (negative control).
+flag reached the session, not that the file was refused. The `checkout` row checks both CLIs in three turns' worth of refusals: an edit-tool write to a tracked file, a shell write (`printf >>`) to a second tracked file, and a raw `gh pr merge`, each refused with the guard's own text, the files unchanged and no `pr merge` call reaching the `gh` stub (the stub wins on a login shell's `PATH` too); for Codex a new file in the same repo is still allowed (negative control). The Codex `handoff` row also runs one `bus_nudge.py --once --only` pass over the staged pane and checks it prints HOLDING and types nothing; the Claude handoff row is auto-start only and carries no hold check.
 
 ### Watch mode: `make selftest-watch`
 
