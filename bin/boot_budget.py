@@ -1041,7 +1041,8 @@ def selftest_codex(check):
         rc, out = run("--agent", "codex", "check")
         rc2, out2 = run("--agent", "codex", "report")
         check(rc == 0 and out == "" and "live.md" in out2 and "TRUNCATED" in out2,
-              "live-context truncation: shown in report, not a check finding")
+              "live-context truncation: shown in report, not a check finding"
+              + ("" if rc == 0 and out == "" else " [rc=%s out=%r report=%r]" % (rc, out[-300:], out2[-900:])))
         write_cfg()
 
         # N1: no [[scopes]] at all still measures the session's own cwd
