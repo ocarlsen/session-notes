@@ -100,7 +100,7 @@ class Fail(Exception):
 def _git(cwd, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True,
-                          timeout=8, env=env)
+                          errors="surrogateescape", timeout=8, env=env)
 
 
 def _nearest_dir(p):
@@ -123,7 +123,7 @@ def repo_info(path):
     """(toplevel, common git dir), both real paths, for the repo holding `path`; None if none.
     A directory with no `.git` entry of its own inherits its parent's answer, so any number of
     sibling directories cost one `git rev-parse`, not one each."""
-    cur = _nearest_dir(path)
+    cur = os.path.realpath(_nearest_dir(path))  # through a symlink into a repo
     chain = []
     while True:
         if cur in _INFO_CACHE:
@@ -1874,11 +1874,44 @@ def selftest():
         sh(nfr, "git", "commit", "-q", "-m", "nfd")
         if nfd in os.listdir(nfr):
             for cmd in ("rm caf*", "rm -f *.txt", "rm " + nfd, "echo x >> " + nfd,
-                        "sed -i '' -e s/a/b/ " + nfd, "rm caf\u00e9.txt"):
+                        "sed -i '' -e s/a/b/ " + nfd):
                 check("N refuse (NFD name on disk): " + cmd, refused(bash(cmd, nfr)), cmd)
+            # the precomposed spelling is the same file only where the file system or git folds
+            fold = sys.platform == "darwin" or subprocess.run(
+                ["git", "-C", nfr, "config", "--get", "core.precomposeunicode"], env=env,
+                capture_output=True, text=True).stdout.strip() == "true"
+            r = bash("rm caf\u00e9.txt", nfr)
+            check("N (precomposed spelling): " + ("refuses where names fold" if fold
+                  else "allowed where the two spellings are different files"),
+                  refused(r) if fold else passed(r), r.stderr)
             check("N refuse: Edit tool with the NFD path", refused(edit("Edit", os.path.join(nfr, nfd))))
         else:
             print("skip N: this file system does not keep a decomposed name")
+
+        # Round 3: a symlink into a repo's interior, and a non-UTF-8 tracked name
+        dsr = mkrepo("dsubrepo", ("a.txt", "sub/f.txt"))
+        touch(dsr, "sub/f.txt", "changed\n")
+        os.makedirs(os.path.join(tmp, "links"))
+        os.symlink(os.path.join(dsr, "sub"), os.path.join(tmp, "links", "dsub"))
+        for cmd in ("git -C links/dsub reset --hard", "cd links/dsub && git checkout -- ."):
+            check("S refuse (symlink into a dirty repo): " + cmd, refused(bash(cmd, tmp)), cmd)
+        l1 = mkrepo("latin1", ("README.md",))
+        try:  # an index entry with a Latin-1 name, no file needed (APFS refuses such names)
+            blob = subprocess.run(["git", "-C", l1, "hash-object", "-w", "--stdin"], env=gitenv,
+                                  input=b"x\n", capture_output=True, check=True).stdout.strip()
+            subprocess.run([b"git", b"-C", os.fsencode(l1), b"update-index", b"--add",
+                            b"--cacheinfo", b"100644," + blob + b",caf\xe9.txt"], env=gitenv,
+                           capture_output=True, check=True)
+            sh(l1, "git", "commit", "-q", "-m", "latin1")
+            made = True
+        except (OSError, subprocess.CalledProcessError, UnicodeError):
+            made = False
+        if made:
+            r = bash("rm README.md", l1)
+            check("U refuse: a non-UTF-8 tracked name in the index does not fail Arm A open",
+                  refused(r) and "README.md" in r.stderr, r.stderr)
+        else:
+            print("skip U: cannot create a Latin-1 file name here")
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
