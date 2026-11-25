@@ -352,7 +352,13 @@ match the rule and falls back to an approval prompt.
   `agent.codex_boot_bytes` (that cap is compared with the text's length in characters).
   Every file is listed as loaded, truncated or dropped, with the reason. `check` is silent
   when everything fits and exits 1 with one `FILE` or `SCOPE` line per dropped or truncated
-  file otherwise. `check-file` stays Claude only.
+  file otherwise. `check-file` stays Claude only. Live-context truncation is shown in
+  `report` but is never a `check` finding (the live block only uses what the files leave).
+  Not modelled: Codex loads no project docs for an untrusted project, and the chain
+  follows git for the project root, not `project_root_markers`.
+  The SessionStart figure is characters (bytes are printed beside it); Codex's own spill
+  limit for hook output is in tokens, so a raised `codex_boot_bytes` can pass here and
+  still spill.
 - `nightly_check.py` runs the canary and `boot_budget.py check` once per installed agent,
   each against its own stores. On macOS,
   `launch_agents.py install nightly-check` runs it every night.
