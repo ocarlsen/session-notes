@@ -378,7 +378,7 @@ def selftest():
             # The Codex boot cap: under resume_bytes (12000) but too big for the SessionStart pack.
             rc, base, _ = run(["hash", "--store", "project"])
             rc, _, err = run(["stage", "--store", "project", "--resume", "--base", base.strip()],
-                             "".join("- line %04d padding padding\n" % i for i in range(410)))
+                             "".join("- line %04d\n" % i for i in range(999)))  # 11,988 chars: under 12000, path-independent
             check("a RESUME under the budget that Codex's boot pack would drop is refused at stage",
                   rc == 2 and "would not load in Codex" in err and "codex_boot_bytes" in err, (rc, err))
 
