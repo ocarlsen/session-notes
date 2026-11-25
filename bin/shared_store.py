@@ -7,7 +7,7 @@ Claude Code and Codex: RESUME.md, MEMORY.md and the memory files. notes_config.s
 one resolver; every reader and writer reaches it through the resolved scope's `store`. This
 tool moves an existing scope into it and prints the one line Claude needs:
 
-  shared_store.py plan --scope NAME [--label FILE=claude|codex ...]
+  shared_store.py plan --scope NAME [--label FILE=claude|codex ...] [--claude-store P] [--codex-store P]
       Dry run: what would move, and whether every original entry would land exactly once.
       Writes nothing, anywhere.
   shared_store.py migrate --scope NAME [--label ...]
@@ -18,7 +18,13 @@ tool moves an existing scope into it and prints the one line Claude needs:
   shared_store.py settings-line --scope NAME
       The `autoMemoryDirectory` line to add to <scope root>/.claude/settings.local.json. Claude
       Code honors it only from there (not from the checked-in settings.json), so this tool prints
-      it and never writes a settings file.
+      it and never writes a settings file. It also prints the CLAUDE.md `@import` line for the
+      shared RESUME.md that replaces the old one (boot_budget.py check flags a boot set that
+      still reaches a file under an old store, or lacks the shared RESUME).
+
+A source store that does not exist, or a migration of 0 files, is RED. A scope that had a
+custom `store` key must drop it to opt in; pass the old folder with --claude-store. Each source
+is printed with its file count. A scope `manifest` that sits in an old store is never copied.
 
 What "entry" means:
   * MEMORY.md, REFERENCE.md, RESUME.md, RESUME-archive.md: each non-blank line. The Claude file
@@ -54,7 +60,8 @@ LINE_FILES = ("MEMORY.md", "REFERENCE.md", "RESUME.md", "RESUME-archive.md")
 MARKER = "<!-- merged from the Codex store by shared_store.py -->"
 MARKED_FILES = ("RESUME.md", "RESUME-archive.md")
 _LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
-_INDEX_RE = re.compile(r"^(- \[[^\]]*\]\([^)]*\) - )(.*)$")
+# the same separators as memory_index_lint.INDEX_LINE_RE: a hyphen-minus or an em dash (escape)
+_INDEX_RE = re.compile(r"^(- \[[^\]]*\]\([^)]*\)\s*[\u2014-]\s*)(.*)$")
 
 
 class MigrationError(Exception):
@@ -110,19 +117,34 @@ def find_scope(cfg, name):
         name, ", ".join(s["name"] for s in cfg["scopes"]) or "none configured"))
 
 
-def legacy_stores(cfg, scope):
-    """{agent: the per-harness store the scope had before it opted in}, from the one resolver."""
+def legacy_stores(cfg, scope, over=None):
+    """{agent: the per-harness store the scope had before it opted in}, from the one resolver.
+    `over` ({agent: path}) names a store the resolver cannot know (a scope that had a custom
+    `store` key, which opting in forbids): it replaces that agent's derived path."""
     plain = {"root": scope["root"], "shared_store": False}
-    return {a: notes_config.store_for(plain, a, cfg) for a in notes_config.AGENTS}
+    out = {a: notes_config.store_for(plain, a, cfg) for a in notes_config.AGENTS}
+    for a, path in (over or {}).items():
+        if path:
+            out[a] = os.path.abspath(os.path.expanduser(path))
+    return out
 
 
-def _entries(store):
-    """({name: text}, [problem]) for a store's top-level files; a missing store is empty."""
+def _skip_names(scope, store):
+    """The scope manifest's file name when it sits in `store`: structural, not a memory file."""
+    m = scope.get("manifest")
+    if m and os.path.realpath(os.path.dirname(m)) == os.path.realpath(store):
+        return {os.path.basename(m)}
+    return set()
+
+
+def _entries(store, skip=()):
+    """({name: text}, [problem]) for a store's top-level files; a missing store is empty (the
+    callers that need it to exist say so)."""
     files, problems = {}, []
     if not os.path.isdir(store):
         return files, problems
     for name in sorted(os.listdir(store)):
-        if name.startswith("."):
+        if name.startswith(".") or name in skip:
             continue
         p = os.path.join(store, name)
         if os.path.isdir(p) or not name.endswith(".md"):
@@ -198,20 +220,26 @@ def _merge_lines(name, c_text, x_text, relabel):
     return "\n".join(out)
 
 
-def build(cfg, scope, labels=None):
+def build(cfg, scope, labels=None, over=None):
     """(outputs {name: text}, report lines, problems [str]). Pure: reads the two legacy stores,
-    writes nothing."""
+    writes nothing. A source that does not exist, or a merge of zero files, is a problem."""
     labels = labels or {}
-    stores = legacy_stores(cfg, scope)
-    files, problems = {}, []
+    stores = legacy_stores(cfg, scope, over)
+    files, problems, head = {}, [], []
     for a in HARNESSES:
-        files[a], pr = _entries(stores[a])
+        files[a], pr = _entries(stores[a], _skip_names(scope, stores[a]))
         problems += pr
+        if not os.path.isdir(stores[a]):
+            problems.append("%s store %s does not exist (point --%s-store at the real folder, or at an "
+                            "empty one if that agent never had a store)" % (a, stores[a], a))
+        head.append("source %s: %s (%d files)" % (a, stores[a], len(files[a])))
+    if not files["claude"] and not files["codex"]:
+        problems.append("both stores hold 0 files: nothing to migrate (wrong path? see --claude-store)")
     relabel = _relabel_map(files, labels)
     for name in labels:
         if not any(name in files[a] for a in HARNESSES):
             problems.append("--label %s: no such file in either store" % name)
-    outputs, report = {}, []
+    outputs, report = {}, list(head)
     for name in sorted(set(files["claude"]) | set(files["codex"])):
         c, x = files["claude"].get(name), files["codex"].get(name)
         if name in LINE_FILES:
@@ -232,12 +260,12 @@ def build(cfg, scope, labels=None):
 
 
 # ---------------------------------------------------------------- the check
-def verify(cfg, scope, dest, labels=None):
+def verify(cfg, scope, dest, labels=None, over=None):
     """Re-read `dest` and the two legacy stores. Returns [finding] (empty = every original entry
     landed exactly once). Does not use build()'s output text: it checks the files on disk."""
     labels = labels or {}
-    stores = legacy_stores(cfg, scope)
-    files = {a: _entries(stores[a])[0] for a in HARNESSES}
+    stores = legacy_stores(cfg, scope, over)
+    files = {a: _entries(stores[a], _skip_names(scope, stores[a]))[0] for a in HARNESSES}
     relabel = _relabel_map(files, labels)
     got, _ = _entries(dest)
     got = {n: t for n, t in got.items()}
@@ -280,7 +308,7 @@ def verify(cfg, scope, dest, labels=None):
                     new, len(got[new].split("\n")), len(text.split("\n")), added))
             elif h and harness_of(got[new]) != h:
                 bad.append("%s: harness label %r missing" % (new, h))
-            elif not h and got[new] != text:
+            elif got[new] != with_harness(text, h):
                 bad.append("%s: text differs from its source" % new)
     for name in sorted(set(got) - expected_names):
         bad.append("%s: in the shared store but in neither source (appears from nowhere)" % name)
@@ -293,24 +321,33 @@ def _scope_args(cfg_path_env=None, name=None):
     return cfg, find_scope(cfg, name)
 
 
+def _over(args):
+    return {"claude": getattr(args, "claude_store", None), "codex": getattr(args, "codex_store", None)}
+
+
+def _budget_warn(scope, outputs):
+    r = outputs.get("RESUME.md")
+    if r is None:
+        return
+    import resume_guard
+    msg = resume_guard.check_write(os.path.join(scope["store"], "RESUME.md"), "", r)
+    if msg:
+        print("  WARN merged RESUME.md is over its budget: " + msg)
+
+
 def cmd_plan(args):
     cfg, scope = _scope_args(name=args.scope)
     labels = _parse_labels(args.label)
-    outputs, report, problems = build(cfg, scope, labels)
-    st = legacy_stores(cfg, scope)
-    print("scope %s: %s -> %s" % (scope["name"], " + ".join("%s (%s)" % (st[a], a) for a in HARNESSES), scope["store"]))
+    over = _over(args)
+    outputs, report, problems = build(cfg, scope, labels, over)
+    print("scope %s -> %s" % (scope["name"], scope["store"]))
     if not scope.get("shared_store"):
         print("NOTE: the scope is not opted in (set `shared_store = true`); migrate would refuse.")
     for ln in report:
         print("  " + ln)
     for p in problems:
         print("  PROBLEM " + p)
-    r = outputs.get("RESUME.md")
-    if r is not None:
-        import resume_guard
-        msg = resume_guard.check_write(os.path.join(scope["store"], "RESUME.md"), "", r)
-        if msg:
-            print("  WARN merged RESUME.md is over its budget: " + msg)
+    _budget_warn(scope, outputs)
     print("plan only: nothing was written." if not problems else "RED: fix the PROBLEM lines first.")
     return 1 if problems else 0
 
@@ -322,8 +359,11 @@ def cmd_migrate(args):
               "entry first" % scope["name"], file=sys.stderr)
         return 2
     labels = _parse_labels(args.label)
-    outputs, report, problems = build(cfg, scope, labels)
+    over = _over(args)
+    outputs, report, problems = build(cfg, scope, labels, over)
     if problems:
+        for ln in report[:2]:
+            print(ln, file=sys.stderr)
         for p in problems:
             print("PROBLEM " + p, file=sys.stderr)
         print("RED: nothing written.", file=sys.stderr)
@@ -346,12 +386,13 @@ def cmd_migrate(args):
         for name, text in outputs.items():
             with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
                 fh.write(text)
-        st = legacy_stores(cfg, scope)
+        st = legacy_stores(cfg, scope, over)
         with open(os.path.join(tmp, "MIGRATED-FROM.txt"), "w", encoding="utf-8") as fh:
             fh.write("Merged by shared_store.py migrate from:\n  claude: %s\n  codex:  %s\n"
                      "Those stores were left untouched; delete them when you are satisfied.\n"
-                     % (st["claude"], st["codex"]))
-        bad = verify_dir(cfg, scope, tmp, labels)
+                     "A scope manifest (the `manifest` key) was NOT copied: it stays where the config "
+                     "points, so do not delete it with the old store.\n" % (st["claude"], st["codex"]))
+        bad = verify_dir(cfg, scope, tmp, labels, over)
         if bad:
             for b in bad:
                 print("RED " + b, file=sys.stderr)
@@ -363,21 +404,23 @@ def cmd_migrate(args):
         os.rename(tmp, dest)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    bad = verify(cfg, scope, dest, labels)
+    bad = verify(cfg, scope, dest, labels, over)
     for ln in report:
         print("  " + ln)
+    _budget_warn(scope, outputs)
     if bad:
         for b in bad:
             print("RED " + b, file=sys.stderr)
         return 1
     print("migrated %d files into %s; every original entry landed exactly once." % (len(outputs), dest))
-    print("The old stores were not touched. Next: shared_store.py settings-line --scope %s" % scope["name"])
+    print("The old stores were not touched. Next: shared_store.py settings-line --scope %s "
+          "(it prints BOTH lines Claude needs)" % scope["name"])
     return 0
 
 
-def verify_dir(cfg, scope, directory, labels):
+def verify_dir(cfg, scope, directory, labels, over=None):
     """verify() against a staging directory (the MIGRATED-FROM.txt file is not an entry)."""
-    return [b for b in verify(cfg, scope, directory, labels)]
+    return [b for b in verify(cfg, scope, directory, labels, over)]
 
 
 def cmd_settings_line(args):
@@ -388,9 +431,14 @@ def cmd_settings_line(args):
     store = scope["store"]
     home = os.path.expanduser("~")
     shown = "~" + store[len(home):] if store.startswith(home.rstrip("/") + "/") else store
-    print("Add to %s (this file only: Claude Code ignores the key in the checked-in settings.json):"
+    old = legacy_stores(cfg, scope)["claude"]
+    print("1. Add to %s (this file only: Claude Code ignores the key in the checked-in settings.json):"
           % os.path.join(scope["root"], ".claude", "settings.local.json"))
     print('  "autoMemoryDirectory": "%s"' % shown)
+    print("2. In the CLAUDE.md that imports this scope's RESUME, REPLACE the old import line "
+          "(`@%s/RESUME.md`, or its ~ form) with:" % old)
+    print("  @%s/RESUME.md" % shown)
+    print("Until both are done Claude boots the old store; `boot_budget.py check` reports it.")
     return 0
 
 
@@ -412,6 +460,8 @@ def main(argv=None):
         p.add_argument("--scope", required=True)
         if n != "settings-line":
             p.add_argument("--label", action="append", metavar="FILE=claude|codex")
+            p.add_argument("--claude-store", metavar="PATH", help="the Claude store to read (default: derived from the root)")
+            p.add_argument("--codex-store", metavar="PATH", help="the Codex store to read (default: derived from the root)")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "plan":
@@ -428,6 +478,7 @@ def main(argv=None):
 
 
 def selftest():
+    global build
     import hashlib
     import json
     import subprocess
@@ -459,6 +510,9 @@ def selftest():
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
+    def command_rm(path):
+        os.unlink(path)
+
     saved = {k: os.environ.get(k) for k in ("SESSION_NOTES_CONFIG", "SESSION_NOTES_AGENT", "HOME")}
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(d)
@@ -473,8 +527,9 @@ def selftest():
                     'shared_stores_dir = "%s"\n[live]\npath = "%s/live.md"\n'
                     '[agent]\ncodex_home = "%s/codex"\n[budgets]\nresume_bytes = 300\n'
                     % (d, d, d, shared_root, d, d))
-        scopes = ('[[scopes]]\nname = "pilot"\nroot = "%s"\nshared_store = true\n'
-                  '[[scopes]]\nname = "plain"\nroot = "%s"\n' % (pilot, plain))
+        manifest = os.path.join(d, "claude", "projects", notes_config.encode_project_dir(pilot), "memory", "reflect-scope.md")
+        scopes = ('[[scopes]]\nname = "pilot"\nroot = "%s"\nshared_store = true\nmanifest = "%s"\n'
+                  '[[scopes]]\nname = "plain"\nroot = "%s"\n' % (pilot, manifest, plain))
         w(cfgf, base_cfg + scopes)
         env = {k: v for k, v in os.environ.items() if not k.startswith("SESSION_NOTES_")}
         env.update(HOME=home, SESSION_NOTES_CONFIG=cfgf)
@@ -505,19 +560,40 @@ def selftest():
               notes_config.store_for(sc["claude"]["pilot"], "codex", cc) == shared
               and notes_config.store_for({"root": plain, "shared_store": False}, "claude", cc)
               == sc["claude"]["plain"]["store"])
-        for tag, extra in (("live = none", '[[scopes]]\\nname = "x"\\nroot = "%s"\\nshared_store = true\\nlive = "none"\\n' % iso),
-                           ("live = own", '[[scopes]]\\nname = "x"\\nroot = "%s"\\nshared_store = true\\nlive = "own"\\nlive_file = "%s/x-live.md"\\n' % (iso, d)),
-                           ("store set", '[[scopes]]\\nname = "x"\\nroot = "%s"\\nshared_store = true\\nstore = "%s/s"\\n' % (iso, d)),
-                           ("not a bool", '[[scopes]]\\nname = "x"\\nroot = "%s"\\nshared_store = "yes"\\n' % iso)):
+        def scope_toml(extra_lines):
+            return base_cfg + '[[scopes]]\nname = "x"\nroot = "%s"\n%s' % (iso, "".join(l + "\n" for l in extra_lines))
+        own = 'live_file = "%s/x-live.md"' % d
+        refusals = (
+            ("live = none", ['shared_store = true', 'live = "none"'], "isolated scope"),
+            ("live = own", ['shared_store = true', 'live = "own"', own], "isolated scope"),
+            ("store set", ['shared_store = true', 'store = "%s/s"' % d], "exclusive"),
+            ("a string", ['shared_store = "yes"'], "must be true or false"),
+            ("an int", ['shared_store = 1'], "must be true or false"))
+        controls = (
+            ("false with live = none", ['shared_store = false', 'live = "none"']),
+            ("false with a store", ['shared_store = false', 'store = "%s/s"' % d]),
+            ("true on a shared scope", ['shared_store = true']),
+            ("false", ['shared_store = false']))
+        for tag, lines, want in refusals:
             bad = os.path.join(d, "bad.toml")
-            w(bad, base_cfg + extra.replace("\\\\n", "\\n"))
+            w(bad, scope_toml(lines))
             try:
                 load("claude", bad)
                 got = "loaded"
             except notes_config.ConfigError as exc:
                 got = str(exc)
-            check("config load refuses shared_store with %s" % tag,
-                  got != "loaded" and "shared_store" in got, got)
+            check("config load refuses shared_store with %s (message: %s)" % (tag, want),
+                  got != "loaded" and "shared_store" in got and want in got and "cannot parse" not in got, got)
+        for tag, lines in controls:
+            ok = os.path.join(d, "ok.toml")
+            w(ok, scope_toml(lines))
+            try:
+                for kind in ("claude", "codex"):
+                    load(kind, ok)
+                got = "loaded"
+            except notes_config.ConfigError as exc:
+                got = str(exc)
+            check("control loads in both modes: shared_store %s" % tag, got == "loaded", got)
 
         # --- writers and readers, both directions, through the real tools
         queue = os.path.join(d, "queue")
@@ -614,6 +690,24 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         w(os.path.join(pilot, ".claude", "settings.local.json"), json.dumps({"autoMemoryDirectory": shared}))
         rc, out, err = sub(bb + ["check"], e=benv)
         check("claude check is silent once the setting points at the shared store", rc == 0 and out == "", (rc, out))
+        # B2: the CLAUDE.md import still pointing at the old store, or at no RESUME at all
+        old_resume = os.path.join(d, "claude", "projects", slug, "memory", "RESUME.md")
+        w(old_resume, "# RESUME\n\n- stale\n")
+        w(os.path.join(pilot, "CLAUDE.md"), "# pilot\n@%s\n" % old_resume)
+        rc, out, err = sub(bb + ["check"], e=benv)
+        check("claude check flags a boot set that imports the OLD RESUME and lacks the shared one",
+              rc == 1 and "still imports" in out and old_resume in out and "does not import" in out
+              and os.path.join(shared, "RESUME.md") in out, (rc, out))
+        w(os.path.join(pilot, "CLAUDE.md"), "# pilot\n")
+        rc, out, err = sub(bb + ["check"], e=benv)
+        check("claude check flags a boot set with no RESUME import at all", rc == 1 and "does not import" in out, (rc, out))
+        w(os.path.join(pilot, "CLAUDE.md"), "# pilot\n@%s\n" % os.path.join(shared, "RESUME.md"))
+        command_rm(old_resume)
+        rc, out, err = sub(bb + ["check"], e=benv)
+        check("claude check is silent again with the shared import", rc == 0 and out == "", (rc, out))
+        rc, line, err = sub([sys.executable, os.path.join(BIN, "shared_store.py"), "settings-line", "--scope", "pilot"])
+        check("settings-line also prints the CLAUDE.md import and says to replace the old one",
+              "REPLACE the old import" in line and "@%s/RESUME.md" % shared in line and old_resume in line, line)
         rc, out, err = sub(bb + ["report"], e=benv)
         mem_chars = len(r(os.path.join(shared, "MEMORY.md")))
         check("claude report counts the shared MEMORY.md (native) and RESUME.md (import) in the scope total",
@@ -639,7 +733,8 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         cdir, xdir = legacy["claude"], legacy["codex"]
         w(os.path.join(cdir, "MEMORY.md"), "# Memory Index\n\n- [A](a.md) - claude a\n- [Both](both.md) - same\n- [Dup](dup.md) - d\n- [Dup](dup.md) - d\n")
         w(os.path.join(xdir, "MEMORY.md"), "# Memory Index\n\n- [X](x.md) - codex x\n- [Both](both.md) - same\n- [Dup](dup.md) - d\n")
-        w(os.path.join(cdir, "RESUME.md"), "# RESUME\n\n- c1\n- c2\n")
+        w(os.path.join(cdir, "RESUME.md"), "# RESUME\n\n- c1\n- c2 " + "p" * 350 + "\n")
+        w(manifest, "# scope manifest\nroutes things\n")
         w(os.path.join(xdir, "RESUME.md"), "# RESUME\n\n- c1\n- x1\n")
         for n, t in (("a.md", "---\nname: a\ndescription: d\n---\nA\n"), ("both.md", "---\nname: b\ndescription: d\n---\nsame\n"),
                      ("dup.md", "claude dup\n")):
@@ -647,21 +742,49 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         w(os.path.join(xdir, "both.md"), "---\nname: b\ndescription: d\n---\nsame\n")
         w(os.path.join(xdir, "x.md"), "---\nname: x\ndescription: d\n---\nX\n")
         w(os.path.join(xdir, "dup.md"), "codex dup\n")
+        w(os.path.join(cdir, "idx_em.md"), "---\nname: em\ndescription: d\n---\nem\n")
+        w(os.path.join(xdir, "idx_em.md"), "---\nname: em\ndescription: d\n---\nCODEX em\n")
+        em = chr(0x2014)
+        with open(os.path.join(cdir, "MEMORY.md"), "a") as fh:
+            fh.write("- [Em](idx_em.md) %s e\n" % em)
         before_old = snap(cdir, xdir)
         before_all = snap(d)
         sstore = [sys.executable, os.path.join(BIN, "shared_store.py")]
         rc, out, err = sub(sstore + ["plan", "--scope", "pilot"])
-        check("plan prints what would move and writes NOTHING anywhere",
-              rc == 0 and "merge  MEMORY.md" in out and "dup.codex.md" in out and "same   both.md" in out
+        check("plan prints each source with its file count, warns on an over-budget merged RESUME, writes nothing",
+              rc == 0 and "source claude: %s (" % cdir in out and "source codex: %s (" % xdir in out
+              and "WARN merged RESUME.md is over its budget" in out and "reflect-scope.md" not in out and "merge  MEMORY.md" in out and "dup.codex.md" in out and "same   both.md" in out
               and "plan only" in out and snap(d) == before_all and not os.path.exists(shared), (rc, out, err))
         rc, out, err = sub(sstore + ["migrate", "--scope", "plain"])
         check("migrate refuses a scope that is not opted in", rc == 2 and "not opted in" in err and snap(d) == before_all, (rc, err))
-        # RED: an entry is dropped between the merge and the write
-        global build
         real_build = build
+        # B3: a labeled (conflict) file's CONTENT is compared, not just its line count and label
+        def swap_labeled(cfg, scope, labels=None, over=None):
+            outs, rep, pr = real_build(cfg, scope, labels, over)
+            outs["dup.codex.md"] = with_harness(r(os.path.join(cdir, "dup.md")), "codex")  # claude text, codex label
+            return outs, rep, pr
+        build = swap_labeled
+        try:
+            rc = main(["migrate", "--scope", "pilot"])
+        finally:
+            build = real_build
+        check("migrate fails RED when a labeled file's text was replaced by another source's (same label)",
+              rc == 1 and not os.path.exists(shared))
 
-        def dropping(cfg, scope, labels=None):
-            outs, rep, pr = real_build(cfg, scope, labels)
+        def same_lines(cfg, scope, labels=None, over=None):
+            outs, rep, pr = real_build(cfg, scope, labels, over)
+            outs["dup.codex.md"] = outs["dup.codex.md"].replace("codex dup", "codex DUP")
+            return outs, rep, pr
+        build = same_lines
+        try:
+            rc = main(["migrate", "--scope", "pilot"])
+        finally:
+            build = real_build
+        check("migrate fails RED when a labeled body is altered at the same line count", rc == 1 and not os.path.exists(shared))
+        # RED: an entry is dropped between the merge and the write
+
+        def dropping(cfg, scope, labels=None, over=None):
+            outs, rep, pr = real_build(cfg, scope, labels, over)
             outs["MEMORY.md"] = outs["MEMORY.md"].replace("- [A](a.md) - claude a\n", "")
             return outs, rep, pr
         build = dropping
@@ -673,8 +796,8 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         check("migrate fails RED when an index entry is dropped, and moves nothing into place",
               rc == 1 and not os.path.exists(shared) and snap(cdir, xdir) == before_old)
 
-        def dropping_file(cfg, scope, labels=None):
-            outs, rep, pr = real_build(cfg, scope, labels)
+        def dropping_file(cfg, scope, labels=None, over=None):
+            outs, rep, pr = real_build(cfg, scope, labels, over)
             outs.pop("x.md")
             return outs, rep, pr
         build = dropping_file
@@ -698,6 +821,15 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
               and "claude dup" in r(os.path.join(shared, "dup.md")) and "codex dup" in r(os.path.join(shared, "dup.codex.md")))
         check("the conflicting codex index line points at the renamed file and is marked",
               "- [Dup](dup.codex.md) - [codex] d" in mem and "- [Dup](dup.md) - [claude] d" in mem, mem)
+        check("the scope manifest is not copied as a memory file; the pointer file says it stays",
+              not os.path.exists(os.path.join(shared, "reflect-scope.md")) and os.path.isfile(manifest)
+              and "manifest" in r(os.path.join(shared, "MIGRATED-FROM.txt"))
+              and "do not delete it" in r(os.path.join(shared, "MIGRATED-FROM.txt")))
+        check("an index line with an em-dash separator is labeled too (same separators as memory_index_lint)",
+              "- [Em](idx_em.md) %s [claude] e" % em in mem and os.path.isfile(os.path.join(shared, "idx_em.codex.md"))
+              and label_index_line("- [T](f.md) %s hook" % em, "codex") == "- [T](f.md) %s [codex] hook" % em, mem)
+        check("migrate printed the same over-budget WARN plan does and the per-source counts",
+              "WARN merged RESUME.md is over its budget" in out and "source claude:" in out, out)
         res = r(os.path.join(shared, "RESUME.md"))
         check("RESUME merged by entry: c1 once, c2 kept, x1 appended after the marker",
               res.count("- c1") == 1 and "- c2" in res and res.index(MARKER) < res.index("- x1"), res)
@@ -710,6 +842,31 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         w(os.path.join(xdir, "sub", "n.md"), "x")
         rc, out, err = sub(sstore + ["plan", "--scope", "pilot"])
         check("a subfolder in an old store is a PROBLEM (RED), never silently skipped", rc == 1 and "NOT MIGRATED" in out, (rc, out))
+
+        # --- B4: a scope that had a custom `store` (opting in forbids the key), and bad sources
+        cust, custore, empty = (os.path.join(d, n) for n in ("cust", "customstore", "emptyx"))
+        os.makedirs(cust)
+        os.makedirs(empty)
+        w(os.path.join(custore, "MEMORY.md"), "# Memory Index\n\n- [C](c.md) - custom\n")
+        w(os.path.join(custore, "c.md"), "---\nname: c\ndescription: d\n---\nC\n")
+        cfg2 = os.path.join(d, "c2.toml")
+        w(cfg2, base_cfg + '[[scopes]]\nname = "cust"\nroot = "%s"\nshared_store = true\n' % cust)
+        env2 = dict(env, SESSION_NOTES_CONFIG=cfg2)
+        rc, out, err = sub(sstore + ["plan", "--scope", "cust"], e=env2)
+        check("without the override the derived (empty) stores are RED, naming the missing source",
+              rc == 1 and "does not exist" in out and "--claude-store" in out and "0 files" in out, (rc, out))
+        rc, out, err = sub(sstore + ["plan", "--scope", "cust", "--claude-store", custore], e=env2)
+        check("a missing Codex store is RED even when Claude's is found",
+              rc == 1 and "source claude: %s (2 files)" % custore in out and "codex store" in out and "does not exist" in out, (rc, out))
+        rc, out, err = sub(sstore + ["plan", "--scope", "cust", "--claude-store", custore, "--codex-store", empty], e=env2)
+        check("with both sources named, plan is green and prints each store with its file count",
+              rc == 0 and "source claude: %s (2 files)" % custore in out and "source codex: %s (0 files)" % empty in out, (rc, out))
+        rc, out, err = sub(sstore + ["migrate", "--scope", "cust", "--claude-store", empty, "--codex-store", empty], e=env2)
+        check("a migration of 0 files is RED and writes nothing",
+              rc == 1 and "0 files" in err and not os.path.exists(os.path.join(shared_root, notes_config.encode_project_dir(cust))), (rc, err))
+        rc, out, err = sub(sstore + ["migrate", "--scope", "cust", "--claude-store", custore, "--codex-store", empty], e=env2)
+        check("migrate from the custom store lands its files",
+              rc == 0 and os.path.isfile(os.path.join(shared_root, notes_config.encode_project_dir(cust), "c.md")), (rc, out, err))
 
     for k, v in saved.items():
         if v is None:

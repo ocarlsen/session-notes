@@ -358,7 +358,9 @@ home, and outside the state dir, which holds no memory.
   `.claude/settings.local.json`. Claude Code ignores that key in the checked-in settings.json, so
   this repo never writes it: `shared_store.py settings-line --scope NAME` prints the line, and
   `boot_budget.py check` reports a `SHARED STORE` finding for an opted-in scope whose settings do
-  not point there.
+  not point there, whose Claude boot set (the CLAUDE.md `@import` chain) lacks the shared
+  RESUME.md, or still imports a file under an old store. `settings-line` prints both lines: the
+  setting, and the `@import` of the shared RESUME.md that replaces the old import.
 - **Harness label.** A memory file may carry `harness: claude` or `harness: codex` in its
   frontmatter; absent means it applies to every agent. The index line shows it as `[codex]` in
   front of the hook. Every agent sees every file (Claude's native load cannot filter): the label
@@ -368,23 +370,37 @@ home, and outside the state dir, which holds no memory.
   kept, Codex lines it lacks appended), other files by name; a name present in both with
   different text keeps both, labeled `harness: claude` and `harness: codex` (the Codex copy as
   `<stem>.codex.md`). It re-reads what it wrote and exits RED, moving nothing into place, unless
-  every original entry landed exactly once. It writes only under the shared stores root and
-  leaves the old stores untouched; deleting them is a later, separate call.
+  every original entry landed exactly once (a labeled file is compared in full). It writes only
+  under the shared stores root and leaves the old stores untouched; deleting them is a later,
+  separate call. `plan` and `migrate` print each source with its file count; a source that does
+  not exist, or a merge of 0 files, is RED. A scope that had a custom `store` must drop the key
+  to opt in, so pass the old folder with `--claude-store PATH` (and `--codex-store PATH`; point it
+  at an empty folder for an agent that never had a store). A scope `manifest` that sits in an old
+  store is not copied (it is structural), and `MIGRATED-FROM.txt` says to keep it. Both commands
+  warn when the merged RESUME.md is over its budget.
 
 ### RESUME size guard
 
 `boot_budget`'s `resume_bytes` is a ceiling, and a write that crosses it is now refused, not just
-reported. `bin/resume_guard.py` is the one predicate: a result at or under the budget passes; one
-over it passes only if it is shorter than what was there (a trim must be allowed to arrive in
-steps); anything else is refused with "move finished items to RESUME-archive.md beside it,
-verbatim, then retry". The budget is `boot_budget.budget_for(path)`, never a number typed in the
+reported. `bin/resume_guard.py` is the one predicate: a result at or under the budget passes (for a
+store Codex boots, a shared scope's or any store in codex mode, it must also still load in Codex:
+the guard dry-runs `hooks/codex_session_start.plan_context` with the candidate text, so the
+`agent.codex_boot_bytes` cap lives only there). A result over the budget, or one Codex would drop,
+passes only if it removes text and adds none: every non-blank line of the new text is in the old
+text, as a multiset. A file can be trimmed back in steps, but nothing new goes in, and a one-byte
+swap is refused. Anything else is refused with "move finished items to RESUME-archive.md beside
+it, verbatim, then retry". The old RESUME.md of a scope that migrated to a shared store is no
+longer read, so a write to it is refused ("write the shared store's RESUME.md instead"). The budget is `boot_budget.budget_for(path)`, never a number typed in the
 guard. Callers: `codex_save.py` (at `stage` and again at `commit`) and the Claude PreToolUse hook
 `hooks/resume_size_guard.py` (matcher `Edit|Write|MultiEdit|Bash`, installed by default). The hook
 judges the simulated result of an Edit, Write or MultiEdit on a configured store's RESUME.md,
 shared or not, and refuses outright any Bash command that writes one (redirect, `tee`, `sed -i`,
 `cp`/`mv`/`rm`, `dd of=`, found with `checkout_guard`'s parser), because a shell write cannot be
 simulated. A RESUME.md target with a config that does not load is refused, never waved through.
-Known limit: a program that writes on its own (`python3 script.py`) is not seen.
+The command is parsed before the config is loaded, so a broken config refuses only a command that
+writes a RESUME.md, never `cat`, `grep` or `git log` on one. Known limits: a program that writes on
+its own (`python3 script.py`), and a path built from `$VAR` or `"$HOME/..."` (not expanded), are
+not seen.
 
 ## live: what just happened, across scopes
 

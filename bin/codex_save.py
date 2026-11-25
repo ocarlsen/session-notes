@@ -130,7 +130,7 @@ def guard_resume(path, content):
             old = fh.read()
     except FileNotFoundError:
         old = ""
-    msg = resume_guard.check_write(path, old, _new_resume_text(content))
+    msg = resume_guard.check_write(path, old, _new_resume_text(content), cwd=os.getcwd())
     if msg:
         raise SaveError(msg)
 
@@ -306,8 +306,8 @@ def selftest():
     import tempfile
     fails = []
 
-    def check(name, cond):
-        print(("ok   " if cond else "FAIL ") + name)
+    def check(name, cond, detail=""):
+        print(("ok   " if cond else "FAIL ") + name + ("" if cond else "  " + str(detail)))
         if not cond:
             fails.append(name)
 
@@ -374,6 +374,13 @@ def selftest():
             rc, out, _ = run(["commit"])
             check("stale resume skipped, not clobbered", rc == 1 and "SKIPPED" in out
                   and "sibling wrote this" in open(os.path.join(p, "RESUME.md")).read())
+
+            # The Codex boot cap: under resume_bytes (12000) but too big for the SessionStart pack.
+            rc, base, _ = run(["hash", "--store", "project"])
+            rc, _, err = run(["stage", "--store", "project", "--resume", "--base", base.strip()],
+                             "".join("- line %04d padding padding\n" % i for i in range(410)))
+            check("a RESUME under the budget that Codex's boot pack would drop is refused at stage",
+                  rc == 2 and "would not load in Codex" in err and "codex_boot_bytes" in err, (rc, err))
 
             # Lock contention: another holder makes commit wait, then time out without writing.
             run(["stage", "--store", "global", "--file", "user_y.md"], "body\n")

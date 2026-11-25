@@ -377,8 +377,9 @@ def store_for(scope, agent, cfg):
     A scope that opted in with `shared_store = true` has one store, the same for both agents:
     <paths.shared_stores_dir>/<slug>. Every other scope keeps its per-agent store: Claude's
     `store` key or ~/.claude/projects/<slug>/memory, Codex's <codex_home>/session-notes/
-    projects/<slug>. `scope` is a RAW [[scopes]] table or a resolved scope dict (both carry
-    name and root; the resolved one is also accepted unchanged). Every reader and writer of a
+    projects/<slug>. `scope` is a dict with `root`, plus `shared_store` and (optionally, for a
+    custom Claude store) `claude_store`; a resolved scope has no `claude_store` and so gets the
+    default Claude store, which is why shared_store.py takes --claude-store. Every reader and writer of a
     project store goes through here (via the resolved scope's `store`)."""
     if agent not in AGENTS:
         raise ConfigError("store_for: agent must be one of %s, got %r" % ("/".join(AGENTS), agent))
@@ -657,8 +658,8 @@ def selftest():
     import tempfile
     fails = []
 
-    def check(name, cond):
-        print(("ok   " if cond else "FAIL ") + name)
+    def check(name, cond, detail=""):
+        print(("ok   " if cond else "FAIL ") + name + ("" if cond else "  " + str(detail)))
         if not cond:
             fails.append(name)
 
@@ -1009,6 +1010,29 @@ store = "/tmp/beta-store"
         check("shared_store: default shared_stores_dir is under ~/.local/share",
               load(os.path.join(d, "none.toml"))["paths"]["shared_stores_dir"]
               == os.path.expanduser("~/.local/share/session-notes/stores"))
+    # shared_store refusals name their reason (real newlines in the fixtures), with loading controls
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "r.toml")
+        head = '[paths]\nshared_stores_dir = "%s/st"\n' % d
+        for tag, body, want in (
+                ("live = none", 'shared_store = true\nlive = "none"\n', "isolated scope"),
+                ("live = own", 'shared_store = true\nlive = "own"\nlive_file = "%s/l.md"\n' % d, "isolated scope"),
+                ("store set", 'shared_store = true\nstore = "%s/s"\n' % d, "exclusive"),
+                ("a string", 'shared_store = "yes"\n', "must be true or false")):
+            with open(f, "w") as fh:
+                fh.write(head + '[[scopes]]\nname = "x"\nroot = "/r/x"\n' + body)
+            try:
+                load(f)
+                got = "loaded"
+            except ConfigError as exc:
+                got = str(exc)
+            check("shared_store refused with %s" % tag, want in got and "shared_store" in got
+                  and "cannot parse" not in got, got)
+        for tag, body in (("false + live none", 'shared_store = false\nlive = "none"\n'),
+                          ("false + store", 'shared_store = false\nstore = "%s/s"\n' % d)):
+            with open(f, "w") as fh:
+                fh.write(head + '[[scopes]]\nname = "x"\nroot = "/r/x"\n' + body)
+            check("control loads: shared_store %s" % tag, bool(load(f)["scopes"]))
     check("encode", encode_project_dir("/a/b.c") == "-a-b-c")
     check("array parse", parse_toml('x = ["a", "b,c"]\n') == {"x": ["a", "b,c"]}
           if _tomllib is None else True)

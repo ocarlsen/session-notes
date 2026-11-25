@@ -466,6 +466,20 @@ def shared_store_findings():
             out.append(f"SHARED STORE {s['name']}: {_display(p)} does not set autoMemoryDirectory to "
                        f"{_display(s['store'])} (got {val!r}); Claude would keep using the old store. "
                        f"Run: shared_store.py settings-line --scope {s['name']}")
+        # Claude's boot set (CLAUDE.md @imports) must reach the shared RESUME.md and nothing under
+        # an old per-harness store, or Claude boots stale files while /reflect writes the new one.
+        import shared_store
+        shared_resume = os.path.join(s["store"], "RESUME.md")
+        boot = [os.path.realpath(f) for f in boot_files_for_scope(s["root"])]
+        if os.path.isfile(shared_resume) and os.path.realpath(shared_resume) not in boot:
+            out.append(f"SHARED STORE {s['name']}: Claude's boot set does not import {_display(shared_resume)}. "
+                       f"Add `@{_display(shared_resume)}` to the scope's CLAUDE.md "
+                       f"(shared_store.py settings-line --scope {s['name']} prints it)")
+        for old in shared_store.legacy_stores(_cfg(), s).values():
+            stale = [f for f in boot if notes_config._under(f, old)]
+            for f in stale:
+                out.append(f"SHARED STORE {s['name']}: Claude's boot set still imports {_display(f)} from the "
+                           f"old store; replace it with the shared store's file (settings-line prints the line)")
     return out
 
 

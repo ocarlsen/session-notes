@@ -18,8 +18,11 @@ Fail loud: a RESUME.md target with a config that cannot be loaded is REFUSED (ex
 config error), never waved through. An unreadable payload or an internal error exits 0 with one
 line on stderr, so a hiccup cannot break unrelated writes. Exit 2 + stderr is the refusal.
 
-Known limit: a program that writes on its own (`python3 script.py`) is not seen, as with
-checkout_guard.
+The command is parsed BEFORE the config is loaded, so a broken config refuses only a command
+that writes some RESUME.md, never `cat`/`grep`/`git log` on one. The old RESUME.md of a scope
+that migrated to a shared store is refused ("write the shared store's RESUME.md instead").
+Known limits, as with checkout_guard: a program that writes on its own (`python3 script.py`), and
+a path built from `$VAR` or `"$HOME/..."` (not expanded) are not seen.
 
     python3 resume_size_guard.py --selftest
 """
@@ -76,9 +79,12 @@ def simulate(tool, ti, old):
     return text
 
 
-def bash_writes_resume(cmd, cwd, resumes, depth=0):
-    """The first configured RESUME.md realpath a shell command writes, or None."""
+def bash_resume_targets(cmd, cwd, depth=0):
+    """Realpaths of every file named RESUME.md a shell command writes (parsed with
+    checkout_guard's parser, no config needed). A `$VAR` or `"$HOME/..."` path is not expanded
+    and so is not seen."""
     import checkout_guard as cg
+    out = []
     for seg, writes, _sub in cg.split_segments(cg.strip_heredocs(cmd)):
         try:
             argv = shlex.split(seg)
@@ -89,23 +95,18 @@ def bash_writes_resume(cmd, cwd, resumes, depth=0):
             cwd = cg._literal_dir(argv[1], cwd) or cwd  # a literal `cd DIR && ...` moves the base
             continue
         for target, _g, _r in cg._write_targets(argv, writes, cwd):
-            if not target or target.startswith("-"):
+            if not target or target.startswith("-") or os.path.basename(target) != "RESUME.md" \
+                    or "$" in target or "`" in target:
                 continue
             t = os.path.expanduser(target)
-            real = os.path.realpath(t if os.path.isabs(t) else os.path.join(cwd, t))
-            if real in resumes:
-                return real
+            out.append(os.path.realpath(t if os.path.isabs(t) else os.path.join(cwd, t)))
         if argv and os.path.basename(argv[0]) in cg.SHELLS and depth < 3:
             script = cg._script_of(argv)
             if script:
-                r = bash_writes_resume(script, cwd, resumes, depth + 1)
-                if r:
-                    return r
+                out += bash_resume_targets(script, cwd, depth + 1)
         if argv and argv[0] == "eval" and depth < 3 and len(argv) > 1:
-            r = bash_writes_resume(" ".join(argv[1:]), cwd, resumes, depth + 1)
-            if r:
-                return r
-    return None
+            out += bash_resume_targets(" ".join(argv[1:]), cwd, depth + 1)
+    return out
 
 
 def decide(payload):
@@ -123,6 +124,9 @@ def decide(payload):
         cfg, err = _load_or_refuse()
         if err:
             return err
+        legacy = resume_guard.legacy_refusal(path, cfg)
+        if legacy:
+            return legacy
         if not resume_guard.is_configured_resume(path, cfg):
             return None
         old = _read(path)
@@ -134,10 +138,14 @@ def decide(payload):
         cmd = ti.get("command")
         if not isinstance(cmd, str) or "RESUME.md" not in cmd:
             return None
+        targets = bash_resume_targets(cmd, cwd)
+        if not targets:
+            return None  # nothing it writes is a RESUME.md: no config needed, none loaded
         cfg, err = _load_or_refuse()
         if err:
             return err
-        hit = bash_writes_resume(cmd, cwd, resume_guard.configured_resumes(cfg))
+        known = resume_guard.configured_resumes(cfg) | set(resume_guard.legacy_resumes(cfg))
+        hit = next((t for t in targets if t in known), None)
         return BASH_REFUSAL % hit if hit else None
     return None
 
@@ -180,7 +188,8 @@ def selftest():
         with open(cfgf, "w") as fh:
             fh.write('[paths]\nclaude_home = "%s/claude"\nglobal_store = "%s"\n'
                      '[budgets]\nresume_bytes = 100\n'
-                     '[[scopes]]\nname = "a"\nroot = "%s/a"\nstore = "%s"\n' % (d, gstore, d, store))
+                     '[[scopes]]\nname = "a"\nroot = "%s/a"\nstore = "%s"\n'
+                     '[[scopes]]\nname = "m"\nroot = "%s/m"\nshared_store = true\n' % (d, gstore, d, store, d))
         env = {k: v for k, v in os.environ.items() if not k.startswith("SESSION_NOTES_")}
         env.update(HOME=home, SESSION_NOTES_CONFIG=cfgf)
         resume = os.path.join(store, "RESUME.md")
@@ -212,16 +221,36 @@ def selftest():
         rc, err = run({"tool_name": "Edit", "tool_input": {"file_path": resume, "old_string": "nope",
                                                            "new_string": "x" * 500}})
         check("an Edit whose old_string is absent changes nothing: passes", rc == 0, (rc, err))
-        w(resume, "z" * 450)
-        rc, err = run({"tool_name": "Edit", "tool_input": {"file_path": resume, "old_string": "z" * 100,
+        lines = "".join("entry number %02d\n" % i for i in range(30))  # 480 chars, over the 100 budget
+        w(resume, lines)
+        rc, err = run({"tool_name": "Edit", "tool_input": {"file_path": resume, "old_string": "entry number 05\n",
                                                            "new_string": ""}})
-        check("a shrinking Edit of an over-budget file passes", rc == 0, (rc, err))
-        rc, err = run({"tool_name": "Edit", "tool_input": {"file_path": resume, "old_string": "z",
-                                                           "new_string": "zz"}})
+        check("an Edit that only removes a line of an over-budget file passes", rc == 0, (rc, err))
+        rc, err = run({"tool_name": "Edit", "tool_input": {"file_path": resume, "old_string": "entry number 05\n",
+                                                           "new_string": "entry number 5\n"}})
+        check("the 1-char swap (shorter, but a new line) is refused while over budget", rc == 2
+              and "only remove lines" in err, (rc, err))
+        rc, err = run({"tool_name": "Edit", "tool_input": {"file_path": resume, "old_string": "entry number 05",
+                                                           "new_string": "entry number 055"}})
         check("a growing Edit of an over-budget file is refused", rc == 2, (rc, err))
         rc, err = run({"tool_name": "MultiEdit", "tool_input": {"file_path": resume, "edits": [
-            {"old_string": "z" * 100, "new_string": ""}, {"old_string": "z", "new_string": "zzz"}]}})
-        check("MultiEdit is judged on the final result (net shrink passes)", rc == 0, (rc, err))
+            {"old_string": "entry number 05\n", "new_string": ""}, {"old_string": "entry number 06\n", "new_string": ""}]}})
+        check("MultiEdit is judged on the final result (two removals pass)", rc == 0, (rc, err))
+        rc, err = run({"tool_name": "MultiEdit", "tool_input": {"file_path": resume, "edits": [
+            {"old_string": "entry number 05\n", "new_string": ""}, {"old_string": "entry number 06", "new_string": "entry number 66"}]}})
+        check("MultiEdit that removes one line and changes another is refused", rc == 2, (rc, err))
+        rc, err = run({"tool_name": "Write", "tool_input": {"file_path": resume, "content": "short\n"}})
+        check("a rewrite that lands under budget passes", rc == 0, (rc, err))
+        w(resume, "a\n" * 20)
+        import shared_store
+        mcfg = notes_config.load(cfgf, env={})
+        mscope = [x for x in mcfg["scopes"] if x["name"] == "m"][0]
+        legacy = os.path.join(shared_store.legacy_stores(mcfg, mscope)["claude"], "RESUME.md")
+        rc, err = run({"tool_name": "Write", "tool_input": {"file_path": legacy, "content": "x"}})
+        check("the old RESUME.md of a migrated scope is refused: write the shared store",
+              rc == 2 and "migrated to a shared store" in err and os.sep + "stores" + os.sep in err, (rc, err))
+        rc, err = run({"tool_name": "Bash", "tool_input": {"command": "echo x >> %s" % legacy}})
+        check("a Bash write to the old RESUME.md is refused too", rc == 2, (rc, err))
         other = os.path.join(store, "feedback_x.md")
         rc, err = run({"tool_name": "Write", "tool_input": {"file_path": other, "content": "x" * 5000}})
         check("a non-RESUME file in the store is ignored", rc == 0 and err == "", (rc, err))
@@ -249,6 +278,13 @@ def selftest():
         check("missing config: a non-RESUME write is untouched", rc == 0 and err == "", (rc, err))
         rc, err = run({"tool_name": "Bash", "tool_input": {"command": "echo x > %s" % resume}}, bad)
         check("missing config: a Bash RESUME write is refused loudly", rc == 2, (rc, err))
+        for cmd in ('cat %s' % resume, 'grep -n a docs/RESUME.md', 'git log -- RESUME.md', 'wc -c RESUME.md'):
+            rc, err = run({"tool_name": "Bash", "tool_input": {"command": cmd}}, bad)
+            check("broken config: a command that writes no RESUME.md is not refused: %s" % cmd[:24], rc == 0 and err == "", (rc, err))
+        rc, err = run({"tool_name": "Bash", "tool_input": {"command": "echo x > docs/RESUME.md"}}, bad)
+        check("broken config: a command that DOES write a RESUME.md is refused loudly", rc == 2 and "missing.toml" in err, (rc, err))
+        rc, err = run({"tool_name": "Bash", "tool_input": {"command": 'echo x > "$HOME/RESUME.md"'}}, bad)
+        check("known limit: a $HOME path is not expanded, so it is not seen", rc == 0, (rc, err))
         rc, err = subprocess.run([sys.executable, os.path.abspath(__file__)], input="not json",
                                  capture_output=True, text=True, env=env).returncode, ""
         check("an unreadable payload fails open", rc == 0)
