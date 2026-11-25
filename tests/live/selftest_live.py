@@ -2797,7 +2797,8 @@ class Live:
         os.makedirs(home, exist_ok=True)
         env = git_env(home)
         env.update(SESSION_NOTES_CONFIG=cfg, WT_GH=os.path.join(self.bin, "gh"))
-        wt = [sys.executable, os.path.join(self.repo, "bin", "wt.py")]
+        grants = os.path.join(parent, "grants", "grants.json")  # see WT_TEST_LAUNCH
+        wt = [sys.executable, "-c", WT_TEST_LAUNCH, os.path.join(self.repo, "bin", "wt.py"), grants]
         main = make_origin_repo(parent, "proj", env)
         path = sh(wt + ["new", "feat"], main, env).stdout.strip().splitlines()[-1]
         with open(os.path.join(path, "tracked.txt"), "a") as fh:
@@ -2815,7 +2816,7 @@ class Live:
             os.remove(os.path.join(self.ghdir, "posted.jsonl"))
         except OSError:
             pass
-        return {"path": path, "head": head, "env": env, "wt": wt}
+        return {"path": path, "head": head, "env": env, "wt": wt, "grants": grants}
 
     def trust_path(self, path):
         """Pre-trust a directory created mid-run, in the sandbox's Claude and Codex configs."""
@@ -2873,6 +2874,11 @@ class Live:
             return FAIL, "the verdict names sha %s, not the PR head %s" % (m.group(2)[:10], pr["head"][:10]), "review-%s.txt" % cli
         if m.group(1) != "APPROVE":
             return FAIL, "the reviewer returned CHANGES on a one line correct change (marker and sha were well formed)", "review-%s.txt" % cli
+        # the user's yes to `merge #7?` (the review itself needs none), as hooks/merge_consent.py records it
+        os.makedirs(os.path.dirname(pr["grants"]), exist_ok=True)
+        with open(pr["grants"], "w") as fh:
+            json.dump({"grants": [{"repo": "o/r", "pr": 7, "ts": time.time(), "prompt": "yes",
+                                   "session": "s", "used": False}]}, fh)
         g = sh(pr["wt"] + ["merge", "feat", "--dry-run"], pr["path"], pr["env"], check=False)
         self.log("review-%s.txt" % cli, "wt merge --dry-run rc=%d\n%s\n%s\n" % (g.returncode, g.stdout, g.stderr))
         if g.returncode != 0 or "verdict gate passed" not in g.stdout:
