@@ -715,7 +715,9 @@ selftest keys (never your own login). It needs both CLIs; `--scenario` requires 
 5. One builds, the other reviews: Claude commits and runs `wt pr` (stub `gh`); `wt merge` refuses with no review;
    Codex runs `$review 7` on gpt-6.2-sol at low effort; Claude ends on `merge #7?`; the harness types `yes` into
    that pane (the status line says `user types: yes` first, so the film never shows it as a model decision); the
-   real consent hook records it and `wt merge` passes through the stub.
+   real consent hook records it and `wt merge` passes through the stub. If Codex answers CHANGES once, Claude
+   makes one fix commit and Codex reviews once more; the APPROVE must name the new head, and a second CHANGES
+   fails the scene.
 6. Everyone hears about it: the merge writes a live-context line; Codex's `$refresh` shows it.
 7. Separate memories: `/reflect` and `$reflect` each write their own store; `bin/nightly_check.py` reports both clean.
 8. The whole story, replayed: the bus log as a timeline; then the normal teardown (`--keep` keeps the sandbox).

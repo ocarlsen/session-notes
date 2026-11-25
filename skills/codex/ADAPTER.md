@@ -29,6 +29,15 @@ asking for approval on every write.
 
 1. **Stage** each change (runs inside the sandbox; it only writes `/tmp`):
    - a memory file: `SESSION_NOTES_AGENT=codex python3 $SESSION_NOTES/bin/codex_save.py stage --store global --file NAME.md` with the whole file on stdin (`<<'EOF'`)
+     The frontmatter has this exact form; `type:` goes under `metadata:`, never at the top level (stage refuses that):
+     ```
+     ---
+     name: descriptive-kebab-slug
+     description: one line saying when this is relevant
+     metadata:
+       type: user | feedback | project | reference
+     ---
+     ```
    - its index line: `SESSION_NOTES_AGENT=codex python3 $SESSION_NOTES/bin/codex_save.py stage --store global --index-line "- [Title](NAME.md) - hook"`
    - RESUME.md: first `... codex_save.py hash --store project` (or `global`) when you READ it,
      then `... codex_save.py stage --store project --resume --base <that hash>` with the whole new

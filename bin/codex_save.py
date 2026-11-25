@@ -60,6 +60,7 @@ sys.path.insert(0, BIN)
 os.environ["SESSION_NOTES_AGENT"] = "codex"
 import notes_config  # noqa: E402
 import append_memory_index  # noqa: E402
+import memory_hygiene_canary  # noqa: E402
 import memory_index_lint  # noqa: E402
 import reflect_lock  # noqa: E402
 import resume_guard  # noqa: E402
@@ -135,6 +136,19 @@ def guard_resume(path, content):
         raise SaveError(msg)
 
 
+_FRONTMATTER_FORM = ("---\nname: descriptive-kebab-slug\ndescription: one line saying when this is relevant\n"
+                     "metadata:\n  type: user | feedback | project | reference\n---")
+
+
+def check_frontmatter(name, content):
+    """Refuse (SaveError) a memory file whose `type:` sits at the top level of its frontmatter: the
+    canary's format is `metadata:` with `type:` nested under it. Parsed by the canary's own parser."""
+    fm = memory_hygiene_canary.parse_frontmatter(content)
+    if fm is not None and fm["top_type"] is not None:
+        raise SaveError("%s: `type:` must be nested under `metadata:`, not at the top level of the frontmatter. "
+                        "Re-stage the whole file in this form:\n%s" % (name, _FRONTMATTER_FORM))
+
+
 def stage(args, content):
     store = resolve_store(args.store)
     item = {"store": store, "ts": time.time()}
@@ -147,6 +161,7 @@ def stage(args, content):
                             " RESUME.md; use --index-line or --resume): %r" % args.file)
         if not content.strip():
             raise SaveError("--file needs the memory body on stdin")
+        check_frontmatter(args.file, content)
         try:
             labeled = shared_store.with_harness(content, harness)
         except ValueError as exc:
@@ -357,6 +372,17 @@ def selftest():
             check("path traversal refused", rc == 2 and "plain NAME.md" in err)
             rc, _, err = run(["stage", "--store", "global", "--file", "MEMORY.md"], "x")
             check("MEMORY.md as a file refused", rc == 2)
+            rc, _, err = run(["stage", "--store", "global", "--file", "user_t.md"],
+                             "---\nname: t\ndescription: d\ntype: reference\n---\nbody\n")
+            check("a top-level type: is refused with the correct form shown",
+                  rc == 2 and "metadata:" in err and "  type:" in err, (rc, err))
+            rc, out, _ = run(["stage", "--store", "global", "--file", "user_t.md"],
+                             "---\nname: t\ndescription: d\nmetadata:\n  type: reference\n---\nbody\n")
+            check("the nested metadata type is accepted", rc == 0 and "staged file" in out, (rc, out))
+            run(["commit"])
+            rc, _, _ = run(["stage", "--store", "global", "--index-line", "- [T](user_t.md) - type: reference"])
+            check("an index line mentioning type: is unaffected", rc == 0)
+            run(["commit"])
             rc, _, err = run(["stage", "--store", "global", "--index-line", "- [X](user_x.md) - " + "h" * 200])
             check("over-cap index line refused at stage time", rc == 2)
 

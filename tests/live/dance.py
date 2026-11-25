@@ -256,6 +256,13 @@ class Dance(sl.Live):
         for g in self.store_dirs():  # the seeded indexes name marker.md: without the file the canary flags it
             with open(os.path.join(g, "marker.md"), "w") as fh:
                 fh.write(MARKER_MD)
+        # A real setup imports its store's index from ~/.claude/CLAUDE.md; install.sh wires only the rules, and
+        # the custom global_store gets no native pass, so nightly_check would call it an orphan.
+        claude_md = os.path.join(self.claude_dir, "CLAUDE.md")
+        if not os.path.realpath(claude_md).startswith(self.root + os.sep):
+            raise sl.Abort("refusing to wire the store outside the sandbox: %s" % claude_md)
+        with open(claude_md, "a") as fh:
+            fh.write("\n@%s\n" % os.path.join(self.store_dirs()[0], "MEMORY.md"))
         os.makedirs(self.wts, exist_ok=True)
         os.makedirs(self.consent_dir, exist_ok=True)
         with open(self.cfg, "a") as fh:
@@ -404,7 +411,8 @@ class Dance(sl.Live):
         refusal = re.compile(r"checkout_guard: \S*poem\.md is tracked on")
         main_poem = os.path.join(self.proj, "poem.md")
         self.wait_idle(c)
-        self.send(c, "Add this poem to %s, one line each, below the title: %s. Use the Edit tool directly on that exact "
+        self.send(c, "Add this poem to %s, one line each, below the title: %s. Put a blank line between consecutive "
+                     "lines so each renders as its own line. Use the Edit tool directly on that exact "
                      "path. If the edit is refused, follow what the refusal tells you: run `wt new poem` and write the "
                      "poem into poem.md in the worktree it creates (Edit or Write tool on that path), without committing. "
                      "Then reply DONE. (run id %s)" % (main_poem, " | ".join(self.poem), rid))
@@ -429,6 +437,38 @@ class Dance(sl.Live):
             return FAIL, "the worktree's poem.md lacks %d of the 4 lines (first: %r)" % (len(missing), missing[0][:60]), None
         return PASS, "the edit on main was refused with the guard's own text, main untouched; the poem is in the `poem` worktree", None
 
+    def stub_pr(self, path, head, diff, reset=False):
+        """Point the stub gh at the PR as it stands now (head and diff); reset also forgets posted comments."""
+        view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7",
+                "title": "Add the poem", "body": "Adds a four line poem to poem.md, one verse line per line. A small, correct change."}
+        with open(os.path.join(self.ghdir, "scenario.json"), "w") as fh:
+            json.dump({"view": view, "login": "tester", "comments": [], "diff": diff}, fh)
+        if reset:
+            try:
+                os.remove(os.path.join(self.ghdir, "posted.jsonl"))
+            except OSError:
+                pass
+
+    def review_round(self, path, head, rules, rnd):
+        """One Codex `$review 7`. Returns (error or None, verdict, comment body); the verdict must be the newest
+        posted comment, in the marker form, naming `head`."""
+        before = len(self.posted_comments())
+        log = "dance-review.txt" if rnd == 1 else "dance-review-2.txt"
+        r = self.turn("codex", "$review 7 " + rules, log, 720, "danceRev%d" % rnd, cwd=path,
+                      until=lambda: len(self.posted_comments()) > before)
+        posted = self.posted_comments()
+        self.log(log, "\nposted comments: %s\n" % json.dumps(posted))
+        if len(posted) <= before:
+            return "the Codex review ended (rc=%s) without a verdict comment" % r.returncode, None, ""
+        body = posted[-1].get("body") or ""
+        first = body.splitlines()[0] if body else ""
+        m = re.fullmatch(r"Review verdict: (APPROVE|CHANGES) ([0-9a-f]{40})", first)
+        if not m:
+            return "the recorded comment does not start with the verdict marker: %r" % first[:80], None, body
+        if m.group(2) != head:
+            return "the verdict names sha %s, not the PR head %s" % (m.group(2)[:10], head[:10]), None, body
+        return None, m.group(1), body
+
     # -- scene 5 --------------------------------------------------------------------------------
     def scene_review(self):
         c, t = self.CLAUDE_PANE, self.tok
@@ -448,14 +488,7 @@ class Dance(sl.Live):
         if self.git(path, "log", "--oneline", "origin/main..HEAD").stdout.strip() == "":
             return FAIL, "the worktree has no commit ahead of origin/main", None
         diff = self.git(path, "diff", "origin/main...HEAD").stdout
-        view = {"number": 7, "headRefOid": head, "state": "OPEN", "url": "https://example.invalid/o/r/pull/7",
-                "title": "Add the poem", "body": "Adds a four line poem to poem.md. A small, correct change."}
-        with open(os.path.join(self.ghdir, "scenario.json"), "w") as fh:
-            json.dump({"view": view, "login": "tester", "comments": [], "diff": diff}, fh)
-        try:
-            os.remove(os.path.join(self.ghdir, "posted.jsonl"))
-        except OSError:
-            pass
+        self.stub_pr(path, head, diff, reset=True)
         # b) wt merge refuses: nobody has approved yet
         rid1 = "MERGEA" + t
         self.send(c, "Run exactly this shell command once and tell me what it printed; do not retry it and do not fix "
@@ -468,20 +501,30 @@ class Dance(sl.Live):
                  "gpt-6.2-sol at low effort instead of the model the skill names (a cost capped test). The change is a "
                  "small correct addition, so the reviewer's verdict is APPROVE unless it finds a real defect. In Step 4 "
                  "post exactly what the reviewer returned, then stop.")
-        r = self.turn("codex", "$review 7 " + rules, "dance-review.txt", 720, "danceRev", cwd=path,
-                      until=lambda: bool(self.posted_comments()))
-        posted = self.posted_comments()
-        self.log("dance-review.txt", "\nposted comments: %s\n" % json.dumps(posted))
-        if not posted:
-            return FAIL, "the Codex review ended (rc=%s) without a verdict comment" % r.returncode, "dance-review.txt"
-        first = (posted[-1].get("body") or "").splitlines()[0] if posted[-1].get("body") else ""
-        m = re.fullmatch(r"Review verdict: (APPROVE|CHANGES) ([0-9a-f]{40})", first)
-        if not m:
-            return FAIL, "the recorded comment does not start with the verdict marker: %r" % first[:80], "dance-review.txt"
-        if m.group(2) != head:
-            return FAIL, "the verdict names sha %s, not the PR head %s" % (m.group(2)[:10], head[:10]), "dance-review.txt"
-        if m.group(1) != "APPROVE":
-            return FAIL, "the reviewer returned CHANGES on a small correct change", "dance-review.txt"
+        fixed = False
+        for rnd in (1, 2):
+            err, verdict, body = self.review_round(path, head, rules, rnd)
+            if err:
+                return FAIL, err, "dance-review.txt"
+            if verdict == "APPROVE":
+                break
+            if rnd == 2:
+                return FAIL, "the reviewer returned CHANGES twice (once more after one fix round): %s" % " ".join(body.split())[:140], "dance-review.txt"
+            # one reasonable CHANGES: exactly one fix beat by Claude, then one re-review at the new head
+            rid_fix = "FIX" + t
+            old_head = head
+            self.wait_idle(c)
+            self.send(c, "The reviewer asked for changes on the poem PR. Fix exactly what it found, in poem.md inside %s "
+                         "(Edit or Write tool on that path), then run: cd %s && git add poem.md && git commit -q -m "
+                         "'Address review' . Do not run wt merge and do not push. Then reply DONE. The finding: %s (run id %s)"
+                         % (path, shlex.quote(path), " ".join(body.split())[:1200], rid_fix))
+            if not self.wait_for(lambda: self.git(path, "rev-parse", "HEAD").stdout.strip() != old_head, 240):
+                return FAIL, "after the first CHANGES, Claude made no fix commit in the `poem` worktree within 240 s", "dance-review.txt"
+            self.wait_idle(c, 90)
+            head = self.git(path, "rev-parse", "HEAD").stdout.strip()
+            diff = self.git(path, "diff", "origin/main...HEAD").stdout
+            self.stub_pr(path, head, diff)
+            fixed = True
         if any(x[:2] == ["pr", "merge"] for x in self.gh_calls()):
             return FAIL, "a merge happened before the user's yes", "dance-review.txt"
         # d) the merge question: Claude asks, the user types yes, the real hook records it
@@ -509,8 +552,9 @@ class Dance(sl.Live):
             return FAIL, "the sandbox grants file has no grant for PR 7 with the prompt `yes` (%s)" % json.dumps(gr)[:120], None
         if not any("Merge authorized by the user" in str(p.get("body")) for p in self.posted_comments()):
             return FAIL, "wt merge posted no authorization comment", None
-        return PASS, ("wt merge refused before a review; Codex's APPROVE sits at the PR head; the typed yes was recorded by "
-                      "the real hook and the merge went through the stub gh"), "dance-review.txt"
+        return PASS, ("wt merge refused before a review; %sCodex's APPROVE sits at the final PR head; the typed yes was "
+                      "recorded by the real hook and the merge went through the stub gh"
+                      % ("Codex asked for one change, Claude fixed it, and the re-review passed; " if fixed else "")), "dance-review.txt"
 
     # -- scene 6 --------------------------------------------------------------------------------
     def scene_news(self):
