@@ -717,6 +717,8 @@ def render_status(st, width=WATCH_W):
     elif st.get("phase") == "done":
         counts += "   done (q to close)"
     hint = "Enter: next step (with --step)   p: pause   q: quit and clean up"
+    if st.get("note"):  # a scenario's line to the viewer (the dance: "user types: yes"); aborted shows its own
+        hint = st["note"]
     return [head[:width], counts[:width], hint[:width]]
 
 
@@ -1796,6 +1798,11 @@ def selftest():
               st == FAIL and "Claude config dir" in detail, "%s %s" % (st, detail))
     finally:
         shutil.rmtree(live.root, ignore_errors=True)
+
+    # the dance scenario's offline checks (its own file; imported here, not at module load)
+    load_scenario("dance")
+    import dance
+    dance.offline_checks(check)
 
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
@@ -3375,6 +3382,30 @@ class Live:
         return None
 
 
+def scenario_problem(a):
+    """Why --scenario cannot run with these arguments (None when it can): a scenario is a watch run
+    of its own steps, so the proof suite's filters mean nothing to it."""
+    if not getattr(a, "scenario", None):
+        return None
+    if not a.watch:
+        return "--scenario needs --watch"
+    for flag, val in (("--feature", a.feature), ("--only", a.only), ("--codex-alone", a.codex_alone)):
+        if val:
+            return "--scenario %s cannot be combined with %s" % (a.scenario, flag)
+    return None
+
+
+def load_scenario(name):
+    """The Live subclass for --scenario NAME. Imported here, not at module load, so the proof suite
+    never pulls a scenario in; the running module is registered under its import name first, so the
+    scenario's `import selftest_live` gets THIS module and not a second copy."""
+    sys.modules.setdefault("selftest_live", sys.modules[__name__])
+    if name == "dance":
+        import dance
+        return dance.Dance
+    raise ValueError("unknown scenario %r" % name)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Live selftest: real Claude Code and Codex sessions in a sandbox")
     ap.add_argument("--only", choices=("claude", "codex"))
@@ -3390,6 +3421,8 @@ def main():
     ap.add_argument("--step", action="store_true", help="watch mode: hold each step until Enter is pressed in the status pane")
     ap.add_argument("--leak-terms", metavar="FILE", help="watch mode: also abort when any term in FILE (one per line) is on screen")
     ap.add_argument("--no-hold-final", action="store_true", help="watch mode: tear down when the run ends instead of waiting for q")
+    ap.add_argument("--scenario", choices=("dance",),
+                    help="watch mode: run a scripted scenario instead of the proof suite (dance: Claude and Codex work together)")
     ap.add_argument("--status-pane", nargs=2, metavar=("STATUS", "FIFO"), help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.status_pane:
@@ -3397,6 +3430,10 @@ def main():
         return 0
     if a.selftest:
         return selftest()
+    bad = scenario_problem(a)
+    if bad:
+        print(bad, file=sys.stderr)
+        return 2
     if a.codex_alone:
         if a.only == "claude":
             print("--codex-alone has no Claude: it cannot be combined with --only claude", file=sys.stderr)
@@ -3415,7 +3452,7 @@ def main():
     if a.feature and not a.feature <= known:
         print("unknown feature(s): %s" % ", ".join(sorted(a.feature - known)), file=sys.stderr)
         return 2
-    live = Live(a)
+    live = load_scenario(a.scenario)(a) if a.scenario else Live(a)
     results, lines, kept = execute(live)
     out = [render_table(results, pane_rows=live.PANE_ROWS if live.watch else (), features=live.FEATURES)] + [redact(ln) for ln in lines]
     if kept:

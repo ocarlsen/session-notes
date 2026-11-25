@@ -1,4 +1,4 @@
-.PHONY: test leak check hooks drift selftest-live selftest-watch
+.PHONY: test leak check hooks drift selftest-live selftest-watch dance-watch
 
 # Everything CI runs, plus the private-term leak scan.
 check: test leak
@@ -27,3 +27,7 @@ selftest-live:
 # Pass options through ARGS, e.g. make selftest-watch ARGS="--pace 2 --step".
 selftest-watch:
 	python3 tests/live/selftest_live.py --watch $(ARGS)
+
+# The story film: a Claude and a Codex session work together (docs/tools.md, Dance scenario).
+dance-watch:
+	python3 tests/live/selftest_live.py --watch --scenario dance $(ARGS)
