@@ -298,9 +298,11 @@ def cmd_apply(path, dry, repo=REPO, local=None):
     new = compute(old, block, snippet_headings(repo), known_lines(repo))
     size = len(new.encode("utf-8"))
     if size > MAX_BYTES:
-        raise RulesError("%s would be %d bytes; Codex caps the combined size of the global and "
-                         "project AGENTS.md files at 32 KiB (%d bytes). Trim the file, or the "
-                         "addendum, and run again" % (tilde(path), size, MAX_BYTES))
+        raise RulesError("%s would be %d bytes, over 32 KiB (%d bytes). Codex's "
+                         "project_doc_max_bytes (32 KiB by default) limits project AGENTS.md "
+                         "files, not this global one; session-notes keeps the global file under "
+                         "the same size to stay safe. Trim the file, or the addendum, and run "
+                         "again" % (tilde(path), size, MAX_BYTES))
     if len(block.encode("utf-8")) > BLOCK_WARN_BYTES:
         print("warning: the session-notes block alone is %d bytes (over %d); it uses much of the "
               "Codex budget" % (len(block.encode("utf-8")), BLOCK_WARN_BYTES), file=sys.stderr)
@@ -653,7 +655,10 @@ def selftest():
             msg = ""
         except RulesError as exc:
             msg = str(exc)
-        check("oversize message names the combined 32 KiB cap", "combined size" in msg and "32 KiB" in msg)
+        check("oversize message names the 32 KiB project-file cap",
+              "32 KiB" in msg and "project_doc_max_bytes" in msg and "project AGENTS.md" in msg)
+        check("oversize message does not claim a combined global+project cap",
+              msg != "" and "combined size" not in msg and "global and project" not in msg)
 
         # duplicate markers refuse
         open(agents, "w").write(BEGIN + "\na\n" + END + "\n" + BEGIN + "\nb\n" + END + "\n")
