@@ -437,7 +437,8 @@ else claude), with the same naming, lineage, staged and auto-start modes and `--
 
 A staged Codex pane needs the session-notes hooks trusted (`/hooks`); the parked spec arrives
 on the first prompt typed in the pane. To have idle
-recipients of bus mail woken instead, keep `bin/bus_nudge.py` running: on macOS
+recipients of bus mail woken instead (plain bus mail only: a staged spec is never woken,
+only a typed prompt releases it), keep `bin/bus_nudge.py` running: on macOS
 `python3 bin/launch_agents.py install bus-nudge` starts it at login and restarts it
 if it exits; or run it in its own tmux session. Only one loop runs at a time. A session launched with `handoff_session.py` records its parent at
 startup (tmux `-e` env read by the pane-registry hook), which is what `--tree`
