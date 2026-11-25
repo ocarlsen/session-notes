@@ -55,7 +55,7 @@ NEW to this session: report each item as new, never "no material changes".
 | `append_memory_index.py`, writing a memory file, editing RESUME.md | `codex_save.py stage` then `codex_save.py commit` (see Writing memory) |
 | `reflect_lock.py acquire` / `wait` / `release` | none: `codex_save.py commit` takes, waits for and releases the lock |
 | `<paths.claude_home>` | `<paths.agent_home>` (the Codex home, `~/.codex`) |
-| CLAUDE.md (global and project) | AGENTS.md: global `~/.codex/AGENTS.md`; project = the AGENTS.md files from the git root down to cwd. Codex caps their combined size at 32 KiB and has no `@import`. |
+| CLAUDE.md (global and project) | AGENTS.md: global `~/.codex/AGENTS.md`; project = the AGENTS.md files from the git root down to cwd. Codex stops adding project files once their combined size reaches `project_doc_max_bytes` (32 KiB by default; the global file does not count toward it) and has no `@import`. |
 | "loads via `@import` in CLAUDE.md"; "add the import or the store is an orphan" | the Codex SessionStart hook loads both stores' MEMORY.md and RESUME.md at startup, resume and after compaction. No import to add. A file over the hook's budget is named, not loaded, so keep MEMORY.md and RESUME.md short. |
 | `$CLAUDE_CODE_SESSION_ID` | `$CODEX_THREAD_ID` (the helpers read it themselves in codex mode) |
 | the transcript on disk | this conversation as you see it; Codex's transcript file format is not stable, so never parse it |

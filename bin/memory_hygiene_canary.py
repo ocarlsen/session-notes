@@ -870,7 +870,7 @@ def _codex_config_values(text):
             try:
                 found[key] = _toml_value(raw)
             except ValueError as exc:
-                found[key] = _Bad("%s (value %s)" % (exc, raw))
+                found[key] = _Bad("%s (value %s)" % (exc, raw) if raw.strip() else str(exc))
     return found
 
 
@@ -1869,6 +1869,9 @@ def selftest():
                     cfg_f = [f for f in got if f.startswith("CODEX CONFIG")]
                     check(len(cfg_f) == 1 and (key in cfg_f[0] or saved_tomllib is not None and not force_scanner) and not any("RAISED" in f for f in got),
                           "codex config: empty value %r is one finding, no exception (%s)"
+                          % (text.strip(), "scanner" if force_scanner else "default parser"))
+                    check(not any("(value )" in f for f in cfg_f),
+                          "codex config: empty value %r shows no blank '(value )' (%s)"
                           % (text.strip(), "scanner" if force_scanner else "default parser"))
         finally:
             _tomllib = saved_tomllib
