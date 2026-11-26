@@ -22,7 +22,9 @@ The command is parsed BEFORE the config is loaded, so a broken config refuses on
 that writes some RESUME.md, never `cat`/`grep`/`git log` on one. The old RESUME.md of a scope
 that migrated to a shared store is refused ("write the shared store's RESUME.md instead").
 Known limits, as with checkout_guard: a program that writes on its own (`python3 script.py`), and
-a path built from `$VAR` or `"$HOME/..."` (not expanded) are not seen.
+a path built from `$VAR` or `"$HOME/..."` (not expanded) are not seen. Also not caught, because
+the parser knows redirects, tee, sed/perl -i, cp/mv/rm/install/ln/unlink, truncate and dd of=, and not: rsync, `git checkout --`,
+patch, `sort -o`, sponge, ed and `find -delete`. This hook is a net for the common slip, not a wall.
 
     python3 resume_size_guard.py --selftest
 """
