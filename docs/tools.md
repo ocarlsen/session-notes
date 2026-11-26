@@ -382,7 +382,10 @@ home, and outside the state dir, which holds no memory.
 - **Two reflect locks.** An opted-in scope takes the state-dir lock first (so it still excludes a
   reflect in another scope that writes the global store), then `<shared store>/.reflect.lock`, so
   a Claude and a Codex reflect on the same store take turns on one file. Always that order, in
-  both modes; release is the reverse; a refused second acquire releases the first. The scope is
+  both modes; release is the reverse; a refused second acquire releases the first. The list is
+  recorded in the state lock, so a release from another folder frees both. `codex_save.py commit`
+  builds its list from the stores its queued items write (any under the shared stores dir), not
+  from the cwd. The scope is
   the one holding the working folder, or `reflect_lock.py ... --scope NAME`. Other folders take
   only the state-dir lock.
 - **No built-in backup.** The shared store is plain files under `paths.shared_stores_dir`. Nothing

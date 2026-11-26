@@ -29,7 +29,11 @@ is printed with its file count. A scope `manifest` that sits in an old store is 
 What "entry" means:
   * MEMORY.md, REFERENCE.md, RESUME.md, RESUME-archive.md: each non-blank line. The Claude file
     is kept verbatim; a Codex line that is not already present (counted, not just set-wise) is
-    appended after it (RESUME files get a marker line first). The check compares line multisets.
+    appended after it (RESUME files get a marker line first). In the RESUME files the Codex `##`
+    sections are kept: a Codex heading is re-emitted before its surviving lines even when Claude
+    has the same heading (so it can appear twice), and a Codex section whose lines are all
+    already present is dropped with its heading. The check compares line multisets, computed
+    from the two sources independently of the merge code (headings by their own rule).
   * every other top-level *.md: one memory file. Same name in both stores with identical text
     lands once. Same name with DIFFERENT text is two harness-specific versions: the Claude copy
     keeps its name with `harness: claude`, the Codex copy lands as <stem>.codex.md with
@@ -294,6 +298,36 @@ def build(cfg, scope, labels=None, over=None):
 
 
 # ---------------------------------------------------------------- the check
+def _expected_entries(name, c, x, relabel):
+    """Counter of the non-blank lines a correct merge of line file `name` holds (the MARKER
+    excluded). Computed from the two sources alone, NOT with _codex_extras, so a bug in the merge
+    cannot make its own check pass. Non-heading lines: every Claude line, plus each Codex line
+    beyond the count Claude already has. RESUME files add the heading rule: a Codex `##` heading
+    appears once for each Codex section that still has a surviving line."""
+    cl = [_transform_line(ln, "claude", relabel) for ln in c.split("\n") if ln.strip()] if c is not None else []
+    xl = [_transform_line(ln, "codex", relabel) for ln in x.split("\n") if ln.strip()] if x is not None else []
+    want = collections.Counter(cl)
+    if c is None:
+        return collections.Counter(xl)
+    have = collections.Counter(cl)
+    marked = name in MARKED_FILES
+    head, head_alive = None, False
+    for ln in xl:
+        if marked and _HEADING_RE.match(ln):
+            if head is not None and head_alive:
+                want[head] += 1
+            head, head_alive = ln, False
+            continue
+        if have[ln] > 0:
+            have[ln] -= 1
+        else:
+            want[ln] += 1
+            head_alive = True
+    if marked and head is not None and head_alive:
+        want[head] += 1
+    return want
+
+
 def verify(cfg, scope, dest, labels=None, over=None):
     """Re-read `dest` and the two legacy stores. Returns [finding] (empty = every original entry
     landed exactly once). Does not use build()'s output text: it checks the files on disk."""
@@ -308,20 +342,7 @@ def verify(cfg, scope, dest, labels=None, over=None):
         c, x = files["claude"].get(name), files["codex"].get(name)
         if name in LINE_FILES:
             expected_names.add(name)
-            want = collections.Counter()
-            have = collections.Counter()
-            for agent, text in (("claude", c), ("codex", x)):
-                if text is None:
-                    continue
-                lines = [_transform_line(ln, agent, relabel) for ln in text.split("\n")]
-                if agent == "claude":
-                    have = collections.Counter(ln for ln in lines if ln.strip())
-                    want = collections.Counter(have)
-                elif c is None:
-                    want.update(ln for ln in lines if ln.strip())
-                else:
-                    c_lines = [_transform_line(ln, "claude", relabel) for ln in c.split("\n")]
-                    want.update(ln for ln in _codex_extras(c_lines, lines, name in MARKED_FILES) if ln.strip())
+            want = _expected_entries(name, c, x, relabel)
             out = collections.Counter(ln for ln in _nonblank(got.get(name, "")) if ln != MARKER)
             if name not in got:
                 bad.append("%s: missing from the shared store" % name)
@@ -408,7 +429,12 @@ def cmd_migrate(args):
     root = cfg["paths"]["shared_stores_dir"]
     if not notes_config._under(dest, root):
         raise MigrationError("destination %s is outside the shared stores root %s" % (dest, root))
-    if os.path.isdir(dest) and os.listdir(dest):
+    names = os.listdir(dest) if os.path.isdir(dest) else []
+    if ".reflect.lock" in names and not [n for n in names if not n.startswith(".")]:
+        print("shared_store: %s holds a reflect lock (.reflect.lock): a reflect is running on, or crashed "
+              "in, this store; wait for it or run reflect_lock.py status, then retry" % dest, file=sys.stderr)
+        return 2
+    if [n for n in names if not n.startswith(".")]:
         have, _ = _entries(dest)
         if have != outputs:
             print("shared_store: %s already has different content; refusing to overwrite it" % dest, file=sys.stderr)
@@ -436,7 +462,17 @@ def cmd_migrate(args):
             return 1
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if os.path.isdir(dest):
-            os.rmdir(dest)  # empty (checked above)
+            # no entries (checked above); a leftover mutex file of a broken stale lock is not content
+            try:
+                os.unlink(os.path.join(dest, ".reflect.lock.breaking"))
+            except FileNotFoundError:
+                pass
+            try:
+                os.rmdir(dest)
+            except OSError:
+                print("shared_store: %s is not empty (%s); refusing to move into place"
+                      % (dest, ", ".join(sorted(os.listdir(dest)))), file=sys.stderr)
+                return 2
         os.rename(tmp, dest)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -514,6 +550,7 @@ def main(argv=None):
 
 
 def selftest():
+    import json
     global build
     import hashlib
     import json
@@ -651,6 +688,30 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         cs(["stage", "--store", "project", "--index-line", "- [From Codex](project_from_codex.md) - learned in Codex"])
         rc, out, err = cs(["commit"])
         check("codex_save commit writes the shared store", rc == 0 and os.path.isfile(os.path.join(shared, "project_from_codex.md")), (rc, out, err))
+
+        # commit locks the stores its ITEMS write, not the cwd: a held store lock stops a shared-store
+        # commit run from a folder outside the scope (red if commit used try_acquire on the state lock alone)
+        commit_py = codex_save_py.replace("sys.exit(c.main(sys.argv[1:]))", "sys.exit(c.commit(timeout=1))")
+        rc, out, err = cs(["stage", "--store", "project", "--file", "project_locked.md"],
+                          "---\nname: locked\ndescription: d\nmetadata:\n  type: project\n---\nlocked fact\n")
+        cs(["stage", "--store", "project", "--index-line", "- [Locked](project_locked.md) - written under a lock"])
+        store_lock = os.path.join(shared, ".reflect.lock")
+        with open(store_lock, "w") as fh:
+            json.dump({"id": "sid-other", "session": "other", "pid": os.getpid(), "pid_source": "claude"}, fh)
+        rc, out, err = sub([sys.executable, "-c", commit_py], "", penv, cwd=d)
+        check("a held store lock makes a shared-store commit refuse, even from a cwd outside the scope",
+              rc == 2 and "still held" in err and not os.path.exists(os.path.join(shared, "project_locked.md")), (rc, out, err))
+        check("the refused commit left no lock of its own behind",
+              not [r_ for r_, _, fs in os.walk(d) for f_ in fs if f_ == "reflect.lock"]
+              and json.load(open(store_lock))["id"] == "sid-other")
+        os.unlink(store_lock)
+        rc, out, err = sub([sys.executable, "-c", commit_py], "", penv, cwd=d)
+        check("with the store lock free the same commit writes, and releases both locks",
+              rc == 0 and os.path.isfile(os.path.join(shared, "project_locked.md")) and not os.path.exists(store_lock), (rc, out, err))
+        # clean up so the later fixture counts see the store as before this test
+        os.unlink(os.path.join(shared, "project_locked.md"))
+        idx = os.path.join(shared, "MEMORY.md")
+        w(idx, "".join(ln for ln in r(idx).splitlines(True) if "project_locked.md" not in ln))
         claude_store = sc["claude"]["pilot"]["store"]
         check("Claude's resolved store sees the Codex-written fact and index line",
               "codex fact" in r(os.path.join(claude_store, "project_from_codex.md"))
@@ -842,6 +903,32 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         finally:
             build = real_build
         check("migrate fails RED when a memory file is dropped", rc == 1 and not os.path.exists(shared))
+
+        # verify() must not trust the merge's own selection: break _codex_extras so it drops the
+        # Codex-only lines of RESUME.md and MEMORY.md (the merge writes without them) and the
+        # independent expectation must still catch it.
+        global _codex_extras
+        real_extras = _codex_extras
+
+        def lossy_extras(c_lines, x_lines, keep_sections):
+            return [ln for ln in real_extras(c_lines, x_lines, keep_sections) if "x1" not in ln and "[X]" not in ln]
+        _codex_extras = lossy_extras
+        try:
+            rc = main(["migrate", "--scope", "pilot"])
+        finally:
+            _codex_extras = real_extras
+        check("migrate fails RED when the merge drops a Codex-only line (verify is independent of _codex_extras)",
+              rc == 1 and not os.path.exists(shared))
+
+        # a lock file in a not-yet-migrated store: a held lock is named as the reason; the
+        # permanent .breaking mutex is not content and does not block the migration
+        os.makedirs(shared)
+        w(os.path.join(shared, ".reflect.lock"), "{}")
+        rc, out, err = sub(sstore + ["migrate", "--scope", "pilot"])
+        check("migrate refuses with the lock as the reason, not 'different content'",
+              rc == 2 and "reflect lock" in err and "different content" not in err, (rc, err))
+        os.unlink(os.path.join(shared, ".reflect.lock"))
+        w(os.path.join(shared, ".reflect.lock.breaking"), "")
         rc, out, err = sub(sstore + ["migrate", "--scope", "pilot"])
         check("migrate succeeds on the real merge and says every entry landed once",
               rc == 0 and "landed exactly once" in out, (rc, out, err))

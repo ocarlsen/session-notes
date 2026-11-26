@@ -230,6 +230,25 @@ def apply_item(item):
     raise SaveError("unknown staged kind %r" % item.get("kind"))
 
 
+def commit_lock_paths(qdir, names):
+    """The locks a commit takes, from the stores its queued items write (never the cwd): the state
+    lock first, then <store>/.reflect.lock for each distinct item store under the shared stores
+    dir, sorted, so every writer takes them in the same order as `reflect_lock.py`."""
+    cfg = notes_config.load()
+    root = os.path.realpath(cfg["paths"]["shared_stores_dir"])
+    stores = set()
+    for n in names:
+        try:
+            with open(os.path.join(qdir, n), encoding="utf-8") as fh:
+                store = json.load(fh).get("store")
+        except (OSError, ValueError):
+            continue
+        if isinstance(store, str) and notes_config._under(store, root) and os.path.realpath(store) != root:
+            stores.add(os.path.realpath(store))
+    return [notes_config.state_path("reflect.lock", cfg=cfg)] + [
+        os.path.join(st, ".reflect.lock") for st in sorted(stores)]
+
+
 def commit(timeout=LOCK_TIMEOUT):
     d = queue_dir()
     names = sorted(n for n in os.listdir(d) if n.endswith(".json")) if os.path.isdir(d) else []
@@ -237,10 +256,11 @@ def commit(timeout=LOCK_TIMEOUT):
         print("nothing staged for this thread")
         return 0
     ident, label, pid, pid_source = reflect_lock.my_identity()
+    lock_list = commit_lock_paths(d, names)
     deadline = time.time() + timeout
     said = False
     while True:
-        r = reflect_lock.acquire_all(ident, label, pid, pid_source)
+        r = reflect_lock.acquire_all(ident, label, pid, pid_source, paths=lock_list)
         if r in ("acquired", "mine"):
             break
         if time.time() >= deadline:
@@ -273,7 +293,7 @@ def commit(timeout=LOCK_TIMEOUT):
             pass
     finally:
         if took_it:
-            reflect_lock.release_all(ident, label)
+            reflect_lock.release_all(ident, label, paths=lock_list)
             print("released the reflect lock")
     return rc
 
