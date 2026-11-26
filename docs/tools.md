@@ -377,7 +377,13 @@ home, and outside the state dir, which holds no memory.
   to opt in, so pass the old folder with `--claude-store PATH` (and `--codex-store PATH`; point it
   at an empty folder for an agent that never had a store). A scope `manifest` that sits in an old
   store is not copied (it is structural), and `MIGRATED-FROM.txt` says to keep it. Both commands
-  warn when the merged RESUME.md is over its budget.
+  warn when the merged RESUME.md is over its budget. A Codex RESUME keeps its `##` sections in
+  the merge (heading, then the lines Claude lacks, one blank line between sections).
+- **One reflect lock.** An opted-in scope locks on `<shared store>/.reflect.lock`, so a Claude and
+  a Codex reflect on the same store take turns on one file. The scope is the one holding the
+  working folder, or `reflect_lock.py ... --scope NAME`. Other folders keep the state-dir lock.
+- **No built-in backup.** The shared store is plain files under `paths.shared_stores_dir`. Nothing
+  here copies it anywhere; route that folder through your own backup.
 
 ### RESUME size guard
 
@@ -400,7 +406,8 @@ simulated. A RESUME.md target with a config that does not load is refused, never
 The command is parsed before the config is loaded, so a broken config refuses only a command that
 writes a RESUME.md, never `cat`, `grep` or `git log` on one. Known limits: a program that writes on
 its own (`python3 script.py`), and a path built from `$VAR` or `"$HOME/..."` (not expanded), are
-not seen.
+not seen. Also not caught: `rsync`, `git checkout --`, `patch`, `sort -o`, `sponge`, `ed` and
+`find -delete`. The hook is a net for the common slip, not a wall.
 
 ## live: what just happened, across scopes
 

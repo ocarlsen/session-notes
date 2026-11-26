@@ -191,6 +191,48 @@ def _nonblank(text):
     return [ln for ln in text.split("\n") if ln.strip()]
 
 
+_HEADING_RE = re.compile(r"^#{2,6}\s")
+
+
+def _codex_extras(c_lines, x_lines, keep_sections):
+    """The Codex lines to append after the Claude text. A line already in the Claude text is
+    dropped (counted, not set-wise). With keep_sections (RESUME files), a `##` heading of the
+    Codex file is kept, even when Claude has the same heading, for every section that still has
+    a kept line, and a blank line separates sections. One home for the merge and for verify()."""
+    have = collections.Counter(ln for ln in c_lines if ln.strip())
+    if not keep_sections:
+        extra = []
+        for ln in x_lines:
+            if not ln.strip():
+                continue
+            if have[ln] > 0:
+                have[ln] -= 1
+            else:
+                extra.append(ln)
+        return extra
+    sections, head, body = [], None, []
+    for ln in x_lines:
+        if _HEADING_RE.match(ln):
+            sections.append((head, body))
+            head, body = ln, []
+        elif ln.strip():
+            if have[ln] > 0:
+                have[ln] -= 1
+            else:
+                body.append(ln)
+    sections.append((head, body))
+    extra = []
+    for head, body in sections:
+        if not body:
+            continue
+        if extra:
+            extra.append("")
+        if head:
+            extra.append(head)
+        extra.extend(body)
+    return extra
+
+
 def _merge_lines(name, c_text, x_text, relabel):
     """Merged text of a line file: the Claude text, then the Codex lines it lacks."""
     c_lines = [_transform_line(ln, "claude", relabel) for ln in (c_text or "").split("\n")] if c_text is not None else None
@@ -199,15 +241,7 @@ def _merge_lines(name, c_text, x_text, relabel):
         return "\n".join(x_lines)
     if x_lines is None:
         return "\n".join(c_lines)
-    have = collections.Counter(ln for ln in c_lines if ln.strip())
-    extra = []
-    for ln in x_lines:
-        if not ln.strip():
-            continue
-        if have[ln] > 0:
-            have[ln] -= 1
-        else:
-            extra.append(ln)
+    extra = _codex_extras(c_lines, x_lines, name in MARKED_FILES)
     out = list(c_lines)
     if extra:
         while out and not out[-1].strip():
@@ -279,13 +313,15 @@ def verify(cfg, scope, dest, labels=None, over=None):
             for agent, text in (("claude", c), ("codex", x)):
                 if text is None:
                     continue
-                mine = collections.Counter(_transform_line(ln, agent, relabel) for ln in _nonblank(text))
+                lines = [_transform_line(ln, agent, relabel) for ln in text.split("\n")]
                 if agent == "claude":
-                    have = mine
-                    want = collections.Counter(mine)
+                    have = collections.Counter(ln for ln in lines if ln.strip())
+                    want = collections.Counter(have)
+                elif c is None:
+                    want.update(ln for ln in lines if ln.strip())
                 else:
-                    for ln, n in mine.items():
-                        want[ln] += max(0, n - have.get(ln, 0))
+                    c_lines = [_transform_line(ln, "claude", relabel) for ln in c.split("\n")]
+                    want.update(ln for ln in _codex_extras(c_lines, lines, name in MARKED_FILES) if ln.strip())
             out = collections.Counter(ln for ln in _nonblank(got.get(name, "")) if ln != MARKER)
             if name not in got:
                 bad.append("%s: missing from the shared store" % name)
@@ -868,6 +904,20 @@ sys.exit(c.main(sys.argv[1:]))""" % (BIN, queue)
         check("migrate from the custom store lands its files",
               rc == 0 and os.path.isfile(os.path.join(shared_root, notes_config.encode_project_dir(cust), "c.md")), (rc, out, err))
 
+    # RESUME merge keeps the Codex `##` sections (headings and blank-line separation), also
+    # when Claude has the same heading; the plain line files stay flat.
+    rel = {"claude": {}, "codex": {}}
+    c_res = "# RESUME\n\n## Open\n\n- c1\n\n## Done\n\n- c2\n"
+    x_res = "# RESUME\n\n## Open\n\n- x1\n- c1\n\n## Notes\n\n- x2\n\n## Same\n\n- c2\n"
+    tail = _merge_lines("RESUME.md", c_res, x_res, rel).split(MARKER, 1)[1]
+    check("RESUME merge keeps the Codex section headings, in order, with blank separators",
+          "\n## Open\n- x1\n\n## Notes\n- x2\n" in tail
+          and tail.index("## Open") < tail.index("- x1") < tail.index("## Notes") < tail.index("- x2"), tail)
+    check("RESUME merge drops a Codex section whose lines are all already in Claude's text",
+          "## Same" not in tail and "- c1" not in tail and "- c2" not in tail, tail)
+    check("a plain line file (MEMORY.md) is still merged flat",
+          _merge_lines("MEMORY.md", "- a\n", "## h\n- b\n", rel).split("\n")[-3:] == ["## h", "- b", ""],
+          _merge_lines("MEMORY.md", "- a\n", "## h\n- b\n", rel))
     for k, v in saved.items():
         if v is None:
             os.environ.pop(k, None)

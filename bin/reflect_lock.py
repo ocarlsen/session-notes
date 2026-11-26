@@ -15,7 +15,7 @@ Contract (wired into the rnr / reflect skills):
   - On contention, WAIT (poll): never ask the user "wait or go?", never clobber.
   - A stale lock (holder crashed / never released) is broken LOUDLY after STALE_SECS.
 
-Commands:
+Commands (each also takes [--scope NAME], see below):
   acquire [--session NAME]   0 = acquired (or already yours); 1 = held by another
   release [--force]          0 = released / not held; 1 = held by another (no --force)
   status                     prints holder + age; 0 = free, 1 = held
@@ -28,6 +28,15 @@ Lock file: <state_dir>/reflect.lock (state_dir from the config).
 (JSON: id, session, pid, pid_source, ts).
 One GLOBAL lock on purpose: reflects are short (minutes) and rare, and a scope session
 often writes both its own store and the global store, so per-scope locks would miss that.
+
+The exception is a scope that opted into the shared store (`shared_store = true`, #88): its
+Claude and Codex reflects write the SAME directory but, in codex mode, `state_dir` moves under
+the Codex home, so the global file would be two different files. For such a scope the lock is
+<shared store>/.reflect.lock, one file for both agents. The scope is the one whose root holds
+the working directory (the same rule the stores use), or the one named by `--scope NAME`
+(pins it when the cwd moved between acquire and release). Any other folder keeps the global
+lock. Note a shared-store reflect therefore no longer excludes a reflect in another scope that
+also writes the global store.
 
 IDENTITY. "You" used to be the tmux session name, falling back to
 `pid-{os.getppid()}@host` when $TMUX was unset. That fallback is not an identity: every
@@ -73,15 +82,37 @@ import notes_config  # noqa: E402
 # None = resolve from the config on first use (see lock_path()). The selftest
 # repoints it at a temp dir.
 LOCK = None
+SCOPE = None  # a scope name pinned by --scope; None = infer from the cwd
 STALE_SECS = 10 * 60  # a reflect should never take this long; beyond it = crashed holder
 POLL_SECS = 5
 
 
+def shared_scope_lock(cfg, scope_name=None, cwd=None):
+    """<shared store>/.reflect.lock when the named scope (or the one holding `cwd`, deepest
+    root) opted into the shared store, else None. An unknown scope name is a ConfigError."""
+    scope = None
+    if scope_name:
+        scope = next((s for s in cfg["scopes"] if s["name"] == scope_name), None)
+        if scope is None:
+            raise notes_config.ConfigError("reflect_lock: no scope named %r in the config" % scope_name)
+    else:
+        cwd = os.path.realpath(os.path.expanduser(cwd or os.getcwd()))
+        for s in cfg["scopes"]:
+            if notes_config._under(cwd, s["root"]) and (scope is None or len(s["root"]) > len(scope["root"])):
+                scope = s
+    if scope and scope.get("shared_store"):
+        return os.path.join(scope["store"], ".reflect.lock")
+    return None
+
+
 def lock_path():
-    """The lock file: LOCK if set, else <state_dir>/reflect.lock from the config."""
+    """The lock file: LOCK if set, else the shared store's .reflect.lock for an opted-in
+    scope, else <state_dir>/reflect.lock from the config."""
     global LOCK
     if LOCK is None:
-        LOCK = notes_config.state_path("reflect.lock")
+        cfg = notes_config.load()
+        LOCK = (shared_scope_lock(cfg, SCOPE)
+                or notes_config.state_path("reflect.lock", cfg=cfg))
     return LOCK
 
 
@@ -311,6 +342,94 @@ def try_acquire(ident, label, pid, pid_source):
         )
     return "acquired"
 
+
+
+def _selftest_shared_scope():
+    """A shared-store scope locks on <store>/.reflect.lock in BOTH agent modes (one file), a
+    plain scope and a folder outside every scope keep the state-dir lock, and a lock held in
+    one mode blocks the other. Temp HOME + config; every path asserted under the sandbox."""
+    import tempfile
+    global LOCK, SCOPE
+    fails = []
+
+    def check(name, cond, detail=""):
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}" + ("" if cond else f"  {detail!r}"))
+        if not cond:
+            fails.append(name)
+
+    keys = ("HOME", "SESSION_NOTES_CONFIG", "SESSION_NOTES_AGENT", "CODEX_THREAD_ID",
+            "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "TMUX", "TMUX_PANE")
+    saved = {k: os.environ.get(k) for k in keys}
+    real_lock, real_scope, real_cwd = LOCK, SCOPE, os.getcwd()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            os.environ["HOME"] = d
+            for k in ("TMUX", "TMUX_PANE", "CLAUDE_PID"):
+                os.environ.pop(k, None)
+            shared_root = os.path.join(d, "stores")
+            proot, qroot, outside = (os.path.join(d, n) for n in ("pilot", "plain", "elsewhere"))
+            for r in (proot, qroot, outside):
+                os.makedirs(r)
+            cfgf = os.path.join(d, "c.toml")
+            with open(cfgf, "w") as fh:
+                fh.write(f'[paths]\nclaude_home = "{d}/claude"\nstate_dir = "{d}/state"\n'
+                         f'shared_stores_dir = "{shared_root}"\n[agent]\ncodex_home = "{d}/codex"\n'
+                         f'[[scopes]]\nname = "pilot"\nroot = "{proot}"\nshared_store = true\n'
+                         f'[[scopes]]\nname = "plain"\nroot = "{qroot}"\n')
+            os.environ["SESSION_NOTES_CONFIG"] = cfgf
+
+            def path_in(mode, cwd, scope=None):
+                global LOCK, SCOPE
+                os.environ["SESSION_NOTES_AGENT"] = mode
+                LOCK, SCOPE = None, scope
+                os.chdir(cwd)
+                return lock_path()
+
+            want = os.path.join(shared_root, notes_config.encode_project_dir(proot), ".reflect.lock")
+            pc, px = path_in("claude", proot), path_in("codex", proot)
+            check("shared scope: Claude and Codex resolve the SAME lock file", pc == px == want, (pc, px, want))
+            check("shared scope: --scope pins it from any cwd", path_in("claude", outside, "pilot") == want)
+            check("shared scope: a subfolder of the root finds it",
+                  path_in("codex", os.path.join(proot)) == want)
+            c_plain, x_plain = path_in("claude", qroot), path_in("codex", qroot)
+            check("plain scope: unchanged, the state-dir lock", c_plain == os.path.join(d, "state", "reflect.lock"), c_plain)
+            check("plain scope: codex mode still moves state (today's behavior)",
+                  x_plain.startswith(os.path.join(d, "codex")) and x_plain.endswith("reflect.lock"), x_plain)
+            check("outside every scope: unchanged", path_in("claude", outside) == os.path.join(d, "state", "reflect.lock"))
+            try:
+                path_in("claude", outside, "nope")
+                check("an unknown --scope is refused", False)
+            except notes_config.ConfigError as exc:
+                check("an unknown --scope is refused", "nope" in str(exc), str(exc))
+            check("every resolved path sits under the sandbox",
+                  all(x.startswith(d + os.sep) for x in (pc, px, c_plain, x_plain)))
+
+            # A lock one mode holds blocks the other, because they share the file.
+            os.environ.update(CODEX_THREAD_ID="thr-1", CLAUDE_CODE_SESSION_ID="sess-1")
+            path_in("claude", proot)
+            cid = my_identity()
+            check("claude takes the shared lock", try_acquire(*cid[:2], os.getpid(), "claude") == "acquired")
+            path_in("codex", proot)
+            xid = my_identity()
+            r = try_acquire(xid[0], xid[1], os.getpid(), "claude")
+            check("a held Claude lock blocks the Codex reflect on the same store",
+                  r != "acquired" and r != "mine", r)
+            check("the lock file lives in the shared store", os.path.isfile(want))
+            path_in("claude", proot)
+            os.unlink(lock_path())
+            path_in("codex", proot)
+            check("once released, Codex acquires it", try_acquire(xid[0], xid[1], os.getpid(), "claude") == "acquired")
+            os.unlink(lock_path())
+    finally:
+        os.chdir(real_cwd)
+        LOCK, SCOPE = real_lock, real_scope
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return fails
 
 
 def _selftest():
@@ -583,6 +702,7 @@ def _selftest():
     finally:
         LOCK = real
 
+    fails += _selftest_shared_scope()
     print("SELFTEST " + ("OK" if not fails else f"FAILED: {fails}"))
     return 1 if fails else 0
 
@@ -593,11 +713,20 @@ def main():
         return _selftest()
     ap.add_argument("cmd", choices=["acquire", "release", "status", "wait", "selftest"])
     ap.add_argument("--session", default=None)
+    ap.add_argument("--scope", default=None,
+                    help="pin the lock to this scope's shared store (default: the scope holding the cwd)")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
     if args.cmd == "selftest":
         return _selftest()
+    global SCOPE
+    SCOPE = args.scope
+    try:
+        lock_path()
+    except notes_config.ConfigError as exc:
+        print("reflect_lock: %s" % exc, file=sys.stderr)
+        return 2
     ident, label, pid, pid_source = my_identity()
     if args.session:
         # An explicit --session names BOTH, so a caller that passes one keeps the
