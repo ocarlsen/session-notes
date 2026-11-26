@@ -240,7 +240,7 @@ def commit(timeout=LOCK_TIMEOUT):
     deadline = time.time() + timeout
     said = False
     while True:
-        r = reflect_lock.try_acquire(ident, label, pid, pid_source)
+        r = reflect_lock.acquire_all(ident, label, pid, pid_source)
         if r in ("acquired", "mine"):
             break
         if time.time() >= deadline:
@@ -273,10 +273,7 @@ def commit(timeout=LOCK_TIMEOUT):
             pass
     finally:
         if took_it:
-            try:
-                os.unlink(reflect_lock.lock_path())
-            except FileNotFoundError:
-                pass
+            reflect_lock.release_all(ident, label)
             print("released the reflect lock")
     return rc
 

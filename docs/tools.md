@@ -379,9 +379,12 @@ home, and outside the state dir, which holds no memory.
   store is not copied (it is structural), and `MIGRATED-FROM.txt` says to keep it. Both commands
   warn when the merged RESUME.md is over its budget. A Codex RESUME keeps its `##` sections in
   the merge (heading, then the lines Claude lacks, one blank line between sections).
-- **One reflect lock.** An opted-in scope locks on `<shared store>/.reflect.lock`, so a Claude and
-  a Codex reflect on the same store take turns on one file. The scope is the one holding the
-  working folder, or `reflect_lock.py ... --scope NAME`. Other folders keep the state-dir lock.
+- **Two reflect locks.** An opted-in scope takes the state-dir lock first (so it still excludes a
+  reflect in another scope that writes the global store), then `<shared store>/.reflect.lock`, so
+  a Claude and a Codex reflect on the same store take turns on one file. Always that order, in
+  both modes; release is the reverse; a refused second acquire releases the first. The scope is
+  the one holding the working folder, or `reflect_lock.py ... --scope NAME`. Other folders take
+  only the state-dir lock.
 - **No built-in backup.** The shared store is plain files under `paths.shared_stores_dir`. Nothing
   here copies it anywhere; route that folder through your own backup.
 

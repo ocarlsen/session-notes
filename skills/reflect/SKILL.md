@@ -251,8 +251,8 @@ Before ANY write in Steps 5 to 7:
 python3 $SESSION_NOTES/bin/reflect_lock.py acquire
 ```
 
-For a scope that shares its store between Claude and Codex, the lock is that store's own
-`.reflect.lock`, picked from the working folder (add `--scope NAME` to every lock command if
+For a scope that shares its store between Claude and Codex, the lock command takes two locks (the usual one, then that store's own
+`.reflect.lock`), picked from the working folder (add `--scope NAME` to every lock command if
 you have `cd`'d out of the scope between them). Exit 0 = acquired (or already yours). Exit 1 = held by another: do NOT ask "wait or go?". Say
 whose lock you're waiting on, run `python3 $SESSION_NOTES/bin/reflect_lock.py wait`
 **backgrounded** (`run_in_background: true`, never a foreground poll), and write only after it

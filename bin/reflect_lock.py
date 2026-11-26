@@ -29,14 +29,15 @@ Lock file: <state_dir>/reflect.lock (state_dir from the config).
 One GLOBAL lock on purpose: reflects are short (minutes) and rare, and a scope session
 often writes both its own store and the global store, so per-scope locks would miss that.
 
-The exception is a scope that opted into the shared store (`shared_store = true`, #88): its
+A scope that opted into the shared store (`shared_store = true`, #88) takes TWO locks: its
 Claude and Codex reflects write the SAME directory but, in codex mode, `state_dir` moves under
-the Codex home, so the global file would be two different files. For such a scope the lock is
-<shared store>/.reflect.lock, one file for both agents. The scope is the one whose root holds
-the working directory (the same rule the stores use), or the one named by `--scope NAME`
-(pins it when the cwd moved between acquire and release). Any other folder keeps the global
-lock. Note a shared-store reflect therefore no longer excludes a reflect in another scope that
-also writes the global store.
+the Codex home, so the state lock alone would be two different files. So it takes the state
+lock FIRST (still excluding any other scope's reflect that writes the global store), then
+<shared store>/.reflect.lock (one file for both agents). Always that order, in both modes, so
+two reflects cannot deadlock; release is the reverse order; if the second acquire is refused
+the first is released again, so a failed acquire holds nothing. status reports both. The scope
+is the one whose root holds the working directory (the store rule), or `--scope NAME` (pins it
+when the cwd moved between acquire and release). Any other folder takes only the state lock.
 
 IDENTITY. "You" used to be the tmux session name, falling back to
 `pid-{os.getppid()}@host` when $TMUX was unset. That fallback is not an identity: every
@@ -105,15 +106,80 @@ def shared_scope_lock(cfg, scope_name=None, cwd=None):
     return None
 
 
+def lock_paths(cfg=None):
+    """Every lock a reflect takes, in the ONE order they are taken: the state-dir lock first,
+    then, for a shared-store scope, <shared store>/.reflect.lock. A LOCK override (selftests)
+    is the only lock."""
+    if LOCK is not None:
+        return [LOCK]
+    cfg = cfg or notes_config.load()
+    paths = [notes_config.state_path("reflect.lock", cfg=cfg)]
+    shared = shared_scope_lock(cfg, SCOPE)
+    if shared:
+        paths.append(shared)
+    return paths
+
+
 def lock_path():
-    """The lock file: LOCK if set, else the shared store's .reflect.lock for an opted-in
-    scope, else <state_dir>/reflect.lock from the config."""
-    global LOCK
-    if LOCK is None:
-        cfg = notes_config.load()
-        LOCK = (shared_scope_lock(cfg, SCOPE)
-                or notes_config.state_path("reflect.lock", cfg=cfg))
-    return LOCK
+    """The primary lock file: LOCK if set, else <state_dir>/reflect.lock from the config."""
+    return lock_paths()[0]
+
+
+class _using:
+    """Point the single-lock helpers (read_lock, try_acquire, ...) at one path for a block."""
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        global LOCK
+        self.prev, LOCK = LOCK, self.path
+
+    def __exit__(self, *exc):
+        global LOCK
+        LOCK = self.prev
+
+
+def acquire_all(ident, label, pid, pid_source):
+    """Take every lock in lock_paths() order. Returns 'acquired' | 'mine' | holder-string.
+    If a later lock is refused, the earlier ones THIS call newly took are released, so a
+    failed acquire leaves nothing held. 'mine' = every lock was already ours."""
+    took = []
+    paths = lock_paths()
+    for path in paths:
+        with _using(path):
+            r = try_acquire(ident, label, pid, pid_source)
+        if r == "acquired":
+            took.append(path)
+        elif r != "mine":
+            for t in reversed(took):
+                _unlink(t)
+            return r
+    return "acquired" if took else "mine"
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def release_all(ident, label, force=False):
+    """Release in REVERSE order. Returns (rc, message): rc 1 if a lock is held by another
+    (and not forced); locks of ours are still released."""
+    rc, msgs = 0, []
+    for path in reversed(lock_paths()):
+        with _using(path):
+            holder, _ = read_lock()
+            if holder is None:
+                continue
+            if not holder_is_me(holder, ident, label) and not force:
+                msgs.append(f"held by {holder.get('session')}, not you ({label}): refusing (use --force)")
+                rc = 1
+                continue
+            _unlink(path)
+            msgs.append(f"released ({holder.get('session')})")
+    return rc, "; ".join(msgs) or "not held"
 
 
 def _tmux_name():
@@ -345,9 +411,9 @@ def try_acquire(ident, label, pid, pid_source):
 
 
 def _selftest_shared_scope():
-    """A shared-store scope locks on <store>/.reflect.lock in BOTH agent modes (one file), a
-    plain scope and a folder outside every scope keep the state-dir lock, and a lock held in
-    one mode blocks the other. Temp HOME + config; every path asserted under the sandbox."""
+    """A shared-store scope takes TWO locks (state lock, then <store>/.reflect.lock) in the same
+    order in both agent modes; a plain scope takes one. Temp HOME + config; every path asserted
+    under the sandbox."""
     import tempfile
     global LOCK, SCOPE
     fails = []
@@ -378,49 +444,79 @@ def _selftest_shared_scope():
                          f'[[scopes]]\nname = "pilot"\nroot = "{proot}"\nshared_store = true\n'
                          f'[[scopes]]\nname = "plain"\nroot = "{qroot}"\n')
             os.environ["SESSION_NOTES_CONFIG"] = cfgf
+            os.environ.update(CODEX_THREAD_ID="thr-1", CLAUDE_CODE_SESSION_ID="sess-1")
+            store_lock = os.path.join(shared_root, notes_config.encode_project_dir(proot), ".reflect.lock")
 
-            def path_in(mode, cwd, scope=None):
+            def setup(mode, cwd, scope=None):
                 global LOCK, SCOPE
                 os.environ["SESSION_NOTES_AGENT"] = mode
                 LOCK, SCOPE = None, scope
                 os.chdir(cwd)
-                return lock_path()
+                return lock_paths()
 
-            want = os.path.join(shared_root, notes_config.encode_project_dir(proot), ".reflect.lock")
-            pc, px = path_in("claude", proot), path_in("codex", proot)
-            check("shared scope: Claude and Codex resolve the SAME lock file", pc == px == want, (pc, px, want))
-            check("shared scope: --scope pins it from any cwd", path_in("claude", outside, "pilot") == want)
-            check("shared scope: a subfolder of the root finds it",
-                  path_in("codex", os.path.join(proot)) == want)
-            c_plain, x_plain = path_in("claude", qroot), path_in("codex", qroot)
-            check("plain scope: unchanged, the state-dir lock", c_plain == os.path.join(d, "state", "reflect.lock"), c_plain)
-            check("plain scope: codex mode still moves state (today's behavior)",
-                  x_plain.startswith(os.path.join(d, "codex")) and x_plain.endswith("reflect.lock"), x_plain)
-            check("outside every scope: unchanged", path_in("claude", outside) == os.path.join(d, "state", "reflect.lock"))
+            def me():
+                i, lab, _, _ = my_identity()
+                return i, lab, os.getpid(), "claude"
+
+            pc, px = setup("claude", proot), setup("codex", proot)
+            check("shared scope: two locks, state first then the store's, in BOTH modes (no deadlock order)",
+                  len(pc) == len(px) == 2 and pc[0] == os.path.join(d, "state", "reflect.lock")
+                  and px[0].startswith(os.path.join(d, "codex")) and pc[1] == px[1] == store_lock, (pc, px))
+            check("shared scope: --scope pins it from any cwd", setup("claude", outside, "pilot")[1] == store_lock)
+            check("shared scope: a subfolder of the root finds it", setup("codex", proot)[1] == store_lock)
+            cp, xp = setup("claude", qroot), setup("codex", qroot)
+            check("plain scope: one lock, today's path",
+                  cp == [os.path.join(d, "state", "reflect.lock")] and len(xp) == 1 and xp[0].endswith("reflect.lock"), (cp, xp))
+            check("outside every scope: one lock", len(setup("claude", outside)) == 1)
             try:
-                path_in("claude", outside, "nope")
+                setup("claude", outside, "nope")
+                lock_paths()
                 check("an unknown --scope is refused", False)
             except notes_config.ConfigError as exc:
                 check("an unknown --scope is refused", "nope" in str(exc), str(exc))
             check("every resolved path sits under the sandbox",
-                  all(x.startswith(d + os.sep) for x in (pc, px, c_plain, x_plain)))
+                  all(x.startswith(d + os.sep) for x in pc + px + cp + xp))
 
-            # A lock one mode holds blocks the other, because they share the file.
-            os.environ.update(CODEX_THREAD_ID="thr-1", CLAUDE_CODE_SESSION_ID="sess-1")
-            path_in("claude", proot)
-            cid = my_identity()
-            check("claude takes the shared lock", try_acquire(*cid[:2], os.getpid(), "claude") == "acquired")
-            path_in("codex", proot)
-            xid = my_identity()
-            r = try_acquire(xid[0], xid[1], os.getpid(), "claude")
-            check("a held Claude lock blocks the Codex reflect on the same store",
-                  r != "acquired" and r != "mine", r)
-            check("the lock file lives in the shared store", os.path.isfile(want))
-            path_in("claude", proot)
-            os.unlink(lock_path())
-            path_in("codex", proot)
-            check("once released, Codex acquires it", try_acquire(xid[0], xid[1], os.getpid(), "claude") == "acquired")
-            os.unlink(lock_path())
+            # (a) a Claude holder blocks a Codex acquire on the shared scope (they share the store lock)
+            setup("claude", proot)
+            cm = me()
+            check("claude takes both locks", acquire_all(*cm) == "acquired" and os.path.isfile(store_lock))
+            check("claude re-acquire is mine", acquire_all(*cm) == "mine")
+            setup("codex", proot)
+            xm = me()
+            r = acquire_all(*xm)
+            check("(a) a held Claude lock blocks the Codex reflect on the shared scope", r not in ("acquired", "mine"), r)
+            # (c) the failed second acquire left no first (codex state) lock behind
+            check("(c) the refused acquire left the codex state lock free", not os.path.exists(px[0]), os.listdir(os.path.dirname(px[0])) if os.path.isdir(os.path.dirname(px[0])) else "")
+            setup("claude", proot)
+            rc, msg = release_all(*cm[:2])
+            check("release frees both, reverse order", rc == 0 and not os.path.exists(store_lock) and not os.path.exists(pc[0]), msg)
+            setup("codex", proot)
+            check("once released, Codex acquires both", acquire_all(*xm) == "acquired"
+                  and os.path.exists(px[0]) and os.path.exists(store_lock))
+            release_all(*xm[:2])
+            check("codex release frees both", not os.path.exists(px[0]) and not os.path.exists(store_lock))
+
+            # (b) a plain-scope holder in the same harness (state lock) blocks a shared-scope acquire
+            setup("claude", qroot)
+            other = ("sid-other", "other", os.getpid(), "claude")
+            check("plain scope acquire takes only the state lock", acquire_all(*other) == "acquired" and not os.path.exists(store_lock))
+            setup("claude", proot)
+            r = acquire_all(*cm)
+            check("(b) a plain-scope holder still blocks a shared-scope acquire", r not in ("acquired", "mine"), r)
+            check("(b) and the shared store lock was not taken", not os.path.exists(store_lock))
+            setup("claude", qroot)
+            release_all("sid-other", "other")
+
+            # (c) again, the other direction: store lock held by someone else, state lock free
+            setup("codex", proot)
+            os.makedirs(os.path.dirname(store_lock), exist_ok=True)
+            with open(store_lock, "w") as fh:
+                json.dump({"id": "sid-other", "session": "other", "pid": os.getpid(), "pid_source": "claude"}, fh)
+            r = acquire_all(*xm)
+            check("(c) store lock held elsewhere: refused, and the state lock taken first is released again",
+                  r not in ("acquired", "mine") and not os.path.exists(px[0]), (r, os.path.exists(px[0])))
+            os.unlink(store_lock)
     finally:
         os.chdir(real_cwd)
         LOCK, SCOPE = real_lock, real_scope
@@ -723,7 +819,7 @@ def main():
     global SCOPE
     SCOPE = args.scope
     try:
-        lock_path()
+        lock_paths()
     except notes_config.ConfigError as exc:
         print("reflect_lock: %s" % exc, file=sys.stderr)
         return 2
@@ -734,7 +830,7 @@ def main():
         ident = label = args.session
 
     if args.cmd == "acquire":
-        r = try_acquire(ident, label, pid, pid_source)
+        r = acquire_all(ident, label, pid, pid_source)
         if r == "acquired":
             print(f"acquired by {label}")
             return 0
@@ -745,35 +841,29 @@ def main():
         return 1
 
     if args.cmd == "release":
-        holder, _ = read_lock()
-        if holder is None:
-            print("not held")
-            return 0
-        if not holder_is_me(holder, ident, label) and not args.force:
-            print(f"held by {holder.get('session')}, not you ({label}): refusing (use --force)")
-            return 1
-        try:
-            os.unlink(lock_path())
-        except FileNotFoundError:
-            pass
-        print(f"released ({holder.get('session')})")
-        return 0
+        rc, msg = release_all(ident, label, args.force)
+        print(msg)
+        return rc
 
     if args.cmd == "status":
-        holder, age = read_lock()
-        if holder is None:
-            print("free")
-            return 0
-        why = break_reason(holder, age)
-        stale = f" STALE ({why})" if why else ""
-        mine = " (that is you)" if holder_is_me(holder, ident, label) else ""
-        print(f"held by {holder.get('session')} for {int(age or 0)}s{stale}{mine}")
-        return 1
+        rc, lines = 0, []
+        for path in lock_paths():
+            with _using(path):
+                holder, age = read_lock()
+                if holder is None:
+                    continue
+                why = break_reason(holder, age)
+                stale = f" STALE ({why})" if why else ""
+                mine = " (that is you)" if holder_is_me(holder, ident, label) else ""
+                lines.append(f"held by {holder.get('session')} for {int(age or 0)}s{stale}{mine}")
+                rc = 1
+        print("; ".join(lines) or "free")
+        return rc
 
     if args.cmd == "wait":
         deadline = time.time() + args.timeout
         while True:
-            r = try_acquire(ident, label, pid, pid_source)
+            r = acquire_all(ident, label, pid, pid_source)
             if r in ("acquired", "mine"):
                 print(f"acquired by {label}")
                 return 0
