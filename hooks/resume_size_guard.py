@@ -175,11 +175,16 @@ def main():
     except Exception as exc:
         sys.stderr.write("resume_size_guard: %s: %s\n" % (type(exc).__name__, exc))
         return 0
-    for w in WARNINGS:
-        sys.stderr.write("resume_size_guard: " + w + "\n")
     if msg:
         sys.stderr.write(msg + "\n")
         return 2
+    if WARNINGS:
+        # Claude Code never shows stderr of a hook that exits 0: the documented route is one
+        # JSON object on stdout (additionalContext for the model, systemMessage for the user).
+        text = "resume_size_guard: " + " ".join(WARNINGS)
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                           "additionalContext": text},
+                                     "systemMessage": text}))
     return 0
 
 
@@ -210,9 +215,12 @@ def selftest():
         env.update(HOME=home, SESSION_NOTES_CONFIG=cfgf)
         resume = os.path.join(store, "RESUME.md")
 
+        last_out = [""]
+
         def run(payload, e=None):
             r = subprocess.run([sys.executable, os.path.abspath(__file__)], input=json.dumps(payload),
                                capture_output=True, text=True, env=e or env, cwd=d)
+            last_out[0] = r.stdout
             return r.returncode, r.stderr
 
         def w(path, text):
@@ -343,14 +351,22 @@ def selftest():
         if tight is not None:
             set_cap(tight)
             rc, err = run({"tool_name": "Write", "tool_input": {"file_path": mstore, "content": small}})
-            check("a Write that loads but uses >=90% of its room is allowed with a warning on stderr",
-                  rc == 0 and "warning:" in err and "RESUME-archive.md" in err, (rc, err))
+            try:
+                warn_out = json.loads(last_out[0])
+            except ValueError:
+                warn_out = None
+            check("a Write that loads but uses >=90% of its room is allowed with a warning as JSON on stdout",
+                  rc == 0 and err == "" and isinstance(warn_out, dict)
+                  and warn_out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+                  and "warning:" in warn_out["hookSpecificOutput"]["additionalContext"]
+                  and "RESUME-archive.md" in warn_out["systemMessage"], (rc, err, warn_out))
             set_cap(tight - 1)
             rc, err = run({"tool_name": "Write", "tool_input": {"file_path": mstore, "content": small}})
             check("one char less room: the same Write is refused", rc == 2 and "would not load in Codex" in err, (rc, err))
             set_cap(tight + 3000)
             rc, err = run({"tool_name": "Write", "tool_input": {"file_path": mstore, "content": small}})
-            check("plenty of room: allowed, silent", rc == 0 and err == "", (rc, err))
+            check("plenty of room: allowed, silent (no stdout, no stderr)",
+                  rc == 0 and err == "" and last_out[0] == "", (rc, err))
         rc, err = subprocess.run([sys.executable, os.path.abspath(__file__)], input="not json",
                                  capture_output=True, text=True, env=env).returncode, ""
         check("an unreadable payload fails open", rc == 0)

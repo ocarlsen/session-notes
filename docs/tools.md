@@ -397,11 +397,13 @@ home, and outside the state dir, which holds no memory.
 reported. `bin/resume_guard.py` is the one predicate: a result at or under the budget passes (for a
 store Codex boots, a shared scope's or any store in codex mode, it must also still load in Codex:
 the guard dry-runs `hooks/codex_session_start.plan_context` with the candidate text, so the
-`agent.codex_boot_bytes` cap lives only there). A result over the budget, or one Codex would drop,
-passes only if it removes text and adds none: every non-blank line of the new text is in the old
+`agent.codex_boot_bytes` cap lives only there). A result over the budget, or one Codex would
+cut (older entries removed from the pack) or drop, passes only if it removes text and adds none: every non-blank line of the new text is in the old
 text, as a multiset. A file can be trimmed back in steps, but nothing new goes in, and a one-byte
 swap is refused. Anything else is refused with "move finished items to RESUME-archive.md beside
-it, verbatim, then retry". The old RESUME.md of a scope that migrated to a shared store is no
+it, verbatim, then retry". A write that is allowed but leaves a Codex-booted RESUME at 90% or more
+of the room the pack has for it prints a non-blocking warning (`codex_boot_warning`; JSON on stdout
+from the Claude hook, stderr from `codex_save`). The old RESUME.md of a scope that migrated to a shared store is no
 longer read, so a write to it is refused ("write the shared store's RESUME.md instead"). The budget is `boot_budget.budget_for(path)`, never a number typed in the
 guard. Callers: `codex_save.py` (at `stage` and again at `commit`) and the Claude PreToolUse hook
 `hooks/resume_size_guard.py` (matcher `Edit|Write|MultiEdit|Bash`, installed by default). The hook

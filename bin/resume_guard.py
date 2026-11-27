@@ -256,7 +256,13 @@ def selftest():
             tcap = next(n for n in range(100, 5000)
                         if (with_cap(n) and check_write(shr, "", multi) is None))
             big = "# R\n" + "".join("- line %03d padding padding\n" % i for i in range(40))  # 1.2K
-            with_cap(900)
+            # derive the cap from the sandbox path lengths (the block head and the marker carry the
+            # store path): the first cap at which `big` is cut rather than dropped
+            tr_cap = next((n for n in range(100, 6000, 5) if with_cap(n)
+                           and "older entries cut to fit" in
+                           (codex_boot_drop(shr, big, notes_config.load()) or (0, ""))[1]), None)
+            check("some cap truncates (not drops) the big shared RESUME in this sandbox", tr_cap is not None)
+            with_cap(tr_cap or 900)
             msg = check_write(shr, "", big, budget=10000)
             drop = codex_boot_drop(shr, big, notes_config.load())
             check("a write that would TRUNCATE the shared RESUME is refused (truncated counts as not loaded)",
