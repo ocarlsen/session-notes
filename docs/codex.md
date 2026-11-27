@@ -292,8 +292,12 @@ entries of your environment file added at the end of its `## Environment Profile
   `additionalContext` on `startup`, `resume` and `compact`. Codex spills hook
   output over the handler's `additionalContextLimit` to a file and shows only a
   preview. To keep that from happening silently, the hook caps itself at
-  `agent.codex_boot_bytes` (12,000 characters) and replaces a file that does
-  not fit with a line naming its path. The install sets the limit to 4,000
+  `agent.codex_boot_bytes` (12,000 characters). A MEMORY.md that does not fit is
+  replaced by a line naming its path; a RESUME.md that does not fit is cut to
+  fit instead, oldest entries first (headings stay, one `(N older lines not
+  shown; read <path>)` marker), and files packed after it keep the room they
+  would have had. Only a RESUME with nothing of its body left falls back to
+  the naming line. The install sets the limit to 4,000
   tokens. After the memory files it adds the live-context block (`bin/live.py`, what
   other sessions just did) from whatever is left of that cap. With an empty store
   and no live entries the hook prints nothing. The live file sits outside both agent homes
@@ -365,7 +369,8 @@ frontmatter, and on an `--index-line` marks the hook `[harness]`.
   `agent.codex_boot_bytes` (that cap is compared with the text's length in characters).
   Every file is listed as loaded, truncated or dropped, with the reason. `check` is silent
   when everything fits and exits 1 with one `FILE` or `SCOPE` line per dropped or truncated
-  file otherwise. `check-file` stays Claude only. Live-context truncation is shown in
+  file otherwise. A RESUME that loads whole but uses 90% or more of the room the pack leaves
+  it prints a `WARN` line (and a `WARN` row in `report`) without changing the exit code. `check-file` stays Claude only. Live-context truncation is shown in
   `report` but is never a `check` finding (the live block only uses what the files leave).
   Not modelled: Codex loads no project docs for an untrusted project, and the chain
   follows git for the project root, not `project_root_markers`.

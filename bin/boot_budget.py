@@ -810,6 +810,9 @@ def codex_boot_report(cfg=None, scopes=None):
                     "boot_bytes": len(text.encode("utf-8")),
                     # the live block only uses what the files leave, by design: shown, never a finding
                     "soft": {e["path"] for e in hook_entries if e["label"] == "live"},
+                    # RESUME blocks near the cliff (plan_context's own warn mark): path -> (used, room)
+                    "warn": {e["path"]: (e["block_chars"], e["room"]) for e in hook_entries
+                             if e.get("warn") and e["status"] == "loaded"},
                     "problem": problem})
     return out
 
@@ -836,6 +839,18 @@ def codex_violations(reports):
     return out
 
 
+def codex_warnings(reports):
+    """One WARN line per RESUME block that loads whole but uses >= the warn share of its room.
+    Never a finding: codex_check_mode prints these without changing its exit code."""
+    out = []
+    for rep in reports:
+        for path, (used, room) in rep["warn"].items():
+            out.append(f"WARN {_display(path)}: {used:,} of {room:,} chars of the room the "
+                       f"SessionStart pack leaves it (scope {rep['name']}); older entries get "
+                       f"cut past that")
+    return out
+
+
 def codex_report_mode():
     reports = codex_boot_report()
     if not reports:
@@ -845,6 +860,9 @@ def codex_report_mode():
         print(f"== scope: {rep['name']} ({_display(_tilde(rep['root']))}) ==")
         for path, size, status, reason in rep["entries"]:
             flag = "ok" if status == "loaded" else status.upper()
+            if status == "loaded" and path in rep["warn"]:
+                flag = "WARN"
+                reason = "%s%d of %d chars of room" % (reason and reason + " ", *rep["warn"][path])
             print(f"  {_display(path):<70} {size:>7,} bytes  {flag}  {reason}".rstrip())
         a = "OVER" if any(st != "loaded" and r.startswith(("only ", "project chain"))
                           for (_p, _s, st, r) in rep["entries"]) else "ok"
@@ -862,8 +880,12 @@ def codex_report_mode():
 
 def codex_check_mode():
     blind_reset()
-    violations = codex_violations(codex_boot_report())
+    reports = codex_boot_report()
+    violations = codex_violations(reports)
     violations.extend(blind_lines())
+    warnings = codex_warnings(reports)
+    for w in warnings:
+        print(w)  # a warning alone never changes the exit code
     if not violations:
         return 0  # silent when clean
     for v in violations:
@@ -1107,6 +1129,42 @@ def selftest_codex(check):
               "live-context truncation: shown in report, not a check finding"
               + ("" if rc == 0 and out == "" else " [rc=%s out=%r report=%r]" % (rc, out[-300:], out2[-900:])))
         write_cfg()
+
+        # RESUME truncation and the 90% warning (issue #124)
+        assert os.path.realpath(pstore).startswith(d), "selftest path escaped the sandbox"
+        write_cfg()
+        os.remove(os.path.join(gstore, "MEMORY.md"))
+
+        def lines(n):
+            return "# RESUME\n\n" + "".join("- line %04d\n" % i for i in range(n))
+        near = None
+        for n in range(1, 200):
+            _write(Path(pstore) / "RESUME.md", lines(n))
+            rep = codex_boot_report(cfg)[0]
+            if rep["warn"]:
+                near = n
+                break
+            if any(st != "loaded" for _p, _s, st, _r in rep["entries"]):
+                break
+        check(near is not None, "a RESUME growing line by line passes through the warn band while still loaded")
+        if near is not None:
+            rc, out = run("--agent", "codex", "check")
+            check(rc == 0 and "WARN " in out and "RESUME.md" in out and "FILE" not in out,
+                  "check: a warning alone prints a WARN line and exits 0")
+            rc, out = run("--agent", "codex", "report")
+            check(rc == 0 and "WARN" in out and "chars of room" in out,
+                  "report: the row carries a WARN marker with used/room")
+        _write(Path(pstore) / "RESUME.md", lines(150))
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 1 and "TRUNCATED" in out and "RESUME.md" in out and "older entries cut to fit" in out,
+              "check: a truncated RESUME is a finding, exit 1")
+        rc, out = run("--agent", "codex", "report")
+        check(rc == 0 and "TRUNCATED" in out and "line 0149" in Path(pstore, "RESUME.md").read_text(),
+              "report: the truncated RESUME row says TRUNCATED")
+        _write(Path(pstore) / "RESUME.md", "# RESUME\n\n- shipped\n")
+        _write(Path(gstore) / "MEMORY.md", "# Memory Index\n\n- [x](x.md) - x\n")
+        rc, out = run("--agent", "codex", "check")
+        check(rc == 0 and out == "", "small RESUME: silent again, exit 0")
 
         # N1: no [[scopes]] at all still measures the session's own cwd
         _write(Path(cfgf), '[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'

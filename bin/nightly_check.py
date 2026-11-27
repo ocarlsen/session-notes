@@ -167,7 +167,15 @@ def _run_checks(env, run, out, checks):
                 continue
             text = (r.stdout or "") + (r.stderr or "")
             if r.returncode == 0:
-                checks.append({"agent": kind, "check": name, "status": "clean", "findings": 0})
+                row = {"agent": kind, "check": name, "status": "clean", "findings": 0}
+                # boot_budget prints WARN lines at exit 0 (a RESUME near the Codex boot cliff):
+                # recorded and shown, never counted as a finding or a failure.
+                warns = [ln for ln in text.splitlines() if ln.startswith("WARN ")] \
+                    if name == "boot_budget" else []
+                if warns:
+                    row["warnings"] = warns
+                    out.write("== %s: %s (warnings) ==\n%s\n" % (kind, name, "\n".join(warns)))
+                checks.append(row)
                 continue
             # boot_budget check exits 1 on a finding (each a FILE/SCOPE/BLIND line); the
             # canary exits 3. Anything else, a traceback, or a boot_budget 1 with no finding
@@ -262,6 +270,10 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
     if bad or rc == 1:
         return "MEMORY CHECKS CRASHED (%s): %s" % (day, bad or "see nightly_check.py")
     found = [(a, n, f) for a, n, st, f in rows if st == "findings"]
+    nwarn = sum(len(c.get("warnings") or []) for c in checks if isinstance(c, dict))
+    if rc == 0 and not found and nwarn:
+        return ("Memory checks (%s): %d warning(s), nothing failing; run nightly_check.py for the "
+                "report" % (day, nwarn))
     if rc == 0 and not found:
         return ""
     if not found:
@@ -356,6 +368,21 @@ def selftest():
         buf = _Buf()
         check("a boot_budget BLIND line is a finding, not a crash",
               run_all(env, run, buf) == 3 and "(findings)" in buf.text)
+
+        # a WARN line at exit 0 is recorded and shown, never a finding or a crash
+        wl = "WARN ~/x/RESUME.md: 900 of 1,000 chars of the room the SessionStart pack leaves it"
+        run, _ = fake({("claude", "boot_budget.py"): R(0, wl + "\n")})
+        wbuf, wchecks = _Buf(), []
+        wrc = _run_checks(env, run, wbuf, wchecks)
+        wrow = [c for c in wchecks if c["check"] == "boot_budget" and c["agent"] == "claude"][0]
+        check("a boot_budget WARN at exit 0: rc 0, still status clean, the line recorded under warnings",
+              wrc == 0 and wrow["status"] == "clean" and wrow["findings"] == 0
+              and wrow["warnings"] == [wl] and wl in wbuf.text)
+        wpath = os.path.join(d, "warn-status.json")
+        write_status(wpath, 0, wchecks, wbuf.text, datetime.now(timezone.utc))
+        wline = status_line(wpath)
+        check("status line mentions the warning without calling it a crash or a finding",
+              "1 warning" in wline and "CRASHED" not in wline and "STALE" not in wline)
 
         # --- environment_render's could-not-check note reaches the report, not the rc
         import environment_render

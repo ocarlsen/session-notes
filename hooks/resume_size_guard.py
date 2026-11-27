@@ -30,6 +30,7 @@ patch, `sort -o`, sponge, ed and `find -delete`. This hook is a net for the comm
 """
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -111,6 +112,9 @@ def bash_resume_targets(cmd, cwd, depth=0):
     return out
 
 
+WARNINGS = []  # non-blocking notes decide() collected for main to print on stderr
+
+
 def decide(payload):
     """The refusal text, or None to allow. May raise (main fails open on that)."""
     tool = payload.get("tool_name")
@@ -135,7 +139,15 @@ def decide(payload):
         new = simulate(tool, ti, old)
         if new is None:
             return None
-        return resume_guard.check_write(path, old, new)
+        refusal = resume_guard.check_write(path, old, new)
+        if refusal is None:  # allowed: a near-the-cliff Codex pack is a warning, never a block
+            try:
+                warn = resume_guard.codex_boot_warning(path, new)
+            except Exception:
+                warn = None  # the signal must never break an allowed write
+            if warn:
+                WARNINGS.append(warn)
+        return refusal
     if tool == "Bash":
         cmd = ti.get("command")
         if not isinstance(cmd, str) or "RESUME.md" not in cmd:
@@ -166,6 +178,13 @@ def main():
     if msg:
         sys.stderr.write(msg + "\n")
         return 2
+    if WARNINGS:
+        # Claude Code never shows stderr of a hook that exits 0: the documented route is one
+        # JSON object on stdout (additionalContext for the model, systemMessage for the user).
+        text = "resume_size_guard: " + " ".join(WARNINGS)
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                           "additionalContext": text},
+                                     "systemMessage": text}))
     return 0
 
 
@@ -196,9 +215,12 @@ def selftest():
         env.update(HOME=home, SESSION_NOTES_CONFIG=cfgf)
         resume = os.path.join(store, "RESUME.md")
 
+        last_out = [""]
+
         def run(payload, e=None):
             r = subprocess.run([sys.executable, os.path.abspath(__file__)], input=json.dumps(payload),
                                capture_output=True, text=True, env=e or env, cwd=d)
+            last_out[0] = r.stdout
             return r.returncode, r.stderr
 
         def w(path, text):
@@ -287,6 +309,64 @@ def selftest():
         check("broken config: a command that DOES write a RESUME.md is refused loudly", rc == 2 and "missing.toml" in err, (rc, err))
         rc, err = run({"tool_name": "Bash", "tool_input": {"command": 'echo x > "$HOME/RESUME.md"'}}, bad)
         check("known limit: a $HOME path is not expanded, so it is not seen", rc == 0, (rc, err))
+        # Codex boot pack: a shared scope's RESUME that still loads but is near the cliff warns, never blocks
+        def set_cap(n):
+            with open(cfgf) as fh:
+                t = fh.read()
+            t = re.sub(r"\[agent\]\ncodex_home = [^\n]*\ncodex_boot_bytes = \d+\n", "", t)
+            with open(cfgf, "w") as fh:
+                fh.write('[agent]\ncodex_home = "%s/cx"\ncodex_boot_bytes = %d\n' % (d, n) + t)
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = home  # `~` in the shared store path expands from the process HOME
+        try:
+            hscope = [x for x in notes_config.load(cfgf, env={})["scopes"] if x["name"] == "m"][0]
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+        mstore = os.path.join(hscope["store"], "RESUME.md")
+        assert os.path.realpath(mstore).startswith(d), "selftest path escaped the sandbox"
+        small = "# R\n- one\n- two\n"
+        saved_cfg = os.environ.get("SESSION_NOTES_CONFIG")
+        os.environ["SESSION_NOTES_CONFIG"] = cfgf
+        os.environ["HOME"] = home
+        try:
+            tight = None
+            for n in range(100, 3000):
+                set_cap(n)
+                if resume_guard.check_write(mstore, "", small) is None:
+                    tight = n
+                    break
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_cfg is None:
+                os.environ.pop("SESSION_NOTES_CONFIG", None)
+            else:
+                os.environ["SESSION_NOTES_CONFIG"] = saved_cfg
+        check("found the smallest cap at which the shared RESUME still loads", tight is not None)
+        if tight is not None:
+            set_cap(tight)
+            rc, err = run({"tool_name": "Write", "tool_input": {"file_path": mstore, "content": small}})
+            try:
+                warn_out = json.loads(last_out[0])
+            except ValueError:
+                warn_out = None
+            check("a Write that loads but uses >=90% of its room is allowed with a warning as JSON on stdout",
+                  rc == 0 and err == "" and isinstance(warn_out, dict)
+                  and warn_out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+                  and "warning:" in warn_out["hookSpecificOutput"]["additionalContext"]
+                  and "RESUME-archive.md" in warn_out["systemMessage"], (rc, err, warn_out))
+            set_cap(tight - 1)
+            rc, err = run({"tool_name": "Write", "tool_input": {"file_path": mstore, "content": small}})
+            check("one char less room: the same Write is refused", rc == 2 and "would not load in Codex" in err, (rc, err))
+            set_cap(tight + 3000)
+            rc, err = run({"tool_name": "Write", "tool_input": {"file_path": mstore, "content": small}})
+            check("plenty of room: allowed, silent (no stdout, no stderr)",
+                  rc == 0 and err == "" and last_out[0] == "", (rc, err))
         rc, err = subprocess.run([sys.executable, os.path.abspath(__file__)], input="not json",
                                  capture_output=True, text=True, env=env).returncode, ""
         check("an unreadable payload fails open", rc == 0)

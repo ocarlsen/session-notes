@@ -134,6 +134,12 @@ def guard_resume(path, content):
     msg = resume_guard.check_write(path, old, _new_resume_text(content), cwd=os.getcwd())
     if msg:
         raise SaveError(msg)
+    try:
+        warn = resume_guard.codex_boot_warning(path, _new_resume_text(content), cwd=os.getcwd())
+    except Exception:
+        warn = None  # the signal must never break an allowed write
+    if warn:
+        print("codex_save: " + warn, file=sys.stderr)
 
 
 _FRONTMATTER_FORM = ("---\nname: descriptive-kebab-slug\ndescription: one line saying when this is relevant\n"
@@ -427,6 +433,27 @@ def selftest():
                              "".join("- line %04d\n" % i for i in range(999)))  # 11,988 chars: under 12000, path-independent
             check("a RESUME under the budget that Codex's boot pack would drop is refused at stage",
                   rc == 2 and "would not load in Codex" in err and "codex_boot_bytes" in err, (rc, err))
+
+            # The 90% warning: the largest RESUME that still loads whole stages and commits, with a
+            # non-blocking warning on stderr; a small one is silent.
+            def lines(n):
+                return "".join("- line %04d\n" % i for i in range(n))
+            fit = None
+            for n in range(998, 500, -1):
+                rc, base, _ = run(["hash", "--store", "project"])
+                rc, _, err = run(["stage", "--store", "project", "--resume", "--base", base.strip()], lines(n))
+                if rc == 0:
+                    fit = (n, err)
+                    break
+            check("the largest RESUME that still loads stages with a warning, not a refusal",
+                  fit is not None and "warning:" in fit[1] and "RESUME-archive.md" in fit[1], fit)
+            rc, out, err = run(["commit"])
+            check("commit of that RESUME succeeds and repeats the warning on stderr",
+                  rc == 0 and "warning:" in err and os.path.getsize(os.path.join(p, "RESUME.md")) > 5000, (rc, err))
+            rc, base, _ = run(["hash", "--store", "project"])
+            rc, _, err = run(["stage", "--store", "project", "--resume", "--base", base.strip()], lines(10))
+            check("a small RESUME stages silently", rc == 0 and "warning" not in err, (rc, err))
+            run(["commit"])
 
             # Lock contention: another holder makes commit wait, then time out without writing.
             run(["stage", "--store", "global", "--file", "user_y.md"], "body\n")
