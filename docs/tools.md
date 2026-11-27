@@ -47,7 +47,7 @@ The README covers the default install: three skills and four commands (`handoff_
   when the files the SessionStart hook loads reach 90% of
   `agent.codex_boot_bytes`. Each run records itself in `paths.last_check`;
   `nightly_check.py status [--max-age-days 8]` prints one line from that record
-  (nothing when clean and fresh; loud when crashed, stale or never run).
+  (nothing when clean, warning-free and fresh; a warnings-only run prints a one-line count; loud when crashed, stale or never run).
 
 ## Talking between sessions: native first, the bus for two jobs
 

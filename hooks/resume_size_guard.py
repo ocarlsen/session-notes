@@ -112,7 +112,7 @@ def bash_resume_targets(cmd, cwd, depth=0):
     return out
 
 
-WARNINGS = []  # non-blocking notes decide() collected for main to print on stderr
+WARNINGS = []  # non-blocking notes decide() collected for main to report in the hook's stdout JSON
 
 
 def decide(payload):

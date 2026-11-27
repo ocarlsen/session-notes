@@ -153,8 +153,9 @@ def _read_checked(path):
 def plan_context(cwd, cfg=None):
     """(text, entries) for cwd. text is the additionalContext (what build_context returns);
     entries is one dict per candidate file in the hook's own order: path, label, chars
-    (len of the text, the unit the cap counts), bytes, status ("loaded" or "dropped"),
-    reason. A store file that exists but cannot be read or decoded is "dropped". The live
+    (len of the text, the unit the cap counts), bytes, status ("loaded", "truncated" for a
+    RESUME with older entries cut, or "dropped"), reason; a RESUME entry also carries
+    block_chars, room and warn. A store file that exists but cannot be read or decoded is "dropped". The live
     block is the last entry: "loaded", "truncated" when older entries were cut, or "dropped"
     when entries exist but none fit. boot_budget.py reads this to report what a
     Codex session loads; the packing lives only here."""
@@ -178,6 +179,7 @@ def plan_context(cwd, cfg=None):
         if stores["project"]:
             parts.append("Project store: %s (root %s)" % (stores["project"], stores["root"]))
     used = sum(len(p) + 2 for p in parts)
+    packed = []  # "label BASENAME" of each file already in the pack, for the reason text
     for pos, (label, path, text, problem) in enumerate(files):
         if problem:  # exists but unreadable: never loaded, so say so (the printed text is unchanged)
             try:
@@ -196,6 +198,7 @@ def plan_context(cwd, cfg=None):
         if used + len(block) + 2 <= cap:
             parts.append(block)
             used += len(block) + 2
+            packed.append("%s %s" % (label, os.path.basename(path)))
             entry.update(status="loaded", reason="")
             if is_resume:
                 entry.update(block_chars=len(block), room=room,
@@ -208,22 +211,26 @@ def plan_context(cwd, cfg=None):
                 ptr = len(_pointer(label, path, text)) + 2
                 reserve = _later_footprint(files, pos + 1, used + ptr, cap)
                 cut = _truncate_resume(label, path, text, room - reserve)
+            if cut and len(cut[0]) < len(_pointer(label, path, text)):
+                cut = None  # a pointer is the shorter stand-in: the reserve counted one
+            before = ("; room already used by %s" % ", ".join(packed)) if packed and is_resume else ""
             if cut:
                 tblock, ncut = cut
                 parts.append(tblock)
                 used += len(tblock) + 2
+                packed.append("%s %s" % (label, os.path.basename(path)))
                 entry.update(status="truncated",
                              reason="older entries cut to fit: %d lines, needs %d chars, "
-                                    "%d left of the %d cap" % (ncut, len(block) + 2,
-                                                               max(left, 0), cap),
+                                    "%d left of the %d cap%s" % (ncut, len(block) + 2,
+                                                                  max(left, 0), cap, before),
                              block_chars=len(tblock), room=room, warn=True)
             else:
                 line = _pointer(label, path, text)
                 parts.append(line)
                 used += len(line) + 2
                 entry.update(status="dropped",
-                             reason="needs %d chars, %d left of the %d cap" % (
-                                 len(block) + 2, max(left, 0), cap))
+                             reason="needs %d chars, %d left of the %d cap%s" % (
+                                 len(block) + 2, max(left, 0), cap, before))
         entries.append(entry)
     try:
         block = live.render(cwd, cfg, budget=cap - used - 2)
@@ -775,6 +782,36 @@ def selftest():
         check("a %d-char RESUME packs in well under 1s (%.2fs), newest kept" % (big, took),
               big > 1300000 and took < 1.0 and "entry 0027999" in t3
               and [e for e in e3 if e["path"] == rpath][0]["status"] == "truncated")
+    # Follow-up nits on #125: short mocked paths, so a truncated block can come out shorter than
+    # the pointer it replaces; the pack must still stay under the cap and name what used the room
+    real_stores, real_read = notes_config.stores_for, _read_checked
+    texts = {"/g/MEMORY.md": "# m\n" + "\n".join("- [t%d](t%d.md) hook" % (i, i) for i in range(6)),
+             "/g/RESUME.md": "# R\n" + "\n".join("- g entry %03d padding" % i for i in range(40)),
+             "/p/MEMORY.md": "# pm\n- [a](a.md) hook",
+             "/p/RESUME.md": "# R\n" + "\n".join("- p entry %03d padding" % i for i in range(40))}
+    mcfg = {"agent": {"codex_boot_bytes": 0}}
+    notes_config.stores_for = lambda cwd, cfg: {"global": "/g", "project": "/p", "root": "/r"}
+    globals()["_read_checked"] = lambda path: (texts.get(path, ""), None)
+    try:
+        mcfg["agent"]["codex_boot_bytes"] = 1
+        floor = len(plan_context("/r", mcfg)[0])  # every file a pointer: the smallest pack
+        over, saw_reason = [], False
+        for cap in range(floor, 2600):
+            mcfg["agent"]["codex_boot_bytes"] = cap
+            mt, me = plan_context("/r", mcfg)
+            if len(mt) > cap and any(e["status"] == "truncated" and e["label"] != "live" for e in me):
+                over.append(cap)
+            for e in me:
+                if e["label"] == "project" and e["path"] == "/p/RESUME.md" and e["status"] != "loaded" \
+                        and "global RESUME.md" in e["reason"]:
+                    saw_reason = True
+        check("mocked short paths: a pack with a truncated RESUME stays under the cap at every cap above the pointer floor",
+              not over)
+        check("a dropped or truncated project RESUME names the earlier file that used the room",
+              saw_reason)
+    finally:
+        notes_config.stores_for = real_stores
+        globals()["_read_checked"] = real_read
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 
