@@ -18,7 +18,11 @@ Budget. Codex spills hook output over ~2,500 tokens (configurable per handler wi
 additionalContextLimit) to a temp file and shows the model only a head-and-tail
 preview. A silent spill would hide the middle of the index, so the hook caps itself at
 agent.codex_boot_bytes: a file that does not fit is replaced by one line naming its
-path and size, telling the model to read it. install.sh sets additionalContextLimit
+path and size, telling the model to read it. A RESUME.md is the exception: it is cut to fit,
+oldest units (topmost; headings and comments stay) first, with a "(N older lines not shown;
+read <path>)" marker, and only dropped when no unit of its body would survive. A RESUME that
+uses >= RESUME_WARN_FRACTION of its room is flagged warn=True in plan_context's entries.
+install.sh sets additionalContextLimit
 above that cap.
 
 Silent when there is nothing to load (the start-empty case), and never fails the
@@ -45,6 +49,55 @@ import live  # noqa: E402
 
 HEADER = ("session-notes memory for this Codex session (loaded at session start, from "
           "the Codex store; it does not update mid-session: run $refresh to re-read it).")
+
+# A RESUME block that uses at least this share of the room the pack leaves it is "near the cliff":
+# plan_context marks it warn=True and every tool (boot_budget, resume_guard) reads that mark.
+RESUME_WARN_FRACTION = 0.9
+
+
+def resume_near_cliff(block_chars, room):
+    """True when a RESUME block of block_chars uses >= RESUME_WARN_FRACTION of its room."""
+    return room > 0 and block_chars >= room * RESUME_WARN_FRACTION
+
+
+def _resume_units(text):
+    """[(lines, cuttable)] for a RESUME body. A heading (column-0 '#') or an HTML comment
+    (column-0 '<!--') is a one-line unit that is never cut. Any other column-0 non-blank line
+    starts a cuttable unit that runs over the blank and indented lines after it, up to the next
+    column-0 non-blank line. Lines before the first column-0 line form a cuttable unit."""
+    units = []
+    for ln in text.split("\n"):
+        top = bool(ln) and not ln[0].isspace()
+        if top and (ln.startswith("#") or ln.startswith("<!--")):
+            units.append(([ln], False))
+        elif top or not units or not units[-1][1]:
+            units.append(([ln], True))
+        else:
+            units[-1][0].append(ln)
+    return units
+
+
+def _truncate_resume(label, path, text, room):
+    """(block, n_cut) for a RESUME that does not fit in `room`: the oldest (topmost) cuttable
+    units are cut until the block plus one marker fits. None when no unit of body would survive
+    (headings alone), so the caller falls back to the NOT-loaded pointer."""
+    units = _resume_units(text)
+    idx = [i for i, u in enumerate(units) if u[1]]
+    head = "## %s %s (%s)\n\n" % (label, os.path.basename(path), path)
+    for k in range(1, len(idx)):  # k cut units; at least one cuttable unit must survive
+        cutset = set(idx[:k])
+        n = sum(1 for i in cutset for ln in units[i][0] if ln.strip())
+        marker = "(%d older lines not shown; read %s)" % (n, path)
+        lines = []
+        for i, (ul, _c) in enumerate(units):
+            if i == idx[0]:
+                lines.append(marker)
+            if i not in cutset:
+                lines.extend(ul)
+        block = head + "\n".join(lines).strip()
+        if len(block) <= room:
+            return block, n
+    return None
 
 
 def _read(path):
@@ -104,19 +157,35 @@ def plan_context(cwd, cfg=None):
         left = cap - used
         entry = {"path": path, "label": label, "chars": len(text),
                  "bytes": len(text.encode("utf-8"))}
+        is_resume = os.path.basename(path) == "RESUME.md"
+        room = left - 2  # what this block may use: cap minus what is packed minus the separator
         if used + len(block) + 2 <= cap:
             parts.append(block)
             used += len(block) + 2
             entry.update(status="loaded", reason="")
+            if is_resume:
+                entry.update(block_chars=len(block), room=room,
+                             warn=resume_near_cliff(len(block), room))
         else:
-            line = ("## %s %s (%s): %d bytes, over the boot budget, NOT loaded. "
-                    "Read it before relying on memory." % (label, os.path.basename(path),
-                                                            path, len(text.encode("utf-8"))))
-            parts.append(line)
-            used += len(line) + 2
-            entry.update(status="dropped",
-                         reason="needs %d chars, %d left of the %d cap" % (
-                             len(block) + 2, max(left, 0), cap))
+            cut = _truncate_resume(label, path, text, room) if is_resume else None
+            if cut:
+                tblock, ncut = cut
+                parts.append(tblock)
+                used += len(tblock) + 2
+                entry.update(status="truncated",
+                             reason="older entries cut to fit: %d lines, needs %d chars, "
+                                    "%d left of the %d cap" % (ncut, len(block) + 2,
+                                                               max(left, 0), cap),
+                             block_chars=len(tblock), room=room, warn=True)
+            else:
+                line = ("## %s %s (%s): %d bytes, over the boot budget, NOT loaded. "
+                        "Read it before relying on memory." % (label, os.path.basename(path),
+                                                                path, len(text.encode("utf-8"))))
+                parts.append(line)
+                used += len(line) + 2
+                entry.update(status="dropped",
+                             reason="needs %d chars, %d left of the %d cap" % (
+                                 len(block) + 2, max(left, 0), cap))
         entries.append(entry)
     try:
         block = live.render(cwd, cfg, budget=cap - used - 2)
@@ -479,6 +548,87 @@ def selftest():
         _t, lents = plan_context(grepo, big)
         check("live entry containing the marker text is not read as truncation",
               lents[-1]["label"] == "live" and lents[-1]["status"] == "loaded")
+    # RESUME truncation (issue #124): a RESUME that does not fit loses its OLDEST units, not itself
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        cf = os.path.join(d, "c.toml")
+
+        def tcfg(cap):
+            with open(cf, "w") as fh:
+                fh.write('[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'
+                         '[live]\npath = "%s/live/l.md"\n'
+                         '[agent]\ncodex_home = "%s/codex"\ncodex_boot_bytes = %d\n' % (d, d, d, d, cap))
+            return notes_config.load(cf)
+        tc = tcfg(1000)
+        trepo = os.path.join(d, "repo")
+        os.makedirs(trepo)
+        subprocess.run(["git", "init", "-q", trepo], check=True)
+        tp = notes_config.codex_project_store(trepo, tc["agent"]["codex_home"])
+        os.makedirs(tp)
+        rpath = os.path.join(tp, "RESUME.md")
+        assert os.path.realpath(rpath).startswith(d), "selftest path escaped the sandbox"
+        old_lines = ["- old entry %02d with some padding text" % i for i in range(40)]
+        body = ("# RESUME\n\n2026-11-22 (newest entry below)\nplain paragraph text line\n\n"
+                + "\n".join(old_lines) + "\n- newest entry\n  with a continuation line\n")
+        with open(rpath, "w") as fh:
+            fh.write(body)
+        ttext, tents = plan_context(trepo, tc)
+        rent = [e for e in tents if e["path"] == rpath][0]
+        kept_nonblank = [ln for ln in ttext.split("\n") if ln.strip()]
+        cut_n = sum(1 for ln in body.split("\n") if ln.strip() and ln not in kept_nonblank)
+        mk = re.search(r"\((\d+) older lines not shown; read (.+)\)", ttext)
+        check("truncated RESUME: status truncated, reason names lines and cap",
+              rent["status"] == "truncated" and "older entries cut to fit" in rent["reason"]
+              and "of the 1000 cap" in rent["reason"])
+        check("truncated RESUME: heading and newest unit kept, oldest cut",
+              "# RESUME" in ttext and "- newest entry\n  with a continuation line" in ttext
+              and "old entry 00" not in ttext)
+        check("truncated RESUME: marker N is the count of non-blank lines cut, with the path",
+              mk is not None and int(mk.group(1)) == cut_n and mk.group(2) == rpath)
+        check("truncated RESUME: a plain paragraph (not a bullet) is a cuttable unit",
+              "2026-11-22 (newest entry below)" not in ttext and "plain paragraph text line" not in ttext)
+        check("truncated RESUME: pack stays under the cap", len(ttext) <= 1000)
+        check("truncated RESUME: warn flag set", rent.get("warn") is True)
+        # the heading-and-marker-only case falls back to the pointer
+        with open(rpath, "w") as fh:
+            fh.write("# H\n" + "x" * 3000)
+        _t, fents = plan_context(trepo, tc)
+        fe = [e for e in fents if e["path"] == rpath][0]
+        check("one huge unit (nothing of the body survives): dropped, not truncated",
+              fe["status"] == "dropped" and "NOT loaded" in _t)
+        with open(rpath, "w") as fh:
+            fh.write("# " + "h" * 3000 + "\n- a\n- b\n")
+        _t, fents = plan_context(trepo, tc)
+        fe = [e for e in fents if e["path"] == rpath][0]
+        check("headings alone do not fit: dropped pointer", fe["status"] == "dropped")
+        # MEMORY.md keeps the drop behavior
+        os.remove(rpath)
+        with open(os.path.join(tp, "MEMORY.md"), "w") as fh:
+            fh.write("# idx\n" + "\n".join("- [t%d](t%d.md) - hook line" % (i, i) for i in range(80)))
+        _t, ments = plan_context(trepo, tc)
+        me = [e for e in ments if e["label"] == "project" and e["path"].endswith("MEMORY.md")][0]
+        check("an over-budget MEMORY.md is still dropped whole", me["status"] == "dropped"
+              and "older lines not shown" not in _t)
+        os.remove(os.path.join(tp, "MEMORY.md"))
+        # 90% boundary: block of exactly 900 chars is warned at room 1000, not at room 1001
+        with open(rpath, "w") as fh:
+            fh.write("x")
+        _t, pe = plan_context(trepo, tc)
+        e0 = [e for e in pe if e["path"] == rpath][0]
+        L0, room0 = e0["block_chars"], e0["room"]
+        with open(rpath, "w") as fh:
+            fh.write("x" * (900 - L0 + 1))
+        got = {}
+        for room_want in (1000, 1001, 999):
+            tc2 = tcfg(1000 + room_want - room0)  # room moves 1:1 with the cap
+            _t, pe = plan_context(trepo, tc2)
+            e1 = [e for e in pe if e["path"] == rpath][0]
+            got[room_want] = (e1["block_chars"], e1["room"], e1["status"], e1["warn"])
+        check("warn at exactly 90% of the room, not below (900 chars: room 1000 warns, 1001 does not)",
+              got[1000] == (900, 1000, "loaded", True) and got[1001][3] is False
+              and got[999][3] is True)
+        check("RESUME_WARN_FRACTION is 0.9 and resume_near_cliff reads it",
+              RESUME_WARN_FRACTION == 0.9 and resume_near_cliff(90, 100) and not resume_near_cliff(89, 100))
     print("%d failed" % len(fails) if fails else "all ok")
     return 1 if fails else 0
 

@@ -31,7 +31,10 @@ import notes_config  # noqa: E402
 REFUSAL = ("%s would be %d chars after this write, over its %d-char budget (it is %d now). "
            "Move finished items to RESUME-archive.md beside it, verbatim, then retry.")
 CODEX_REFUSAL = ("%s would not load in Codex after this write: its SessionStart pack (the "
-                 "agent.codex_boot_bytes cap, %d chars) would drop it (%s). Move finished items to RESUME-archive.md beside it, verbatim, then retry.")
+                 "agent.codex_boot_bytes cap, %d chars) would cut or drop it (%s). Move finished items to RESUME-archive.md beside it, verbatim, then retry.")
+WARN_TEXT = ("warning: %s would use %d of the %d chars Codex's SessionStart pack has left for it "
+             "(agent.codex_boot_bytes cap %d): near the point where older entries get cut. "
+             "Move finished items to RESUME-archive.md soon.")
 ADD_REFUSAL = " While it is over budget a write may only remove lines, not add or change any."
 LEGACY_REFUSAL = ("%s is the old RESUME.md of a scope that migrated to a shared store: it is no "
                   "longer read. Write the shared store's RESUME.md instead: %s")
@@ -60,12 +63,14 @@ def only_removes(old_text, new_text):
     return not extra
 
 
-def codex_boot_drop(path, new_text, cfg, cwd=None):
-    """(cap, reason) for why Codex's SessionStart pack would drop `path` (a RESUME.md) if it held new_text,
-    else None. Only for a store Codex boots: every store in codex mode, a shared scope's store
-    otherwise. It dry-runs hooks/codex_session_start.plan_context with the candidate text, so
-    the cap and the packing live only there."""
+def _codex_boot_entry(path, new_text, cfg, cwd=None):
+    """(cap, entry) where entry is plan_context's dict for `path` (a RESUME.md) if it held
+    new_text, else None (not a store Codex boots, or the path is not packed). Only for a store
+    Codex boots: every store in codex mode, a shared scope's store otherwise. It dry-runs
+    hooks/codex_session_start.plan_context with the candidate text, so the cap and the packing
+    live only there."""
     rp = os.path.realpath(path)
+    found = None
     shared_roots = [s["root"] for s in cfg.get("scopes", []) if s.get("shared_store")
                     and os.path.realpath(os.path.join(s["store"], "RESUME.md")) == rp]
     if cfg["agent"]["kind"] != "codex" and not shared_roots:
@@ -92,10 +97,36 @@ def codex_boot_drop(path, new_text, cfg, cwd=None):
         for root in roots:
             _text, entries = css.plan_context(root, ccfg)
             for e in entries:
-                if os.path.realpath(e["path"]) == rp and e["status"] != "loaded":
-                    return ccfg["agent"]["codex_boot_bytes"], e["reason"]
+                if os.path.realpath(e["path"]) == rp:
+                    # the worst entry over every root wins: a refusal beats a warning
+                    if e["status"] != "loaded":
+                        return ccfg["agent"]["codex_boot_bytes"], e
+                    if e.get("warn") and found is None:
+                        found = (ccfg["agent"]["codex_boot_bytes"], e)
     finally:
         css._read_checked = real_read
+    return found
+
+
+def codex_boot_drop(path, new_text, cfg, cwd=None):
+    """(cap, reason) for why Codex's SessionStart pack would not load `path` (a RESUME.md) whole
+    if it held new_text (dropped, or truncated with older entries cut), else None."""
+    hit = _codex_boot_entry(path, new_text, cfg, cwd)
+    if hit and hit[1]["status"] != "loaded":
+        return hit[0], hit[1]["reason"]
+    return None
+
+
+def codex_boot_warning(path, new_text, cfg=None, cwd=None):
+    """Warning text (never a refusal) when `path` would still load whole in Codex's pack but use
+    >= the plan_context warn share of the room it has left, else None. The share is
+    codex_session_start.RESUME_WARN_FRACTION, read from the entry's own `warn` mark."""
+    if os.path.basename(str(path)) != "RESUME.md":
+        return None
+    hit = _codex_boot_entry(path, new_text, cfg or notes_config.load(), cwd)
+    if hit and hit[1]["status"] == "loaded" and hit[1].get("warn"):
+        e = hit[1]
+        return WARN_TEXT % (path, e["block_chars"], e["room"], hit[0])
     return None
 
 
@@ -221,6 +252,26 @@ def selftest():
             check("a shared RESUME under budget but dropped by Codex's pack is refused, naming the cap",
                   msg and "would not load in Codex" in msg and str(cap) in msg, msg)
             check("a small shared RESUME that Codex loads passes at that cap", check_write(shr, "", "ok\n") is None)
+            multi = "# R\n" + "".join("- line %02d\n" % i for i in range(8))  # 8 units, under the 100 budget
+            tcap = next(n for n in range(100, 5000)
+                        if (with_cap(n) and check_write(shr, "", multi) is None))
+            big = "# R\n" + "".join("- line %03d padding padding\n" % i for i in range(40))  # 1.2K
+            with_cap(900)
+            msg = check_write(shr, "", big, budget=10000)
+            drop = codex_boot_drop(shr, big, notes_config.load())
+            check("a write that would TRUNCATE the shared RESUME is refused (truncated counts as not loaded)",
+                  drop is not None and "older entries cut to fit" in drop[1]
+                  and msg and "would not load in Codex" in msg and "cut or drop" in msg, (drop, msg))
+            with_cap(tcap)
+            warn = codex_boot_warning(shr, multi, notes_config.load())
+            check("a write that fits exactly is allowed AND warns (non-blocking, text separate)",
+                  check_write(shr, "", multi) is None and warn and warn.startswith("warning:")
+                  and "RESUME-archive.md" in warn, warn)
+            with_cap(tcap + 4000)
+            check("plenty of room: no warning", codex_boot_warning(shr, multi, notes_config.load()) is None
+                  and check_write(shr, "", multi) is None)
+            check("a non-RESUME name never warns", codex_boot_warning(os.path.join(d, "x.md"), multi) is None)
+            with_cap(600)
             check("a non-shared scope's RESUME is not subject to the Codex cap",
                   check_write(r, "", "y" * 99) is None)
             check("legacy RESUME of an opted-in scope is reported as migrated",
