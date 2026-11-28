@@ -842,13 +842,16 @@ def codex_violations(reports):
 def codex_warnings(reports):
     """One WARN line per RESUME block that loads whole but uses >= the warn share of its room.
     Never a finding: codex_check_mode prints these without changing its exit code."""
-    out = []
+    best = {}  # one file is one warning, however many scopes boot it: keep the tightest
     for rep in reports:
         for path, (used, room) in rep["warn"].items():
-            out.append(f"WARN {_display(path)}: {used:,} of {room:,} chars of the room the "
-                       f"SessionStart pack leaves it (scope {rep['name']}); older entries get "
-                       f"cut past that")
-    return out
+            real = os.path.realpath(path)
+            tight = used / room if room > 0 else float("inf")
+            if real not in best or tight > best[real][0]:
+                best[real] = (tight, path, used, room, rep["name"])
+    return [f"WARN {_display(path)}: {used:,} of {room:,} chars of the room the "
+            f"SessionStart pack leaves it (scope {name}); older entries get cut past that"
+            for _t, path, used, room, name in best.values()]
 
 
 def codex_report_mode():
@@ -1165,6 +1168,19 @@ def selftest_codex(check):
         _write(Path(gstore) / "MEMORY.md", "# Memory Index\n\n- [x](x.md) - x\n")
         rc, out = run("--agent", "codex", "check")
         check(rc == 0 and out == "", "small RESUME: silent again, exit 0")
+        # one shared file warned across scopes counts once
+        shared = str(Path(gstore) / "RESUME.md")
+        twice = codex_warnings([{"name": "a", "warn": {shared: (90, 100)}},
+                                {"name": "b", "warn": {shared: (90, 100)}},
+                                {"name": "c", "warn": {str(Path(pstore) / "RESUME.md"): (95, 100)}}])
+        tight = codex_warnings([{"name": "a", "warn": {shared: (50, 100)}},
+                                {"name": "b", "warn": {shared: (95, 100)}},
+                                {"name": "c", "warn": {shared: (60, 100)}}])
+        check(len(tight) == 1 and "95 of 100" in tight[0] and "scope b" in tight[0],
+              "codex_warnings: the shared file's tightest scope numbers are the ones printed")
+        check(len(twice) == 2 and sum("global" in w or "RESUME.md" in w for w in twice) == 2
+              and sum(os.path.basename(os.path.dirname(shared)) in w for w in twice) >= 1,
+              "codex_warnings: a RESUME shared by two scopes prints one WARN, a distinct one still prints")
 
         # N1: no [[scopes]] at all still measures the session's own cwd
         _write(Path(cfgf), '[paths]\nclaude_home = "%s/claude"\nstate_dir = "%s/state"\n'

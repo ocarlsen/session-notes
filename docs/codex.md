@@ -371,7 +371,7 @@ frontmatter, and on an `--index-line` marks the hook `[harness]`.
   when everything fits and exits 1 with one `FILE` or `SCOPE` line per dropped or truncated
   file otherwise. A RESUME that loads whole but uses 90% or more of the room the pack leaves
   it prints a `WARN` line (and a `WARN` row in `report`) without changing the exit code. `check-file` stays Claude only. Live-context truncation is shown in
-  `report` but is never a `check` finding (the live block only uses what the files leave).
+  `report` but is never a `check` finding (the live block only uses what the files leave). That includes a truncated RESUME: it keeps the room it fills, so the live block can be dropped where a dropped RESUME would have left room for it.
   Not modelled: Codex loads no project docs for an untrusted project, and the chain
   follows git for the project root, not `project_root_markers`.
   The SessionStart figure is characters (bytes are printed beside it); Codex's own spill

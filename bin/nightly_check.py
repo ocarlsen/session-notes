@@ -10,7 +10,7 @@ load: Claude Code's CLAUDE.md prefix, or Codex's AGENTS.md chain and SessionStar
 An agent counts as installed when its home directory exists: paths.claude_home
 for Claude, agent.codex_home for Codex.
 
-    python3 nightly_check.py               # silent + exit 0 when every check is clean (a could-not-check note may print)
+    python3 nightly_check.py               # exit 0; prints only a could-not-check note or non-failing warnings when otherwise clean
     python3 nightly_check.py status        # one line (or nothing) from the last run's record
     python3 launch_agents.py install nightly-check   # run it every night (macOS)
     python3 nightly_check.py --selftest
@@ -18,7 +18,7 @@ for Claude, agent.codex_home for Codex.
 Every run records itself in paths.last_check (default <state_dir>/last-check.json):
 when it ran, the exit code, each check's outcome and the report. `status` reads that
 file and prints at most one line, so a brief or prompt can show it: nothing when the
-last run is clean and fresh; a findings summary, or a loud line when the last run
+last run is clean (no warnings) and fresh; a warnings-only or findings summary, or a loud line when the last run
 crashed, never ran, left an unreadable record, or is older than --max-age-days.
 
 Exit codes: 0 clean, 3 findings (the report is on stdout), 1 a check crashed or the
@@ -234,7 +234,7 @@ def _environment_check(env, out, checks):
 
 
 def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
-    """The one line `status` prints, or "" when the last run is clean and fresh.
+    """The one line `status` prints, or "" when the last run is clean, warning-free and fresh.
     Fails closed: anything it cannot positively read as clean is a loud line."""
     now = now or datetime.now(timezone.utc)
     try:
@@ -270,7 +270,14 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
     if bad or rc == 1:
         return "MEMORY CHECKS CRASHED (%s): %s" % (day, bad or "see nightly_check.py")
     found = [(a, n, f) for a, n, st, f in rows if st == "findings"]
-    nwarn = sum(len(c.get("warnings") or []) for c in checks if isinstance(c, dict))
+    nwarn = 0
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        w = c.get("warnings", [])
+        if not isinstance(w, list):
+            return "MEMORY CHECKS STATUS UNREADABLE: %s (malformed warnings)" % path
+        nwarn += len(w)
     if rc == 0 and not found and nwarn:
         return ("Memory checks (%s): %d warning(s), nothing failing; run nightly_check.py for the "
                 "report" % (day, nwarn))
@@ -552,6 +559,11 @@ def selftest():
               status_line(rec2({"rc": 2}), 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
         check("status: rc 'true' is not rc 1",
               status_line(rec2({"rc": True}), 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
+        for bad_w in (5, "oops", {"a": 1}, 0, "", {}):
+            wrow = [dict(clean[0], warnings=bad_w)] + list(clean[1:])
+            check("status: a malformed warnings value %r is UNREADABLE, not a traceback" % (bad_w,),
+                  status_line(rec2({"checks": wrow}), 8, later)
+                  .startswith("MEMORY CHECKS STATUS UNREADABLE"))
         bad_row = [{"agent": "claude", "check": "x", "status": "weird", "findings": 0}]
         check("status: an unknown row status is loud CRASHED",
               status_line(rec2({"checks": bad_row}), 8, later).startswith("MEMORY CHECKS CRASHED"))
@@ -594,7 +606,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--selftest", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
-    st = sub.add_parser("status", help="one line from the last run's record; silent when clean")
+    st = sub.add_parser("status", help="one line from the last run's record; silent when clean and warning-free")
     st.add_argument("--max-age-days", type=float, default=DEFAULT_MAX_AGE_DAYS)
     a = ap.parse_args(argv)
     if a.selftest:
