@@ -154,8 +154,8 @@ def plan_context(cwd, cfg=None):
     """(text, entries) for cwd. text is the additionalContext (what build_context returns);
     entries is one dict per candidate file in the hook's own order: path, label, chars
     (len of the text, the unit the cap counts), bytes, status ("loaded", "truncated" for a
-    RESUME with older entries cut, or "dropped"), reason; a RESUME entry also carries
-    block_chars, room and warn. A store file that exists but cannot be read or decoded is "dropped". The live
+    RESUME with older entries cut, or "dropped"), reason; a loaded or truncated RESUME entry
+    also carries block_chars, room and warn (a dropped one does not). A store file that exists but cannot be read or decoded is "dropped". The live
     block is the last entry: "loaded", "truncated" when older entries were cut, or "dropped"
     when entries exist but none fit. boot_budget.py reads this to report what a
     Codex session loads; the packing lives only here."""
@@ -209,10 +209,21 @@ def plan_context(cwd, cfg=None):
                 # files packed after this one keep the room they would have had: reserve their
                 # footprint (a pointer for this file stands in for it in that count)
                 ptr = len(_pointer(label, path, text)) + 2
-                reserve = _later_footprint(files, pos + 1, used + ptr, cap)
-                cut = _truncate_resume(label, path, text, room - reserve)
-            if cut and len(cut[0]) < len(_pointer(label, path, text)):
-                cut = None  # a pointer is the shorter stand-in: the reserve counted one
+                later_ptr = _later_footprint(files, pos + 1, used + ptr, cap)
+                # never pack worse than the pointer plan: within the cap whenever that plan is
+                limit = max(cap, used + ptr + later_ptr)
+                budget = room - later_ptr
+                for _ in range(8):
+                    cut = _truncate_resume(label, path, text, budget)
+                    if not cut:
+                        break
+                    # the truncated block's REAL length decides what the later files get
+                    end = used + len(cut[0]) + 2
+                    over = end + _later_footprint(files, pos + 1, end, cap) - limit
+                    if over <= 0:
+                        break
+                    budget = len(cut[0]) - over  # cut further and re-check
+                    cut = None
             before = ("; room already used by %s" % ", ".join(packed)) if packed and is_resume else ""
             if cut:
                 tblock, ncut = cut
@@ -789,9 +800,13 @@ def selftest():
              "/g/RESUME.md": "# R\n" + "\n".join("- g entry %03d padding" % i for i in range(40)),
              "/p/MEMORY.md": "# pm\n- [a](a.md) hook",
              "/p/RESUME.md": "# R\n" + "\n".join("- p entry %03d padding" % i for i in range(40))}
-    mcfg = {"agent": {"codex_boot_bytes": 0}}
+    import shutil
+    tdir = tempfile.mkdtemp()  # the mock's trace dir and live file: nothing may reach the real HOME
+    mcfg = {"agent": {"codex_boot_bytes": 0}, "scopes": [], "live": {"path": os.path.join(tdir, "live.md")}}
+    real_tdir = _trace_dir
     notes_config.stores_for = lambda cwd, cfg: {"global": "/g", "project": "/p", "root": "/r"}
     globals()["_read_checked"] = lambda path: (texts.get(path, ""), None)
+    globals()["_trace_dir"] = lambda: os.path.join(tdir, "errors")
     try:
         mcfg["agent"]["codex_boot_bytes"] = 1
         floor = len(plan_context("/r", mcfg)[0])  # every file a pointer: the smallest pack
@@ -810,8 +825,8 @@ def selftest():
         check("a dropped or truncated project RESUME names the earlier file that used the room",
               saw_reason)
         # the reviewer's trigger: the truncated global block comes out SHORTER than its pointer, so
-        # the reserve (which counted a pointer) let the project MEMORY load whole and pushed the
-        # project RESUME out, over the cap. The fallback keeps the pack under the cap and RESUME in.
+        # a reserve that counted a pointer let the project MEMORY load whole and pushed the
+        # project RESUME out, over the cap. The later reserve now follows the block's real length.
         texts.pop("/g/MEMORY.md")
         texts.update({"/g/RESUME.md": "# R\n" + "\n".join("- g%03d" % i for i in range(70)),
                       "/p/MEMORY.md": "m" * 158, "/p/RESUME.md": "r" * 40})
@@ -820,7 +835,49 @@ def selftest():
         st = {(e["label"], os.path.basename(e["path"])): e["status"] for e in me if e["label"] != "live"}
         check("truncated block shorter than its pointer: pack within the cap and project RESUME not dropped",
               len(mt) <= 495 and st[("project", "RESUME.md")] != "dropped")
+        # seeded fuzz over short-path layouts: never worse than the whole-or-pointer plan, and a
+        # file that loads whole when its earlier RESUME is a pointer is never dropped
+        import random
+        rnd = random.Random(126)
+        bad, n_trunc = [], 0
+        for _ in range(3000):
+            ls = [rnd.randint(1, 12) for _ in range(rnd.randint(3, 60))]
+            texts.clear()
+            texts["/g/RESUME.md"] = "# R\n" + "\n".join("-" + "x" * k for k in ls)
+            texts["/p/MEMORY.md"] = "m" * rnd.randint(60, 320)
+            texts["/p/RESUME.md"] = "r" * rnd.randint(10, 120)
+            if rnd.random() < .5:
+                texts["/g/MEMORY.md"] = "g" * rnd.randint(10, 100)
+            cap = rnd.randint(250, 700)
+            mcfg["agent"]["codex_boot_bytes"] = cap
+            mt, me = plan_context("/r", mcfg)
+            mine = {e["path"]: e for e in me if e["label"] != "live"}
+            n_trunc += any(e["status"] == "truncated" for e in mine.values())
+            # base plan: every file whole where it fits, else a pointer
+            u = len(HEADER) + 2 + len("Project store: /p (root /r)") + 2
+            plan = {}
+            for pth in ("/g/MEMORY.md", "/g/RESUME.md", "/p/MEMORY.md", "/p/RESUME.md"):
+                if pth not in texts:
+                    continue
+                lab = "global" if pth.startswith("/g") else "project"
+                blk = "## %s %s (%s)\n\n%s" % (lab, os.path.basename(pth), pth, texts[pth])
+                if u + len(blk) + 2 <= cap:
+                    plan[pth] = "loaded"
+                    u += len(blk) + 2
+                else:
+                    plan[pth] = "dropped"
+                    u += len(_pointer(lab, pth, texts[pth])) + 2
+            if u <= cap and len(mt) > cap:
+                bad.append(("over", cap, len(mt)))
+            if any(st == "loaded" and mine[pth]["status"] == "dropped" for pth, st in plan.items()):
+                bad.append(("lost", cap))
+        check("fuzz: %d truncated layouts; never over a cap the base plan fits, never loses a file the "
+              "base plan loads %s" % (n_trunc, bad[:3]), not bad and n_trunc > 100)
+        check("the mocked block wrote no trace file, real or temp",
+              not os.path.exists(os.path.join(tdir, "errors")))
     finally:
+        globals()["_trace_dir"] = real_tdir
+        shutil.rmtree(tdir, ignore_errors=True)
         notes_config.stores_for = real_stores
         globals()["_read_checked"] = real_read
     print("%d failed" % len(fails) if fails else "all ok")

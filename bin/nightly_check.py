@@ -234,7 +234,7 @@ def _environment_check(env, out, checks):
 
 
 def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
-    """The one line `status` prints, or "" when the last run is clean and fresh.
+    """The one line `status` prints, or "" when the last run is clean, warning-free and fresh.
     Fails closed: anything it cannot positively read as clean is a loud line."""
     now = now or datetime.now(timezone.utc)
     try:
@@ -274,7 +274,7 @@ def status_line(path, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
     for c in checks:
         if not isinstance(c, dict):
             continue
-        w = c.get("warnings") or []
+        w = c.get("warnings", [])
         if not isinstance(w, list):
             return "MEMORY CHECKS STATUS UNREADABLE: %s (malformed warnings)" % path
         nwarn += len(w)
@@ -559,7 +559,7 @@ def selftest():
               status_line(rec2({"rc": 2}), 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
         check("status: rc 'true' is not rc 1",
               status_line(rec2({"rc": True}), 8, later).startswith("MEMORY CHECKS STATUS UNREADABLE"))
-        for bad_w in (5, "oops", {"a": 1}):
+        for bad_w in (5, "oops", {"a": 1}, 0, "", {}):
             wrow = [dict(clean[0], warnings=bad_w)] + list(clean[1:])
             check("status: a malformed warnings value %r is UNREADABLE, not a traceback" % (bad_w,),
                   status_line(rec2({"checks": wrow}), 8, later)
@@ -606,7 +606,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--selftest", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
-    st = sub.add_parser("status", help="one line from the last run's record; silent when clean")
+    st = sub.add_parser("status", help="one line from the last run's record; silent when clean and warning-free")
     st.add_argument("--max-age-days", type=float, default=DEFAULT_MAX_AGE_DAYS)
     a = ap.parse_args(argv)
     if a.selftest:
