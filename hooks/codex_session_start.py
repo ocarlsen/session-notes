@@ -809,6 +809,17 @@ def selftest():
               not over)
         check("a dropped or truncated project RESUME names the earlier file that used the room",
               saw_reason)
+        # the reviewer's trigger: the truncated global block comes out SHORTER than its pointer, so
+        # the reserve (which counted a pointer) let the project MEMORY load whole and pushed the
+        # project RESUME out, over the cap. The fallback keeps the pack under the cap and RESUME in.
+        texts.pop("/g/MEMORY.md")
+        texts.update({"/g/RESUME.md": "# R\n" + "\n".join("- g%03d" % i for i in range(70)),
+                      "/p/MEMORY.md": "m" * 158, "/p/RESUME.md": "r" * 40})
+        mcfg["agent"]["codex_boot_bytes"] = 495
+        mt, me = plan_context("/r", mcfg)
+        st = {(e["label"], os.path.basename(e["path"])): e["status"] for e in me if e["label"] != "live"}
+        check("truncated block shorter than its pointer: pack within the cap and project RESUME not dropped",
+              len(mt) <= 495 and st[("project", "RESUME.md")] != "dropped")
     finally:
         notes_config.stores_for = real_stores
         globals()["_read_checked"] = real_read
